@@ -191,15 +191,6 @@ How the Mac and iPhone renderer works is in
 [docs/metal-backend.md](docs/metal-backend.md). The version comes from the git
 tag the tree is at.
 
-## Where this is going
-
-The target is the shape [Ship of Harkinian](https://github.com/HarbourMasters/Shipwright)
-set: you own the game, you point the app at it, it plays. Next:
-
-1. The rest of the game — later areas get far less testing than the first.
-2. The iPhone and iPad build on real devices.
-3. Windows.
-
 ## Legality
 
 The releases contain the engine: the runtime (the kernel layer and the
