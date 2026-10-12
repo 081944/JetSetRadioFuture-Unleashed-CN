@@ -64,6 +64,12 @@ cmake --build build-ios
 launcher/ios/package_ios.sh build-ios/jsrf_recomp 0.2.0      # JSRF-Unleashed-iOS.ipa
 ```
 
+The release's IPA also goes into the AltStore / SideStore source,
+`altstore/source.json` (what players add in *Sources › +*), with
+`launcher/ios/altstore_source.py JSRF-Unleashed-iOS.ipa --notes "..."` once it
+is attached to the GitHub release; then commit the source. AltStore takes the
+first entry of `versions` as the newest.
+
 For the Simulator, `-DCMAKE_OSX_SYSROOT=iphonesimulator` and
 `package_ios.sh ... --simulator`, which leaves `JSRF Unleashed.app` to install
 with `xcrun simctl install`. Environment variables reach the app through

@@ -1,0 +1,42 @@
+{
+  "name": "JSRF Unleashed",
+  "identifier": "com.jumatt.jsrf-unleashed.source",
+  "subtitle": "Jet Set Radio Future on iPhone and iPad",
+  "description": "JSRF Unleashed: Jet Set Radio Future, statically recompiled to run natively -- not an emulator. You need your own copy of the game (the USA release); this source has the app only. Source code, the Mac and Linux builds and instructions: https://github.com/JuMatt/JetSetRadioFuture-Unleashed",
+  "website": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed",
+  "iconURL": "https://raw.githubusercontent.com/JuMatt/JetSetRadioFuture-Unleashed/main/launcher/icon/AppIcon.iconset/icon_512x512.png",
+  "tintColor": "#9EDB29",
+  "nsfw": false,
+  "featuredApps": [
+    "com.jumatt.jsrf-unleashed"
+  ],
+  "apps": [
+    {
+      "name": "JSRF Unleashed",
+      "bundleIdentifier": "com.jumatt.jsrf-unleashed",
+      "developerName": "JuMatt",
+      "subtitle": "Jet Set Radio Future, natively",
+      "localizedDescription": "Jet Set Radio Future, statically recompiled: the game's own code translated to native code and running on Metal -- not an emulator.\n\nBring your own game: the USA release of Jet Set Radio Future. After installing, open the app once, then copy the game into its folder in the Files app (On My iPhone > JSRF Unleashed): either the extracted folder with default.xbe in it, or the disc image (.iso), which the app unpacks itself.\n\nA controller is the best way to play (Xbox, PlayStation, MFi and others); without one there are on-screen controls. Widescreen 16:9, saves in the app's Saves folder.\n\nExperimental: played in the iOS Simulator, not yet widely on real devices. Bug reports with the log from the app's Logs folder are welcome on GitHub.",
+      "iconURL": "https://raw.githubusercontent.com/JuMatt/JetSetRadioFuture-Unleashed/main/launcher/icon/AppIcon.iconset/icon_512x512.png",
+      "tintColor": "#9EDB29",
+      "category": "games",
+      "screenshotURLs": [],
+      "appPermissions": {
+        "entitlements": [],
+        "privacy": {}
+      },
+      "versions": [
+        {
+          "version": "0.2.0",
+          "buildVersion": "0.2.0",
+          "date": "2026-10-12T16:05:25Z",
+          "localizedDescription": "First iPhone and iPad release (experimental): the Metal renderer, on-screen controls, controllers and keyboards, the game copied in through the Files app or unpacked from a disc image.",
+          "downloadURL": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/download/v0.2.0/JSRF-Unleashed-iOS.ipa",
+          "size": 13178338,
+          "minOSVersion": "15.0"
+        }
+      ]
+    }
+  ],
+  "news": []
+}

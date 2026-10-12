@@ -55,8 +55,16 @@ with your own Apple ID on the way in: [AltStore](https://altstore.io),
 With a free Apple ID the install lasts seven days and is then refreshed from
 the tool.
 
-1. Install `JSRF-Unleashed-iOS.ipa` with one of those tools, and open the app
-   once: it shows where the game goes.
+1. Install the app. With **AltStore** or **SideStore**, add this source
+   (*Sources › +*) and install JSRF Unleashed from it — new versions then
+   show up there as updates:
+
+   ```
+   https://raw.githubusercontent.com/JuMatt/JetSetRadioFuture-Unleashed/main/altstore/source.json
+   ```
+
+   Or download `JSRF-Unleashed-iOS.ipa` from the release and install it with
+   any of the three. Open the app once: it shows where the game goes.
 2. Copy the game into the app's folder. In the **Files** app it is *On My
    iPhone › JSRF Unleashed*; from a Mac, Finder › your iPhone › *Files* ›
    JSRF Unleashed. Copy either the extracted game folder (the one with
