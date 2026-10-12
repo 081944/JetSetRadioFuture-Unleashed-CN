@@ -42,6 +42,8 @@
  * that on both platforms. */
 #ifndef __APPLE__
 #include <ucontext.h>
+#else
+#include <TargetConditionals.h>   /* TARGET_OS_IPHONE: the iOS build */
 #endif
 #include <unistd.h>
 #include <pthread.h>
@@ -702,7 +704,7 @@ static int host_main(void)
     printf("\nStarting game...\n");
     fflush(stdout);
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) && !TARGET_OS_IPHONE
     /*
      * On macOS the window has to belong to the main thread.
      *
@@ -866,6 +868,17 @@ int main(int argc, char **argv)
         return 0;
     }
     g_argv = argv;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    /* iOS: UIKit owns the main thread and the process; the app (in
+     * nv2a_window_ios.m) finds the game in its Documents folder, sets the
+     * environment the Mac launcher would, and runs host_main on a thread of
+     * its own -- the guest's main thread, as the window path below makes one
+     * on the Mac. It does not come back. */
+    {
+        extern int nv_ios_main(int argc, char **argv, int (*host)(void));
+        return nv_ios_main(argc, argv, host_main);
+    }
+#endif
     if (argc > 1) g_game_dir_arg = argv[1];
     return host_main();
 }

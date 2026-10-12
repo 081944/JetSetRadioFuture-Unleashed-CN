@@ -4,11 +4,33 @@
 # (the software rasteriser): this one turns the same pushbuffer into real
 # draw calls. Built only where EGL and GL are available; on a host without
 # them the runtime keeps the software path and nothing else changes.
+if(IOS)
+    # iPhone and iPad: Metal only. iOS has no OpenGL (only the deprecated
+    # OpenGL ES), so nv2a_gl.c is built without its OpenGL device and
+    # contexts (NV2A_GL_USE_NONE) and the window is the app's own -- the
+    # port's ios/jsrf_ios.m, which defines what nv2a_window_mac.m does here.
+    add_library(xbox_nv2a_gl STATIC
+        nv2a_vsh.c nv2a_vsh_interp.c nv2a_psh.c nv2a_uniforms.c nv2a_gl.c
+        ../nv2a_metal/nv2a_metal.m)
+    set_source_files_properties(../nv2a_metal/nv2a_metal.m PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    target_include_directories(xbox_nv2a_gl PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../d3d)
+    target_compile_definitions(xbox_nv2a_gl PRIVATE NV2A_HAVE_METAL)
+    target_compile_definitions(xbox_nv2a_gl PUBLIC NV2A_GL_USE_NONE=1)
+    target_link_libraries(xbox_nv2a_gl PUBLIC
+        "-framework Metal" "-framework Foundation" "-framework QuartzCore" m)
+    target_compile_options(xbox_nv2a_gl PRIVATE -Wall -Wextra -O2)
+    message(STATUS "nv2a_gl context: none (iOS: Metal only)")
+    return()
+endif()
+
 set(NV2A_GL_SOURCES
     nv2a_vsh.c
     nv2a_vsh_interp.c
     nv2a_psh.c
+    nv2a_uniforms.c
     nv2a_gl.c
+    nv2a_gfx_gl.c
 )
 if(APPLE)
     # An AppKit window, so the frame can be watched rather than only dumped.
@@ -23,6 +45,11 @@ if(APPLE)
     # supplies a nv2a_backend_metal() that returns NULL, which is what the
     # header asks a backend that cannot be built to do.
     list(APPEND NV2A_GL_SOURCES ../nv2a_metal/nv2a_metal.m)
+    # ARC for the Metal backend alone: it holds Metal objects in its tables,
+    # and reference counting them by hand is a leak or a crash per mistake.
+    # (The window code predates it and manages its few objects itself.)
+    set_source_files_properties(../nv2a_metal/nv2a_metal.m
+                                PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 endif()
 
 add_library(xbox_nv2a_gl STATIC ${NV2A_GL_SOURCES})

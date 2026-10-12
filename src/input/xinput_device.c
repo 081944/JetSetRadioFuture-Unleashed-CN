@@ -114,6 +114,17 @@ static int input_script(DWORD port, XBOX_INPUT_STATE *pState)
  * changes nothing. Only available in a windowed run -- there is no keyboard
  * to read otherwise -- so the symbol is weak (the AppKit window on the Mac,
  * the SDL one elsewhere). Returns 1 if a key was held. */
+/* The iPhone app's on-screen stick (port/ios/jsrf_ios.m): 1, and where it
+ * is, while a thumb is on it. A weak definition that says "none", which the
+ * app's own replaces -- Mach-O will not link a weak reference that nothing
+ * defines. */
+__attribute__((weak)) int nv_window_touch_stick(short *x, short *y);
+__attribute__((weak)) int nv_window_touch_stick(short *x, short *y)
+{
+    (void)x; (void)y;
+    return 0;
+}
+
 static int kb_merge(DWORD dwPort, WORD *out, unsigned char analog[8], short axes[4])
 {
     extern int nv_window_keys(unsigned short *b, unsigned char *a)
@@ -148,6 +159,12 @@ static int kb_merge(DWORD dwPort, WORD *out, unsigned char analog[8], short axes
             short v = (rx && ry) ? 23170 : 32767;
             axes[2] = (short)(rx * v); axes[3] = (short)(ry * v);
         }
+    }
+    /* The on-screen stick moves the left stick by as much as the thumb
+     * does -- over the full deflection its d-pad bits gave above. */
+    {
+        short tx = 0, ty = 0;
+        if (nv_window_touch_stick(&tx, &ty)) { axes[0] = tx; axes[1] = ty; }
     }
     return 1;
 }

@@ -77,6 +77,19 @@ add_executable(jsrf_recomp
     recomp_manual.c
     ${JSRF_GEN_SOURCES}
 )
+if(IOS)
+    # The iPhone / iPad app around the engine (ios/jsrf_ios.m: the window,
+    # the controls, the game in Documents) and the disc-image unpacker. The
+    # bundle -- Info.plist, icons, signature -- is put together by
+    # launcher/ios/package_ios.sh from this executable.
+    target_sources(jsrf_recomp PRIVATE ios/jsrf_ios.m ios/xiso.c)
+    set_source_files_properties(ios/jsrf_ios.m PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    set_target_properties(jsrf_recomp PROPERTIES MACOSX_BUNDLE OFF)
+    target_link_libraries(jsrf_recomp PRIVATE
+        "-framework UIKit" "-framework GameController" "-framework AVFoundation"
+        "-framework Metal" "-framework QuartzCore" "-framework CoreGraphics"
+        "-framework Foundation")
+endif()
 target_compile_definitions(jsrf_recomp PRIVATE JSRF_VERSION="${JSRF_VERSION}")
 target_link_libraries(jsrf_recomp PRIVATE xboxrecomp)
 target_include_directories(jsrf_recomp PRIVATE

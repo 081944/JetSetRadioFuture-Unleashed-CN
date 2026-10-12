@@ -194,6 +194,14 @@ void xa2_shutdown(void)
 
 int xa2_is_active(void) { return g_active; }
 
+/* iOS stops the queue for an interruption -- a call, Siri, an alarm -- and
+ * does not start it again; the app calls this when it is back in front. A
+ * queue that is running is not affected. */
+void xa2_resume(void)
+{
+    if (g_active && g_queue) AudioQueueStart(g_queue, NULL);
+}
+
 int xa2_get_buffer_size(void) { return CA_BUF_FRAMES; }
 
 /* What the APU paces itself on (apu_core.c, throttle): how much is waiting,

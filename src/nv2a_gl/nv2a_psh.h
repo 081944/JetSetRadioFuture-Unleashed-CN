@@ -104,25 +104,20 @@ typedef struct {
 int nv2a_psh_emit_glsl(const Nv2aPshState *ps, char *buf, int bufsize);
 
 /*
- * The same combiner configuration as a Metal fragment shader.
+ * The same combiner configuration as a Metal fragment shader, from the same
+ * body generator.
  *
  * Entry point `nv2a_psh_main`. It takes the vertex stage's Nv2aVshOut as
- * stage_in, `Nv2aPshUniforms` at buffer NV2A_MSL_PSH_UNIFORM_INDEX, and a
+ * stage_in, the Nv2aFU uniform struct at buffer NV2A_MSL_BUF_FU, and a
  * texture2d + sampler pair at index N for each bound stage -- only the bound
- * ones, so a backend binds exactly what the shader declares.
+ * ones, so a backend binds exactly what the shader declares. With w_buffer
+ * set it returns depth as well as colour.
  */
 int nv2a_psh_emit_msl(const Nv2aPshState *ps, char *buf, int bufsize);
 
-#define NV2A_MSL_PSH_UNIFORM_INDEX 0
-
-/* Host-side twin of the generated `Nv2aPshUniforms`. */
-typedef struct {
-    float   fog_color[4];
-    float   tex_scale[4][2];
-    int32_t alpha_func;
-    float   alpha_ref;
-    float   _pad[2];
-} Nv2aPshUniformsHost;
+/* A shader that paints every fragment drawTint, for the diagnostics that
+ * colour draws by identity. msl selects the dialect. */
+int nv2a_psh_emit_solid(char *buf, int bufsize, int msl);
 
 #ifdef __cplusplus
 }

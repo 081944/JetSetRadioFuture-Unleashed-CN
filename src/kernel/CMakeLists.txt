@@ -43,6 +43,10 @@ if(WIN32)
     # platform is an INTERFACE target on Windows: it contributes the src/
     # include path that "platform/xbox_winnt.h" resolves against.
     target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
+elseif(APPLE)
+    # The crypto is the portable code in kernel_crypto.c; OpenSSL is not
+    # needed (and on an iPhone not there).
+    target_link_libraries(xbox_kernel PUBLIC platform xbox_nv2a_gl)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
     find_package(OpenSSL REQUIRED)

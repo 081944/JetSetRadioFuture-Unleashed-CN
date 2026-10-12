@@ -1,6 +1,6 @@
 # JSRF Unleashed
 
-**Jet Set Radio Future, running natively on Mac and Linux.** Not an emulator — the
+**Jet Set Radio Future, running natively on Mac, Linux, iPhone and iPad.** Not an emulator — the
 game's own code, statically recompiled into C and built as a native
 application.
 
@@ -22,8 +22,9 @@ you own.
 | Platform | Download |
 |---|---|
 | macOS 12 or later, Apple Silicon (M1 or later) | [JSRF-Unleashed-macOS-arm64.zip](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-macOS-arm64.zip) |
-| Linux, x86_64 (glibc 2.34 or later: Ubuntu 22.04, Debian 12, Fedora 36 and newer) | [JSRF-Unleashed-linux-x86_64.tar.gz](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-linux-x86_64.tar.gz) — new, less tested than the Mac build |
-| Windows, iPhone | not started |
+| Linux, x86_64 (glibc 2.34 or later: Ubuntu 22.04, Debian 12, Fedora 36 and newer) | [JSRF-Unleashed-linux-x86_64.tar.gz](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-linux-x86_64.tar.gz) — less tested than the Mac build |
+| iPhone and iPad, iOS 15 or later (iPhone XS or newer recommended) | [JSRF-Unleashed-iOS.ipa](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-iOS.ipa) — **new and experimental**: tested in the iOS Simulator, not yet on a real device |
+| Windows | not started |
 
 Every version is on the [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases) page; what changed is in the [changelog](CHANGELOG.md).
 
@@ -44,6 +45,33 @@ Every version is on the [Releases](https://github.com/JuMatt/JetSetRadioFuture-U
 Saves are kept in `~/Library/Application Support/JSRF Unleashed/save`. Each
 run writes `last-run.log` into the game folder (with a few older ones in
 `logs/`) — attach it when you report a bug.
+
+### Installing on iPhone or iPad
+
+The `.ipa` is not signed by Apple (that needs a paid developer account and
+the App Store), so it is installed with a sideloading tool, which signs it
+with your own Apple ID on the way in: [AltStore](https://altstore.io),
+[SideStore](https://sidestore.io) or [Sideloadly](https://sideloadly.io).
+With a free Apple ID the install lasts seven days and is then refreshed from
+the tool.
+
+1. Install `JSRF-Unleashed-iOS.ipa` with one of those tools, and open the app
+   once: it shows where the game goes.
+2. Copy the game into the app's folder. In the **Files** app it is *On My
+   iPhone › JSRF Unleashed*; from a Mac, Finder › your iPhone › *Files* ›
+   JSRF Unleashed. Copy either the extracted game folder (the one with
+   `default.xbe` in it) or the disc image (`.iso`) — the app unpacks an image
+   once, and offers to delete it afterwards.
+3. Back in the app, it starts.
+
+A controller is the way to play (any one iOS supports: Xbox, PlayStation,
+MFi, Backbone and the like). Without one, the app shows on-screen controls,
+with Start and Back at the top. The ⚙ button has widescreen, the on-screen
+controls and the resolution. Saves are kept in `Saves`, and each run's log in
+`Logs`, in the same folder.
+
+The game's memory map needs 4 GB of address space, which recent iPhones give
+an app. If an older device does not, the app says so when it starts.
 
 ### Installing on Linux
 
@@ -88,6 +116,7 @@ others, over Bluetooth or USB. On Linux, any pad SDL knows.
 **Video menu:**
 - **Resolution** — the internal resolution, 1× to 4× (2× by default). The
   game restarts to apply it.
+- **Renderer** — Metal (the default) or OpenGL. The game restarts to apply it.
 - **Full Screen** — Ctrl ⌘ F.
 - **Widescreen (16:9)** — ⇧ ⌘ W. The game is shown at 16:9 with a wider
   field of view, not stretched; the HUD and text keep their shape. The title
@@ -104,9 +133,10 @@ Playable, early, and not yet played from start to finish.
 | Skating, grinding, tricks, graffiti, the pause map | works |
 | Music, sound effects, voices | works |
 | Widescreen 16:9 | works in game; the title screen stays 4:3 |
-| Linux build | new: boots, menus, starting a new game; far less played than the Mac build |
+| Linux build | boots, menus, starting a new game; far less played than the Mac build |
+| iPhone / iPad build | new: plays in the iOS Simulator; not yet tried on a real device |
 | Later areas | little tested — expect bugs |
-| Known issues | an occasional "disc error" screen during a load; a 1-pixel dark line along the right edge |
+| Known issues | an occasional "disc error" screen during a load |
 
 Found a bug? [Open an issue](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/issues)
 with your `last-run.log` and what you were doing.
@@ -120,8 +150,8 @@ JIT at runtime. Two things follow from that:
 - **It is fast.** The game's logic runs as native code, at native speed.
 - **It can ship where JITs cannot.** iOS forbids runtime code generation, which
   is why there is no real Xbox emulator on an iPhone. A statically recompiled
-  binary has nothing to generate — which is the reason an iPhone build is on
-  the list at all.
+  binary has nothing to generate — which is why there can be an iPhone build
+  at all.
 
 What still has to be emulated is the *hardware*: the NV2A graphics processor,
 the MCPX audio processor, and the Xbox kernel the game calls into. Those parts
@@ -146,7 +176,11 @@ launcher/package_mac.sh build/jsrf_recomp             # macOS: the app, zipped
 ```
 
 On Linux, [`launcher/linux/package.sh`](launcher/linux/package.sh) packages the
-build and records how the release one is made. The version comes from the git
+build and records how the release one is made. For iPhone and iPad, see
+[docs/ios.md](docs/ios.md) (Xcode's iOS SDK, the same CMake project,
+[`launcher/ios/package_ios.sh`](launcher/ios/package_ios.sh) for the `.ipa`).
+How the Mac and iPhone renderer works is in
+[docs/metal-backend.md](docs/metal-backend.md). The version comes from the git
 tag the tree is at.
 
 ## Where this is going
@@ -155,8 +189,8 @@ The target is the shape [Ship of Harkinian](https://github.com/HarbourMasters/Sh
 set: you own the game, you point the app at it, it plays. Next:
 
 1. The rest of the game — later areas get far less testing than the first.
-2. Windows.
-3. The Metal renderer, and with it an iPhone build, with touch controls.
+2. The iPhone and iPad build on real devices.
+3. Windows.
 
 ## Legality
 

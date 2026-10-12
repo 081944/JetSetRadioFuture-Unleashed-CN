@@ -1,11 +1,34 @@
 # Changelog
 
-Releases are tagged `vX.Y.Z` and built from that tag: the Mac app and the
-Linux build both say which version they are (Finder › Get Info, or
-`./jsrf-unleashed --version` on Linux), and so does the first line of every
-log. Downloads are on the
+Releases are tagged `vX.Y.Z` and built from that tag: the Mac app, the Linux
+build and the iPhone app say which version they are (Finder › Get Info,
+`./jsrf-unleashed --version` on Linux, the ⚙ button on iPhone), and so does
+the first line of every log. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
+
+## 0.2.0 — 12 October 2026
+
+- **iPhone and iPad** (new, experimental): `JSRF-Unleashed-iOS.ipa`, for
+  sideloading (AltStore, SideStore, Sideloadly). The game goes into the app's
+  folder in the Files app — the extracted folder, or the disc image, which the
+  app unpacks itself. Controllers, on-screen controls (a stick and the pad's
+  buttons), a hardware keyboard. Played in the iOS Simulator; not yet tried
+  on a real device.
+- **Mac: Metal is the renderer now.** Each frame goes straight to the window,
+  every one of them reaches the screen, and on a 120 Hz display (a MacBook
+  Pro's) nearly every frame stays up for exactly a sixtieth of a second:
+  smooth 60 fps. Less CPU, too. OpenGL is still there, under Video › Renderer.
+- **Fixed: the picture could freeze for good** now and then during play (all
+  platforms). The game's graphics driver sometimes waits for an interrupt the
+  GPU raises when it reaches a marker in the command stream; nothing raised
+  it.
+- Widescreen: on the character select the characters stay inside their
+  panels; the boot logos fill the 16:9 screen.
+- Fixed: a 1-pixel dark line along the right and bottom edges.
+- Logs are a small fraction of the size (most of a log was one line per GPU
+  submission).
+- Building on a Mac needs nothing from Homebrew.
 
 ## 0.1.2 — 2 October 2026
 

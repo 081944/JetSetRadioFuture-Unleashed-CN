@@ -44,7 +44,15 @@
  * tested here rather than first compiled on the machine it is meant for.
  */
 #define GL_GLEXT_PROTOTYPES 1
-#if defined(NV2A_GL_USE_CGL)
+/* NV2A_GL_USE_NONE: no OpenGL at all -- iOS, which has none (only the
+ * long-deprecated OpenGL ES). The device is Metal's, and the few
+ * diagnostics built from GL objects are left out. */
+#if !defined(NV2A_GL_USE_NONE)
+#  define NV2A_GL_HAVE_GL 1
+#endif
+#if defined(NV2A_GL_USE_NONE)
+   /* nothing to include */
+#elif defined(NV2A_GL_USE_CGL)
 #  include <OpenGL/OpenGL.h>
 #  include <OpenGL/gl3.h>
 #  include <OpenGL/gl3ext.h>
@@ -537,12 +545,19 @@ static void prof_report(void)
 static int      g_on = -1;
 static int      g_ready;
 static int      g_failed;
+
+/* The device everything below draws through: OpenGL (nv2a_gfx_gl.c) or Metal
+ * (nv2a_metal.m). Chosen once, in gfx_init(). */
+static const Nv2aGfx *G;
+static int g_is_gl;        /* G is OpenGL: the GL-only diagnostics may run */
+unsigned nv2a_gfx_gl_fbo(uint32_t rt);   /* nv2a_gfx_gl.c */
 #if defined(NV2A_GL_USE_CGL)
 static CGLContextObj g_cgl_ctx;
 #elif defined(NV2A_GL_USE_SDL)
 static SDL_Window   *g_window;
 static SDL_GLContext g_sdl_ctx;
 int  nv2a_widescreen(void);   /* below; the window opens in its shape */
+#elif defined(NV2A_GL_USE_NONE)
 #else
 static EGLDisplay g_dpy;
 static EGLContext g_ctx;
@@ -569,7 +584,7 @@ static EGLSurface g_egl_surf;
 #define SURF_CACHE 16
 static struct {
     uint32_t offset, w, h;
-    GLuint   fbo, tex, depth;
+    uint32_t rt;          /* the device's render target */
     int      used;
     uint32_t last_use;    /* bind order, for eviction */
     uint32_t last_draw;   /* S.draws when last drawn or cleared into */
@@ -583,7 +598,11 @@ static uint32_t g_last_flip_draws;    /* S.draws at the last FLIP_STALL */
 static int      g_cur_surf = -1;
 /* nv2a_gl_trace_frames(): per-pass log for the next few frames. */
 static uint32_t g_pass_trace_until;
-static GLuint   g_fbo, g_color_tex, g_depth_rb;
+static uint32_t g_cur_rt;            /* the bound surface's render target */
+/* The surface the title is drawing into could not be made (a target the
+ * device refused): its draws and clears go nowhere until a surface binds,
+ * rather than landing on whichever surface was bound before. */
+static int      g_surf_lost;
 static uint32_t g_fbo_w, g_fbo_h;
 #define SLOTCENSUS_MAX 4096
 static uint32_t g_slot_draws[SLOTCENSUS_MAX];
@@ -601,7 +620,6 @@ int g_darkhunt_at = -1;
  * asks for more -- see gl_scale(). Everything the title can observe uses the
  * logical size; only the pixels use this one. */
 static uint32_t g_fbo_pw, g_fbo_ph;
-static GLuint   g_vao, g_vbo;
 static uint8_t *g_readback;
 static uint32_t g_readback_bytes;
 
@@ -652,18 +670,7 @@ static struct {
     uint32_t hash;      /* vertex program and combiner state together */
     int      used;
     uint32_t last_draw; /* for eviction, if a title ever does fill this */
-    GLuint   prog;
-    GLint    u_c, u_vpScale, u_vpOff, u_vpSurface, u_posMode, u_drawTint;
-    GLint    u_fogEnable;
-    GLint    u_ffMat, u_ffTexMat;   /* fixed-function transform, see S.ff_* */
-    GLint    u_ffVpOff;
-    GLint    u_litAmbient, u_zClip;
-    /* fixed-function lighting, see nv2a_vsh_emit_ff_glsl */
-    GLint    u_ffMV, u_ffIMV, u_ltSceneAmb, u_ltMatEm, u_ltMatAlpha;
-    GLint    u_ltAmb, u_ltDif, u_ltSpc, u_ltDir, u_ltHalf, u_ltPos, u_ltAtt;
-    GLint    u_ltRange, u_ltSpotDir, u_ltEye, u_ltSpecPow;
-    GLint    u_tex[4], u_texScale[4], u_fogColor, u_alphaFunc, u_alphaRef;
-    GLint    u_bumpMat[4], u_bumpScale[4], u_bumpOff[4], u_texOff[4];
+    uint32_t prog;      /* the device's program; it knows where each uniform is */
     uint16_t inputs;
     uint8_t  uses_a0;   /* indexes the constant file through the address register */
     uint8_t  a0_input;  /* the v register the index comes from, 0xFF if unknown */
@@ -696,8 +703,18 @@ static uint32_t gl_scale(void)
     return sc;
 }
 
-static GLuint g_cur_prog;
-static int    g_cur_slot = -1;
+static uint32_t g_cur_prog;
+static int      g_cur_slot = -1;
+
+/* Uniforms, by name (nv2a_backend.h), for the program in use. `uses` is
+ * whether the program at a cache slot reads one at all: work for one it does
+ * not is skipped, as it always was when a GL location came back -1. */
+static int  uses(int slot, int id) { return G->prog_uses(g_pcache[slot].prog, id); }
+static void uni1f(int id, float a) { G->uniform_f(id, &a, 1); }
+static void uni2f(int id, float a, float b)
+{ float v[2]; v[0] = a; v[1] = b; G->uniform_f(id, v, 1); }
+static void uni4f(int id, float a, float b, float c, float d)
+{ float v[4]; v[0] = a; v[1] = b; v[2] = c; v[3] = d; G->uniform_f(id, v, 1); }
 
 /* Find a compiled program by hash, or -1. Open addressing: a run of used slots
  * with different hashes is a collision chain, and an empty slot ends it. */
@@ -740,22 +757,15 @@ static int pcache_alloc(uint32_t hash)
  * toggles, per draw, all identical to the last one. Remembering what was set
  * turns that into a handful of calls. */
 static struct {
-    uint32_t layout;        /* which arrays are enabled, and where each sits */
-    uint32_t const_mask;    /* attributes currently set as constants */
-    float    const_attr[NUM_ATTRS][4];   /* and the values they were set to */
     int      prog_slot;
-    GLuint   tex0;
+    uint32_t tex0;
     int      tex_enable;
     float    tex_sx, tex_sy;
-    int      depth_test, depth_func, depth_mask;
-    int      blend_enable, blend_src, blend_dst;
     int      alpha_func;
     float    alpha_ref;
     float    vp_scale[4], vp_off[4];
-    int      valid;
+    float    wide_shift;
 } g_last;
-static int g_last_cm_reset;   /* a clear forced the colour mask on */
-static int g_last_stencil_reset;   /* a clear changed the stencil write mask */
 static uint32_t g_frame_chars;       /* big skinned batches this frame */
 static uint32_t g_frame_chars_prev;  /* ... and in the frame just finished */
 
@@ -773,7 +783,7 @@ static uint32_t g_frame_chars_prev;  /* ... and in the frame just finished */
 static struct {
     uint32_t offset, format, w, h, pitch, hash;
     uint32_t last_draw;     /* when this entry was last looked up */
-    GLuint   tex;
+    uint32_t tex;           /* the device's texture */
     int      used;
 } g_tcache[TEX_CACHE];
 
@@ -833,8 +843,8 @@ static int vp_trace(void)
  * window was 943 where the ceiling is twenty. A model whose vertices all
  * pick the same wrong bone matrix does not fall apart -- it moves somewhere
  * plausible, a few metres off. Static world geometry, loaded once into
- * contiguous memory, is unaffected, which is exactly the split Julien
- * described: the buildings and the roads are right and everything else
+ * contiguous memory, is unaffected, which is exactly the split the
+ * player described: the buildings and the roads are right and everything else
  * floats.
  *
  * So the window is used only for offsets the contiguous allocator has
@@ -877,11 +887,6 @@ static const uint8_t *guest(uint32_t va)
     return (const uint8_t *)xbox_GetMemoryOffset() + va;
 }
 
-/* Which backend is running -- OpenGL, or Metal. Defined at the foot of this
- * file, next to the table it returns; declared here because the front half
- * calls it long before then. */
-static const Nv2aBackend *backend(void);
-
 static uint32_t fnv(const void *p, size_t n)
 {
     const uint8_t *b = (const uint8_t *)p;
@@ -892,19 +897,31 @@ static uint32_t fnv(const void *p, size_t n)
 
 /* ---- context ------------------------------------------------------------ */
 
+#if defined(NV2A_GL_USE_NONE)
+
+/* No OpenGL in this build: Metal or nothing. */
+static int gl_init(uint32_t w, uint32_t h)
+{
+    (void)w; (void)h;
+    fprintf(stderr, "  [GL] this build has no OpenGL renderer\n");
+    return 0;
+}
+
+#else
+
 /* Everything that is the same whichever way the context was obtained. */
 static int gl_init_common(uint32_t w, uint32_t h)
 {
-    glGenVertexArrays(1, &g_vao);
-    glGenBuffers(1, &g_vbo);
-    glGenFramebuffers(1, &g_fbo);
-    glGenTextures(1, &g_color_tex);
-    glGenRenderbuffers(1, &g_depth_rb);
     (void)w; (void)h;
-    return 1;
+    G = nv2a_gfx_gl();
+    g_is_gl = 1;
+    return G->init();
 }
 
-#if defined(NV2A_GL_USE_CGL)
+#endif
+
+#if defined(NV2A_GL_USE_NONE)
+#elif defined(NV2A_GL_USE_CGL)
 
 /*
  * A context with no window and no third-party dependency.
@@ -952,9 +969,6 @@ static int gl_init(uint32_t w, uint32_t h)
      * stays exactly as it is. They are deliberately not shared -- the window
      * is handed finished pixels rather than GL objects, which is what makes
      * the display path independent of AppKit's layer behaviour. */
-    if (getenv("RECOMP_WINDOW") && nv_window_is_open())
-        g_windowed = 1;
-
     err = CGLChoosePixelFormat(attribs, &pix, &npix);
     if (err != kCGLNoError || !pix) {
         fprintf(stderr, "  [GL] CGLChoosePixelFormat failed (%d)\n", (int)err);
@@ -1384,49 +1398,35 @@ static void surface_bind(uint32_t offset, uint32_t w, uint32_t h)
 
     if (!g_surf[slot].used || g_surf[slot].offset != offset
      || g_surf[slot].w != w || g_surf[slot].h != h) {
-        if (!g_surf[slot].fbo) {
-            glGenFramebuffers(1, &g_surf[slot].fbo);
-            glGenTextures(1, &g_surf[slot].tex);
-            glGenRenderbuffers(1, &g_surf[slot].depth);
+        /* A colour buffer and a depth/stencil one -- with a stencil: the
+         * title keeps its shadow counts there -- at the raster's size. */
+        uint32_t rt;
+        if (g_surf[slot].rt) {
+            G->target_free(g_surf[slot].rt);
+            g_surf[slot].rt = 0;
+            g_surf[slot].used = 0;
+            if (g_cur_surf == slot) { g_cur_surf = -1; g_cur_rt = 0; }
         }
-        glBindTexture(GL_TEXTURE_2D, g_surf[slot].tex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
-                     (GLsizei)(w * gl_scale()), (GLsizei)(h * gl_scale()), 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glBindRenderbuffer(GL_RENDERBUFFER, g_surf[slot].depth);
-        /* With a stencil: the title keeps its shadow counts there. */
-        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8,
-                              (GLsizei)(w * gl_scale()),
-                              (GLsizei)(h * gl_scale()));
-        glBindFramebuffer(GL_FRAMEBUFFER, g_surf[slot].fbo);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                               GL_TEXTURE_2D, g_surf[slot].tex, 0);
-        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
-                                  GL_RENDERBUFFER, g_surf[slot].depth);
-        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-            fprintf(stderr, "  [GL] framebuffer incomplete at %ux%u\n", w, h);
+        rt = G->target_new(w * gl_scale(), h * gl_scale());
+        if (!rt) {
+            fprintf(stderr, "  [GL] no render target at %ux%u\n", w, h);
+            g_surf_lost = 1;
             return;
         }
+        g_surf[slot].rt = rt;
         g_surf[slot].used = 1;
         g_surf[slot].offset = offset;
         g_surf[slot].w = w; g_surf[slot].h = h;
         fprintf(stderr, "  [GL] surface %08X: new %ux%u render target\n",
                 offset, w, h);
-        g_last.tex0 = 0;      /* the bind above disturbed unit 0 */
     }
 
     if (g_cur_surf != slot) {
-        glBindFramebuffer(GL_FRAMEBUFFER, g_surf[slot].fbo);
-        glViewport(0, 0, (GLsizei)(w * gl_scale()), (GLsizei)(h * gl_scale()));
+        G->target_bind(g_surf[slot].rt);
         g_cur_surf = slot;
     }
-    g_fbo = g_surf[slot].fbo;
-    g_color_tex = g_surf[slot].tex;
-    g_depth_rb = g_surf[slot].depth;
+    g_cur_rt = g_surf[slot].rt;
+    g_surf_lost = 0;
     g_fbo_w = w; g_fbo_h = h;
     g_fbo_pw = w * gl_scale(); g_fbo_ph = h * gl_scale();
 
@@ -1462,10 +1462,10 @@ static int surface_find(uint32_t offset, uint32_t w, uint32_t h, int allow_cur)
     return best;
 }
 
-static GLuint surface_texture(uint32_t offset, uint32_t w, uint32_t h)
+static uint32_t surface_texture(uint32_t offset, uint32_t w, uint32_t h)
 {
     int i = surface_find(offset, w, h, 0);
-    return i >= 0 ? g_surf[i].tex : 0;
+    return i >= 0 ? G->target_texture(g_surf[i].rt) : 0;
 }
 
 /* ---- shaders ------------------------------------------------------------ */
@@ -1473,88 +1473,61 @@ static GLuint surface_texture(uint32_t offset, uint32_t w, uint32_t h)
 /* RECOMP_GL_SOLID: paint every fragment opaque magenta and ignore depth.
  * When a frame comes back empty this says, in one run, whether the geometry
  * is reaching the surface at all -- which is a different bug from it being
- * shaded to black or hidden behind the depth test. */
-static const char *FRAG_SOLID =
-"#version 330 core\n"
-"in vec4 oD0; in vec4 oD1; in vec4 oT0; in vec4 oT1; in vec4 oT2; in vec4 oT3;\n"
-"in float oFogC;\n"
-"uniform sampler2D tex0; uniform int texEnable; uniform vec2 texScale;\n"
-"uniform int alphaFunc; uniform float alphaRef;\n"
-"out vec4 frag;\n"
-"uniform vec4 drawTint;\n"
-"void main() { frag = drawTint; }\n";
-
-static GLuint compile(GLenum stage, const char *src, const char *what)
+ * shaded to black or hidden behind the depth test. The shader is
+ * nv2a_psh_emit_solid(); this is its buffer. */
+static char *frag_solid(void)
 {
-    GLuint s = glCreateShader(stage);
-    GLint ok = 0;
-    char *patched = NULL;
-
-    /* RECOMP_GL_ZVIEW turns every fragment shader into a depth view.
-     *
-     * The define has to land after the #version line, which GLSL requires to
-     * come first, so it is spliced in here rather than prepended. The emitter
-     * already carries the epilogue behind an #ifdef; this is only the switch.
-     */
-    { static int zview = -1;
-      if (zview < 0) zview = getenv("RECOMP_GL_ZVIEW") ? 1 : 0;
-      if (zview && stage == GL_FRAGMENT_SHADER && src
-       && strncmp(src, "#version", 8) == 0) {
-          const char *nl = strchr(src, '\n');
-          if (nl) {
-              static const char def[] = "#define NV2A_ZVIEW_ON 1\n";
-              size_t head = (size_t)(nl - src) + 1;
-              size_t len = strlen(src);
-              patched = (char *)malloc(len + sizeof def);
-              if (patched) {
-                  memcpy(patched, src, head);
-                  memcpy(patched + head, def, sizeof def - 1);
-                  memcpy(patched + head + sizeof def - 1, src + head,
-                         len - head + 1);
-                  src = patched;
-              }
-          }
-      } }
-
-    /* RECOMP_GL_Z01: take the program's depth as the 0..1 it already is,
-     * rather than dividing it by a clip range it never used. Same splice,
-     * the vertex stage this time. */
-    { static int z01 = -1;
-      if (z01 < 0) z01 = getenv("RECOMP_GL_Z01") ? 1 : 0;
-      if (z01 && stage == GL_VERTEX_SHADER && src
-       && strncmp(src, "#version", 8) == 0) {
-          const char *nl = strchr(src, '\n');
-          if (nl) {
-              static const char d2[] = "#define NV2A_Z01 1\n";
-              size_t head = (size_t)(nl - src) + 1;
-              size_t len = strlen(src);
-              char *p2 = (char *)malloc(len + sizeof d2);
-              if (p2) {
-                  memcpy(p2, src, head);
-                  memcpy(p2 + head, d2, sizeof d2 - 1);
-                  memcpy(p2 + head + sizeof d2 - 1, src + head, len - head + 1);
-                  free(patched);
-                  src = patched = p2;
-              }
-          }
-      } }
-
-    glShaderSource(s, 1, &src, NULL);
-    glCompileShader(s);
-    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
-    if (!ok) {
-        char log[4096];
-        GLsizei n = 0;
-        glGetShaderInfoLog(s, sizeof log, &n, log);
-        fprintf(stderr, "  [GL] %s failed to compile:\n%.*s\n", what, (int)n, log);
-        if (getenv("RECOMP_GL_DUMP_SHADER"))
-            fprintf(stderr, "----- source -----\n%s\n------------------\n", src);
-        glDeleteShader(s);
-        free(patched);
-        return 0;
+    static char *src;
+    if (!src) {
+        src = (char *)malloc(16 * 1024);
+        if (src && !nv2a_psh_emit_solid(src, 16 * 1024, G->lang == NV2A_LANG_MSL)) {
+            free(src); src = NULL;
+        }
     }
-    free(patched);
-    return s;
+    return src;
+}
+
+/* A #define spliced into generated source: after the #version line, which
+ * GLSL requires to come first, or at the very top of Metal source. Returns a
+ * new string, or NULL to keep the original. */
+static char *splice_define(const char *src, const char *def)
+{
+    size_t head = 0, len, dl = strlen(def);
+    char *out;
+    if (!src) return NULL;
+    if (strncmp(src, "#version", 8) == 0) {
+        const char *nl = strchr(src, '\n');
+        if (!nl) return NULL;
+        head = (size_t)(nl - src) + 1;
+    }
+    len = strlen(src);
+    out = (char *)malloc(len + dl + 1);
+    if (!out) return NULL;
+    memcpy(out, src, head);
+    memcpy(out + head, def, dl);
+    memcpy(out + head + dl, src + head, len - head + 1);
+    return out;
+}
+
+/* Build a program from generated source, with the bring-up switches that
+ * work by editing it.
+ *
+ * RECOMP_GL_ZVIEW turns every fragment shader into a depth view (the
+ * emitter carries the epilogue behind an #ifdef; this is only the switch).
+ * RECOMP_GL_Z01 takes the program's depth as the 0..1 it already is, rather
+ * than dividing it by a clip range it never used. */
+static uint32_t build_program(const char *vsrc, const char *fsrc, const char *what)
+{
+    static int zview = -1, z01 = -1;
+    char *v2 = NULL, *f2 = NULL;
+    uint32_t prog;
+    if (zview < 0) zview = getenv("RECOMP_GL_ZVIEW") ? 1 : 0;
+    if (z01 < 0)   z01   = getenv("RECOMP_GL_Z01") ? 1 : 0;
+    if (zview) f2 = splice_define(fsrc, "#define NV2A_ZVIEW_ON 1\n");
+    if (z01)   v2 = splice_define(vsrc, "#define NV2A_Z01 1\n");
+    prog = G->prog_new(v2 ? v2 : vsrc, f2 ? f2 : fsrc, what);
+    free(v2); free(f2);
+    return prog;
 }
 
 /* Translate the current vertex program and link it against the fragment
@@ -1636,64 +1609,6 @@ static void psh_sync_textures(void)
                       wb = v ? atoi(v) : -1; }
       S.psh.w_buffer = (uint8_t)(wb >= 0 ? wb
                                          : ((S.control0 >> 16) & 1u)); }
-}
-
-/* Where this program keeps the things the backend sets every draw.
- *
- * Shared by the two compile paths -- a translated program and the
- * fixed-function transform link against the same combiner shader and take
- * the same uniforms, and a name looked up in one place and not the other is
- * a uniform that silently stays at zero. */
-static void pcache_locate_uniforms(int slot)
-{
-    GLuint prog = g_pcache[slot].prog;
-    int i;
-    g_pcache[slot].u_c          = glGetUniformLocation(prog, "c");
-    g_pcache[slot].u_vpScale    = glGetUniformLocation(prog, "vpScale");
-    g_pcache[slot].u_vpOff      = glGetUniformLocation(prog, "vpOff");
-    g_pcache[slot].u_vpSurface  = glGetUniformLocation(prog, "vpSurface");
-    g_pcache[slot].u_posMode    = glGetUniformLocation(prog, "posMode");
-    g_pcache[slot].u_fogEnable  = glGetUniformLocation(prog, "fogEnable");
-    g_pcache[slot].u_drawTint   = glGetUniformLocation(prog, "drawTint");
-    g_pcache[slot].u_ffMat      = glGetUniformLocation(prog, "ffMat");
-    g_pcache[slot].u_ffTexMat   = glGetUniformLocation(prog, "ffTexMat");
-    g_pcache[slot].u_ffVpOff    = glGetUniformLocation(prog, "ffVpOff");
-    g_pcache[slot].u_litAmbient = glGetUniformLocation(prog, "litAmbient");
-    g_pcache[slot].u_zClip      = glGetUniformLocation(prog, "zClip");
-    g_pcache[slot].u_ffMV       = glGetUniformLocation(prog, "ffMV");
-    g_pcache[slot].u_ffIMV      = glGetUniformLocation(prog, "ffIMV");
-    g_pcache[slot].u_ltSceneAmb = glGetUniformLocation(prog, "ltSceneAmb");
-    g_pcache[slot].u_ltMatEm    = glGetUniformLocation(prog, "ltMatEm");
-    g_pcache[slot].u_ltMatAlpha = glGetUniformLocation(prog, "ltMatAlpha");
-    g_pcache[slot].u_ltAmb      = glGetUniformLocation(prog, "ltAmb");
-    g_pcache[slot].u_ltDif      = glGetUniformLocation(prog, "ltDif");
-    g_pcache[slot].u_ltSpc      = glGetUniformLocation(prog, "ltSpc");
-    g_pcache[slot].u_ltDir      = glGetUniformLocation(prog, "ltDir");
-    g_pcache[slot].u_ltHalf     = glGetUniformLocation(prog, "ltHalf");
-    g_pcache[slot].u_ltPos      = glGetUniformLocation(prog, "ltPos");
-    g_pcache[slot].u_ltAtt      = glGetUniformLocation(prog, "ltAtt");
-    g_pcache[slot].u_ltRange    = glGetUniformLocation(prog, "ltRange");
-    g_pcache[slot].u_ltSpotDir  = glGetUniformLocation(prog, "ltSpotDir");
-    g_pcache[slot].u_ltEye      = glGetUniformLocation(prog, "ltEye");
-    g_pcache[slot].u_ltSpecPow  = glGetUniformLocation(prog, "ltSpecPow");
-    for (i = 0; i < 4; i++) {
-        char nm[16];
-        snprintf(nm, sizeof nm, "tex%d", i);
-        g_pcache[slot].u_tex[i] = glGetUniformLocation(prog, nm);
-        snprintf(nm, sizeof nm, "texScale%d", i);
-        g_pcache[slot].u_texScale[i] = glGetUniformLocation(prog, nm);
-        snprintf(nm, sizeof nm, "texOff%d", i);
-        g_pcache[slot].u_texOff[i] = glGetUniformLocation(prog, nm);
-        snprintf(nm, sizeof nm, "bumpMat%d", i);
-        g_pcache[slot].u_bumpMat[i] = glGetUniformLocation(prog, nm);
-        snprintf(nm, sizeof nm, "bumpScale%d", i);
-        g_pcache[slot].u_bumpScale[i] = glGetUniformLocation(prog, nm);
-        snprintf(nm, sizeof nm, "bumpOffset%d", i);
-        g_pcache[slot].u_bumpOff[i] = glGetUniformLocation(prog, nm);
-    }
-    g_pcache[slot].u_fogColor   = glGetUniformLocation(prog, "fogColor");
-    g_pcache[slot].u_alphaFunc  = glGetUniformLocation(prog, "alphaFunc");
-    g_pcache[slot].u_alphaRef   = glGetUniformLocation(prog, "alphaRef");
 }
 
 /*
@@ -1790,11 +1705,9 @@ static void dump_msl_pair(uint32_t hash, const char *vsrc, const char *fsrc)
 static int ff_program_for_current(void)
 {
     Nv2aVshFixed f;
-    uint32_t hash;
+    uint32_t hash, prog;
     char *vsrc, *fsrc;
-    GLuint vs, fs, prog;
-    GLint ok = 0;
-    int slot;
+    int slot, msl = (G->lang == NV2A_LANG_MSL);
 
     ff_describe(&f);
     psh_sync_textures();
@@ -1808,9 +1721,10 @@ static int ff_program_for_current(void)
       if (hit >= 0) return hit; }
     slot = pcache_alloc(hash);
 
-    vsrc = (char *)malloc(64 * 1024);
+    vsrc = (char *)malloc(96 * 1024);
     if (!vsrc) return -1;
-    if (!nv2a_vsh_emit_ff_glsl(&f, vsrc, 64 * 1024)) {
+    if (!(msl ? nv2a_vsh_emit_ff_msl(&f, vsrc, 96 * 1024)
+              : nv2a_vsh_emit_ff_glsl(&f, vsrc, 96 * 1024))) {
         free(vsrc); S.shader_fails++; return -1;
     }
     if (getenv("RECOMP_GL_DUMP_FF")) {
@@ -1820,35 +1734,18 @@ static int ff_program_for_current(void)
                     "texmat %X) -----\n%s\n",
                     f.inputs_read, f.tex_matrix, vsrc);
     }
-    vs = compile(GL_VERTEX_SHADER, vsrc, "fixed-function transform");
-    free(vsrc);
-    if (!vs) { S.shader_fails++; return -1; }
-
     fsrc = (char *)malloc(96 * 1024);
-    if (!fsrc) { glDeleteShader(vs); return -1; }
-    if (!nv2a_psh_emit_glsl(&S.psh, fsrc, 96 * 1024)) {
-        free(fsrc); glDeleteShader(vs); S.shader_fails++; return -1;
+    if (!fsrc) { free(vsrc); return -1; }
+    if (!(msl ? nv2a_psh_emit_msl(&S.psh, fsrc, 96 * 1024)
+              : nv2a_psh_emit_glsl(&S.psh, fsrc, 96 * 1024))) {
+        free(fsrc); free(vsrc); S.shader_fails++; return -1;
     }
-    fs = compile(GL_FRAGMENT_SHADER, fsrc, "combiners (fixed-function draw)");
+    if (msl && getenv("RECOMP_GL_DUMP_MSL")) dump_msl_pair(hash, vsrc, fsrc);
+    prog = build_program(vsrc, fsrc, "fixed-function transform + combiners");
+    free(vsrc);
     free(fsrc);
-    if (!fs) { glDeleteShader(vs); S.shader_fails++; return -1; }
-
-    prog = glCreateProgram();
-    glAttachShader(prog, vs);
-    glAttachShader(prog, fs);
-    glLinkProgram(prog);
-    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-    if (!ok) {
-        char log[2048];
-        glGetProgramInfoLog(prog, sizeof log, NULL, log);
-        fprintf(stderr, "  [GL] fixed-function link failed: %s\n", log);
-        glDeleteProgram(prog);
-        S.shader_fails++;
-        return -1;
-    }
-    if (g_pcache[slot].used) glDeleteProgram(g_pcache[slot].prog);
+    if (!prog) { S.shader_fails++; return -1; }
+    if (g_pcache[slot].used && g_pcache[slot].prog) G->prog_free(g_pcache[slot].prog);
     free(g_pcache[slot].dis);
     memset(&g_pcache[slot], 0, sizeof g_pcache[slot]);
     g_pcache[slot].used = 1;
@@ -1859,7 +1756,6 @@ static int ff_program_for_current(void)
     g_pcache[slot].dis = (dump_slot() >= 0 || dump_big() > 0)
                        ? strdup("  (fixed-function transform, no microcode)\n")
                        : NULL;
-    pcache_locate_uniforms(slot);
     S.prog_switches++;
     return slot;
 }
@@ -1869,9 +1765,8 @@ static int program_for_current(void)
     uint32_t hash, start;
     Nv2aVshProgram vp;
     char *vsrc, *fsrc;
-    GLuint vs, fs, prog;
-    GLint ok = 0;
-    int slot, len;
+    uint32_t prog;
+    int slot, len, msl = (G->lang == NV2A_LANG_MSL);
 
     /*
      * Programs run from where NV097_SET_TRANSFORM_PROGRAM_START points, not
@@ -1930,7 +1825,8 @@ static int program_for_current(void)
 
     vsrc = (char *)malloc(96 * 1024);
     if (!vsrc) return -1;
-    if (!nv2a_vsh_emit_glsl(&vp, vsrc, 96 * 1024)) {
+    if (!(msl ? nv2a_vsh_emit_msl(&vp, vsrc, 96 * 1024)
+              : nv2a_vsh_emit_glsl(&vp, vsrc, 96 * 1024))) {
         free(vsrc); S.shader_fails++; return -1;
     }
     if (getenv("RECOMP_GL_DUMP_RAW")) {
@@ -1959,23 +1855,26 @@ static int program_for_current(void)
         if (nv2a_vsh_disasm(&vp, dis, sizeof dis))
             fprintf(stderr, "----- NV2A program (%d slots, hash %08X) -----\n%s",
                     len, hash, dis);
-        fprintf(stderr, "----- GLSL -----\n%s\n", vsrc);
+        fprintf(stderr, "----- %s -----\n%s\n", msl ? "MSL" : "GLSL", vsrc);
     }
 
-    vs = compile(GL_VERTEX_SHADER, vsrc, "translated vertex program");
-    free(vsrc);
-    if (!vs) { S.shader_fails++; return -1; }
     fsrc = (char *)malloc(96 * 1024);
-    if (!fsrc) { glDeleteShader(vs); return -1; }
-    if (!nv2a_psh_emit_glsl(&S.psh, fsrc, 96 * 1024)) {
-        free(fsrc); glDeleteShader(vs); S.shader_fails++; return -1;
+    if (!fsrc) { free(vsrc); return -1; }
+    if (!(msl ? nv2a_psh_emit_msl(&S.psh, fsrc, 96 * 1024)
+              : nv2a_psh_emit_glsl(&S.psh, fsrc, 96 * 1024))) {
+        free(fsrc); free(vsrc); S.shader_fails++; return -1;
     }
+    /* RECOMP_GL_DUMP_MSL=<dir>: every program's Metal translation, from
+     * either backend -- the OpenGL one translates it only to write it out. */
     if (getenv("RECOMP_GL_DUMP_MSL")) {
-        char *mv = (char *)malloc(96 * 1024), *mf = (char *)malloc(96 * 1024);
-        if (mv && mf && nv2a_vsh_emit_msl(&vp, mv, 96 * 1024)
-                     && nv2a_psh_emit_msl(&S.psh, mf, 96 * 1024))
-            dump_msl_pair(hash, mv, mf);
-        free(mv); free(mf);
+        if (msl) dump_msl_pair(hash, vsrc, fsrc);
+        else {
+            char *mv = (char *)malloc(96 * 1024), *mf = (char *)malloc(96 * 1024);
+            if (mv && mf && nv2a_vsh_emit_msl(&vp, mv, 96 * 1024)
+                         && nv2a_psh_emit_msl(&S.psh, mf, 96 * 1024))
+                dump_msl_pair(hash, mv, mf);
+            free(mv); free(mf);
+        }
     }
     { static int solid = -1;
       if (solid < 0) solid = (getenv("RECOMP_GL_SOLID")
@@ -2014,29 +1913,14 @@ static int program_for_current(void)
                 S.psh.tex_alpha_only[3], S.psh.alpha_test, S.psh.alpha_func,
                 S.psh.alpha_ref, fsrc ? fsrc : "(solid)");
       } }
-    fs = compile(GL_FRAGMENT_SHADER, fsrc ? fsrc : FRAG_SOLID,
-                 "combiner shader");
+    prog = build_program(vsrc, fsrc ? fsrc : frag_solid(),
+                         "translated vertex program + combiners");
+    free(vsrc);
     free(fsrc);
-    if (!fs) { glDeleteShader(vs); S.shader_fails++; return -1; }
-
-    prog = glCreateProgram();
-    glAttachShader(prog, vs);
-    glAttachShader(prog, fs);
-    glLinkProgram(prog);
-    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-    if (!ok) {
-        char log[4096]; GLsizei n = 0;
-        glGetProgramInfoLog(prog, sizeof log, &n, log);
-        fprintf(stderr, "  [GL] link failed:\n%.*s\n", (int)n, log);
-        glDeleteProgram(prog);
-        S.shader_fails++;
-        return -1;
-    }
+    if (!prog) { S.shader_fails++; return -1; }
 
     if (g_pcache[slot].used && g_pcache[slot].prog)
-        glDeleteProgram(g_pcache[slot].prog);
+        G->prog_free(g_pcache[slot].prog);
     g_pcache[slot].used   = 1;
     g_pcache[slot].hash   = hash;
     g_pcache[slot].last_draw = S.draws;
@@ -2082,7 +1966,6 @@ static int program_for_current(void)
           }
           break;
       } }
-    pcache_locate_uniforms(slot);
     S.prog_switches++;
     if (verbose())
         fprintf(stderr, "  [GL] compiled vertex program %08X (%d slots, "
@@ -2209,7 +2092,7 @@ static void tex_alpha_census(const uint8_t *rgba, uint32_t w, uint32_t h,
     fflush(stderr);
 }
 
-static GLuint upload_texture_inner(const TexStage *t);
+static uint32_t upload_texture_inner(const TexStage *t);
 /*
  * The texture for a stage whose address is a surface this backend renders
  * into, or 0 when it is not one.
@@ -2224,55 +2107,39 @@ static GLuint upload_texture_inner(const TexStage *t);
  * first and the copy is sampled.
  */
 static int g_upload_bias_bg;   /* see psh_sync_textures: bump sources */
-static GLuint g_fb_copy_tex;
-static uint32_t g_fb_copy_w, g_fb_copy_h;
 static int g_fb_copies;
-static GLuint surface_texture_for(const TexStage *t, float *sx, float *sy, int *slot_out)
+static uint32_t surface_texture_for(const TexStage *t, float *sx, float *sy, int *slot_out)
 {
     int i = surface_find(t->offset, t->width, t->height, 1);
     int linear;
-    uint32_t pw, ph;
     if (slot_out) *slot_out = i;
     if (i < 0) return 0;
     linear = !fmt_is_swz(t->color) && !fmt_is_dxt(t->color);
     *sx = linear ? 1.0f / (float)g_surf[i].w : 1.0f;
     *sy = linear ? 1.0f / (float)g_surf[i].h : 1.0f;
-    if (i != g_cur_surf) return g_surf[i].tex;
-    pw = g_surf[i].w * gl_scale(); ph = g_surf[i].h * gl_scale();
-    if (!g_fb_copy_tex) glGenTextures(1, &g_fb_copy_tex);
-    glBindTexture(GL_TEXTURE_2D, g_fb_copy_tex);
-    if (g_fb_copy_w != pw || g_fb_copy_h != ph) {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)pw, (GLsizei)ph, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        g_fb_copy_w = pw; g_fb_copy_h = ph;
-    }
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_surf[i].fbo);
-    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, (GLsizei)pw, (GLsizei)ph);
-    glBindFramebuffer(GL_FRAMEBUFFER, g_surf[i].fbo);
+    if (i != g_cur_surf) return G->target_texture(g_surf[i].rt);
     if (g_fb_copies++ < 4)
         fprintf(stderr, "  [GL] draw %u samples surface %08X while drawing into it:"
                         " sampling a copy\n", S.draws, g_surf[i].offset);
-    return g_fb_copy_tex;
+    return G->target_snapshot(g_surf[i].rt);
 }
 
-static GLuint upload_texture(const TexStage *t)
+static uint32_t upload_texture(const TexStage *t)
 {
-    GLuint r; PROF_T0();
+    uint32_t r; PROF_T0();
     g_prof.n_tex_lookup++;
     r = upload_texture_inner(t);
     PROF_ADD(tex);
     return r;
 }
-static GLuint upload_texture_inner(const TexStage *t)
+static uint32_t upload_texture_inner(const TexStage *t)
 {
     uint32_t va = resolve(t->offset);
     const uint8_t *src = guest(va);
     uint32_t w = t->width, h = t->height, i, hash, key;
-    GLuint tex;
+    uint32_t tex;
+    uint8_t *rgba = NULL;
+    Nv2aSampler smp;
     int slot = -1;
 
     if (!w || !h || w > 4096 || h > 4096) return 0;
@@ -2355,11 +2222,14 @@ static GLuint upload_texture_inner(const TexStage *t)
                   S.draws, S.flips, t->offset, w, h, t->color, t->pitch,
                   S.xf_mode == NV2A_XF_MODE_FIXED ? "ff" : "vp");
       } }
-    if (g_tcache[slot].used && g_tcache[slot].tex)
-        glDeleteTextures(1, &g_tcache[slot].tex);
-    glGenTextures(1, &tex);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    if (g_tcache[slot].used && g_tcache[slot].tex) {
+        G->tex_free(g_tcache[slot].tex);
+        g_tcache[slot].tex = 0;
+    }
+    /* Until the new texture exists the slot holds nothing: a tombstone that
+     * keeps its place in the probe chain and matches no lookup. */
+    g_tcache[slot].offset = 0xFFFFFFFFu;
+    g_tcache[slot].hash = 0xFFFFFFFFu;
 
     if (fmt_is_dxt(t->color)) {
         /* Decoded here rather than handed to the driver compressed.
@@ -2371,10 +2241,10 @@ static GLuint upload_texture_inner(const TexStage *t)
          * a whole-screen failure caused by a driver capability, which is not
          * a trade worth making for an upload that happens once per texture
          * and is cached afterwards. */
-        uint8_t *rgba = (uint8_t *)malloc((size_t)w * h * 4);
         uint32_t x, y;
 
-        if (!rgba) { glDeleteTextures(1, &tex); return 0; }
+        rgba = (uint8_t *)malloc((size_t)w * h * 4);
+        if (!rgba) return 0;
         for (y = 0; y < h; y++)
             for (x = 0; x < w; x++) {
                 uint32_t argb = 0xFF000000u;
@@ -2386,13 +2256,9 @@ static GLuint upload_texture_inner(const TexStage *t)
                 rgba[((size_t)y * w + x) * 4 + 3] = (uint8_t)(argb >> 24);
             }
         tex_alpha_census(rgba, w, h, t->color, 1);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-        free(rgba);
     } else {
         uint32_t lin = fmt_is_swz(t->color) ? swz_to_linear(t->color) : t->color;
         uint32_t bpp = linear_bpp(lin);
-        uint8_t *rgba;
         uint32_t x, y;
 
         if (!bpp) {
@@ -2409,10 +2275,10 @@ static GLuint upload_texture_inner(const TexStage *t)
                         "(pitch %u, draw %u; %lu such uploads so far)\n",
                         t->color, w, h, t->offset, t->pitch, S.draws, total);
             }
-            glDeleteTextures(1, &tex); return 0;
+            return 0;
         }
         rgba = (uint8_t *)malloc((size_t)w * h * 4);
-        if (!rgba) { glDeleteTextures(1, &tex); return 0; }
+        if (!rgba) return 0;
         for (y = 0; y < h; y++) {
             for (x = 0; x < w; x++) {
                 const uint8_t *p;
@@ -2431,9 +2297,6 @@ static GLuint upload_texture_inner(const TexStage *t)
             }
         }
         tex_alpha_census(rgba, w, h, t->color, 0);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-        free(rgba);
     }
     /* RECOMP_GL_DUMP_TEX=<prefix>: every texture as uploaded. A frame that
      * shades to black is either sampling the wrong place or sampling a black
@@ -2463,7 +2326,12 @@ static GLuint upload_texture_inner(const TexStage *t)
             if (back) {
                 char nm[128]; FILE *f; uint32_t x, y, row, sz, nz = 0;
                 uint8_t hdr[54];
-                glGetTexImage(GL_TEXTURE_2D, 0, GL_BGRA, GL_UNSIGNED_BYTE, back);
+                /* What is being uploaded, as BGRA: the same bytes the
+                 * device gets, without asking it for them back. */
+                for (x = 0; x < w * h; x++) {
+                    back[x*4+0] = rgba[x*4+2]; back[x*4+1] = rgba[x*4+1];
+                    back[x*4+2] = rgba[x*4+0]; back[x*4+3] = rgba[x*4+3];
+                }
                 for (x = 0; x < w * h; x++)
                     if (back[x*4] | back[x*4+1] | back[x*4+2]) nz++;
                 snprintf(nm, sizeof nm, "%s%02d_%08X_f%02X_%ux%u.bmp",
@@ -2533,7 +2401,6 @@ static GLuint upload_texture_inner(const TexStage *t)
     {
         uint32_t minf = (t->filter >> 16) & 0xF;
         uint32_t magf = (t->filter >> 24) & 0xF;
-        GLenum mn, mg;
         static int want_mips = -1;
         if (want_mips < 0) {
             const char *v = getenv("RECOMP_GL_MIPMAP");
@@ -2551,8 +2418,8 @@ static GLuint upload_texture_inner(const TexStage *t)
          * neighbouring pieces into each other, and by the third level a sign
          * is carrying its neighbour's colour. Trilinear then blends toward
          * those levels for anything not filling the screen, so the whole
-         * world goes soft and slightly wrong at once. Julien called it
-         * straight away: worse than before.
+         * world goes soft and slightly wrong at once. The first player to
+         * see it called it straight away: worse than before.
          *
          * The console had the real chain sitting in the texture. Until this
          * decodes it -- swizzled and DXT-compressed, per level -- the honest
@@ -2566,36 +2433,31 @@ static GLuint upload_texture_inner(const TexStage *t)
          * invented. RECOMP_GL_MIPMAP=1 puts the generated chain back for
          * anyone who wants to compare.
          */
+        memset(&smp, 0, sizeof smp);
         if (minf >= 3 && minf <= 6) {
             if (want_mips) {
-                glGenerateMipmap(GL_TEXTURE_2D);
-                mn = minf == 3 ? GL_NEAREST_MIPMAP_NEAREST
-                   : minf == 4 ? GL_LINEAR_MIPMAP_NEAREST
-                   : minf == 5 ? GL_NEAREST_MIPMAP_LINEAR
-                               : GL_LINEAR_MIPMAP_LINEAR;
+                /* 3 and 5 sample nearest within a level, 4 and 6 linear;
+                 * 3 and 4 take the nearest level, 5 and 6 blend two. */
+                smp.min_linear = (minf == 4 || minf == 6);
+                smp.mip = (minf == 3 || minf == 4) ? 1 : 2;
                 /* Anisotropy only makes sense alongside a chain, and it was
                  * the other half of what made distant surfaces look smeared
                  * rather than sharp. It goes with the chain. */
-                { static float aniso = -1.0f;
-                  if (aniso < 0.0f) {
+                { static int aniso = -1;
+                  if (aniso < 0) {
                       const char *v = getenv("RECOMP_GL_ANISO");
-                      GLfloat cap = 1.0f;
-                      glGetFloatv(0x84FF, &cap);
-                      aniso = v ? (float)atof(v) : 4.0f;
-                      if (aniso > (float)cap) aniso = (float)cap;
-                      if (aniso < 1.0f) aniso = 1.0f;
+                      aniso = v ? atoi(v) : 4;
+                      if (aniso < 1) aniso = 1;
+                      if (aniso > 16) aniso = 16;
                   }
-                  if (aniso > 1.0f)
-                      glTexParameterf(GL_TEXTURE_2D, 0x84FE, aniso); }
+                  smp.aniso = (uint8_t)aniso; }
             } else {
-                mn = (minf == 3 || minf == 5) ? GL_NEAREST : GL_LINEAR;
+                smp.min_linear = !(minf == 3 || minf == 5);
             }
         } else {
-            mn = minf == 1 ? GL_NEAREST : GL_LINEAR;
+            smp.min_linear = (minf != 1);
         }
-        mg = magf == 1 ? GL_NEAREST : GL_LINEAR;
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, (GLint)mn);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, (GLint)mg);
+        smp.mag_linear = (magf != 1);
     }
     /* Wrap. Mode 1 is repeat, 2 mirrors, 4 uses the border colour and 3 and 5
      * clamp; everything that was not 1 used to clamp, so a mirrored texture
@@ -2609,16 +2471,16 @@ static GLuint upload_texture_inner(const TexStage *t)
      * is transparent black -- and a texture atlas sampled a hair outside its
      * rectangle then returns black instead of the neighbouring texel. That
      * is a thin dark line along every seam in the world, which is exactly
-     * what Julien saw appear. Clamping is wrong in the same small way it was
+     * what the player saw appear. Clamping is wrong in the same small way it was
      * wrong before, and wrong invisibly rather than wrong in black. */
-    { static const GLint wrap_of[8] = {
-          GL_CLAMP_TO_EDGE, GL_REPEAT, GL_MIRRORED_REPEAT, GL_CLAMP_TO_EDGE,
-          GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE,
-          GL_CLAMP_TO_EDGE };
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                      wrap_of[t->addr & 7u]);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                      wrap_of[(t->addr >> 8) & 7u]); }
+    /* 0 clamp, 1 repeat, 2 mirrored repeat -- in the device's terms. */
+    { static const uint8_t wrap_of[8] = { 0, 1, 2, 0, 0, 0, 0, 0 };
+      smp.wrap_s = wrap_of[t->addr & 7u];
+      smp.wrap_t = wrap_of[(t->addr >> 8) & 7u]; }
+
+    tex = G->tex_new(w, h, rgba, &smp);
+    free(rgba);
+    if (!tex) return 0;
 
     g_prof.n_tex_upload++;
     g_tcache[slot].used = 1;
@@ -2684,24 +2546,39 @@ static void fetch(const Attr *a, uint32_t index, float out[4], int inl)
 
 /* ---- draw --------------------------------------------------------------- */
 
-static GLenum gl_prim(uint32_t p, uint32_t *fan_expand)
+static int nv2a_prim(uint32_t p, uint32_t *fan_expand)
 {
     *fan_expand = 0;
     switch (p) {
-    case PRIM_POINTS:         return GL_POINTS;
-    case PRIM_LINES:          return GL_LINES;
-    case PRIM_LINE_LOOP:      return GL_LINE_LOOP;
-    case PRIM_LINE_STRIP:     return GL_LINE_STRIP;
-    case PRIM_TRIANGLES:      return GL_TRIANGLES;
-    case PRIM_TRIANGLE_STRIP: return GL_TRIANGLE_STRIP;
-    case PRIM_TRIANGLE_FAN:   return GL_TRIANGLE_FAN;
-    case PRIM_POLYGON:        return GL_TRIANGLE_FAN;
-    /* Quads have no core-profile equivalent, so they are expanded into two
-     * triangles per quad on the way to the buffer rather than emulated with
-     * a geometry shader. */
-    case PRIM_QUADS:          *fan_expand = 1; return GL_TRIANGLES;
-    case PRIM_QUAD_STRIP:     *fan_expand = 2; return GL_TRIANGLES;
+    case PRIM_POINTS:         return NV2A_PRIM_POINTS;
+    case PRIM_LINES:          return NV2A_PRIM_LINES;
+    case PRIM_LINE_LOOP:      return NV2A_PRIM_LINE_LOOP;
+    case PRIM_LINE_STRIP:     return NV2A_PRIM_LINE_STRIP;
+    case PRIM_TRIANGLES:      return NV2A_PRIM_TRIANGLES;
+    case PRIM_TRIANGLE_STRIP: return NV2A_PRIM_TRIANGLE_STRIP;
+    case PRIM_TRIANGLE_FAN:   return NV2A_PRIM_TRIANGLE_FAN;
+    case PRIM_POLYGON:        return NV2A_PRIM_TRIANGLE_FAN;
+    /* Quads have no core-profile equivalent (nor a Metal one), so they are
+     * expanded into two triangles per quad on the way to the buffer rather
+     * than emulated with a geometry shader. */
+    case PRIM_QUADS:          *fan_expand = 1; return NV2A_PRIM_TRIANGLES;
+    case PRIM_QUAD_STRIP:     *fan_expand = 2; return NV2A_PRIM_TRIANGLES;
     default:                  return 0;
+    }
+}
+
+#ifdef NV2A_GL_HAVE_GL
+/* The same in GL's terms, for the GL-only probes below. */
+static GLenum gl_mode_of(int prim)
+{
+    switch (prim) {
+    case NV2A_PRIM_LINES:          return GL_LINES;
+    case NV2A_PRIM_LINE_LOOP:      return GL_LINE_LOOP;
+    case NV2A_PRIM_LINE_STRIP:     return GL_LINE_STRIP;
+    case NV2A_PRIM_TRIANGLE_STRIP: return GL_TRIANGLE_STRIP;
+    case NV2A_PRIM_TRIANGLE_FAN:   return GL_TRIANGLE_FAN;
+    case NV2A_PRIM_POINTS:         return GL_POINTS;
+    default:                       return GL_TRIANGLES;
     }
 }
 
@@ -2733,6 +2610,7 @@ static GLenum gl_depth_func(uint32_t f)
     default:     return GL_LEQUAL;
     }
 }
+#endif /* NV2A_GL_HAVE_GL */
 
 
 /*
@@ -2835,7 +2713,7 @@ static void write_bmp(const char *nm, const uint8_t *buf,
  * Reads back rather than sharing the present path's buffer: the two are asked
  * at different moments -- one at the end of a frame, one straight after a
  * draw -- and the whole value of the second is that it is not the first. */
-static void dump_fbo(const char *prefix, int *counter, int limit)
+static void dump_fbo(uint32_t rt, const char *prefix, int *counter, int limit)
 {
     static uint8_t *buf;
     static uint32_t cap;
@@ -2848,11 +2726,9 @@ static void dump_fbo(const char *prefix, int *counter, int limit)
     need = pw * ph * 4;
     if (cap < need) { free(buf); buf = (uint8_t *)malloc(need); cap = need; }
     if (!buf) return;
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
 
     /* Colour first, always. */
-    glReadPixels(0, 0, (GLsizei)pw, (GLsizei)ph, GL_BGRA,
-                 GL_UNSIGNED_BYTE, buf);
+    if (!G->target_read(rt, 0, 0, pw, ph, 1, buf)) return;
     for (i = 0; i < pw * ph; i++)
         if (buf[i*4] | buf[i*4+1] | buf[i*4+2]) nz++;
     snprintf(nm, sizeof nm, "%s%03d.bmp", prefix, (*counter)++);
@@ -2884,8 +2760,10 @@ static void dump_fbo(const char *prefix, int *counter, int limit)
           if (zb) {
               float lo = 1e30f, hi = -1e30f;
               unsigned h[10] = {0}, at1 = 0, j;
-              glReadPixels(0, 0, (GLsizei)pw, (GLsizei)ph,
-                           GL_DEPTH_COMPONENT, GL_FLOAT, zb);
+              if (!G->target_read_depth(rt, pw, ph, zb)) {
+                  fprintf(stderr, "  [GL] depth readback: not on the %s backend\n", G->name);
+                  return;
+              }
               for (i = 0; i < np; i++) {
                   if (zb[i] < lo) lo = zb[i];
                   if (zb[i] < 1.0f && zb[i] > hi) hi = zb[i];
@@ -2940,7 +2818,7 @@ static void surface_sync(void)
     if (!g_ready) return;
     if (S.surf_dirty) {
         S.surf_dirty = 0;
-        backend()->surface(S.color_offset, S.clip_w, S.clip_h, gl_scale());
+        surface_bind(S.color_offset, S.clip_w, S.clip_h);
         if (g_pass_trace_until && S.frames < g_pass_trace_until)
             fprintf(stderr, "[PASS] f%u d%u bind surface %08X %ux%u pitch %u fmt %02X zeta %08X\n",
                     S.frames, S.draws, S.color_offset, S.clip_w, S.clip_h,
@@ -2989,6 +2867,8 @@ static volatile int g_wide_scene = 1;
 void nv2a_set_wide_scene(int on) { g_wide_scene = on ? 1 : 0; }
 int nv2a_wide_scene(void) { return nv2a_widescreen() && g_wide_scene; }
 static int g_wide_squeeze;   /* this draw's 2D squeeze, set in do_draw */
+static float g_wide_shift;   /* this draw's framed-3D move, title pixels, ditto */
+static Nv2aRenderState g_draw_rs;   /* the state this draw was given */
 static float g_wide_ext[4];  /* its x and y extent, for the draw log */
 
 static void do_draw(void)
@@ -2996,7 +2876,7 @@ static void do_draw(void)
     static float *vbuf;
     static uint32_t vbuf_cap;
     uint32_t n, i, k, out_n, fan_expand;
-    GLenum mode;
+    int mode;
     int slot;
     int inl = (S.inline_count != 0);
     uint32_t stride_floats = NUM_ATTRS * 4;
@@ -3010,8 +2890,11 @@ static void do_draw(void)
     if (!g_ready || !S.prim) return;
     surface_sync();
 
-    mode = gl_prim(S.prim, &fan_expand);
-    if (!mode) return;
+    mode = nv2a_prim(S.prim, &fan_expand);
+    /* Points included: this tested a GLenum against zero, and GL_POINTS is
+     * zero, so point lists have never been drawn. Kept that way here so the
+     * two backends agree; drawing them is a change to make on purpose. */
+    if (!mode || mode == NV2A_PRIM_POINTS) return;
 
     /* Indices: an explicit list, a DRAW_ARRAYS range, or the implicit
      * 0..n-1 of an inline batch. */
@@ -3136,7 +3019,7 @@ static void do_draw(void)
      * ONLY_XF above splits by transform pipeline, which for this title turns
      * out not to be the interesting line -- almost everything in the 3D
      * scene is programmable, so it separates the 2D screens from the world
-     * and nothing else. The line that matters is the one Julien drew: the
+     * and nothing else. The line that matters is the one the player drew: the
      * things that move against the things that do not. A moving object picks
      * its matrix with the address register and a piece of the city does not,
      * so that flag is the split, exactly.
@@ -3452,7 +3335,8 @@ static void do_draw(void)
         if (verbose() && shown < 6) {
             uint32_t j;
             shown++;
-            {
+#ifdef NV2A_GL_HAVE_GL
+            if (g_is_gl) {
                 GLint fb = 0, vp4[4] = {0,0,0,0}, cp = 0, va = 0;
                 glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fb);
                 glGetIntegerv(GL_VIEWPORT, vp4);
@@ -3460,10 +3344,11 @@ static void do_draw(void)
                 glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &va);
                 fprintf(stderr, "  [GL] context: fbo=%d (ours %u) viewport=%d,%d %dx%d "
                         "program=%d vao=%d depth=%d blend=%d cull=%d scissor=%d\n",
-                        fb, g_fbo, vp4[0], vp4[1], vp4[2], vp4[3], cp, va,
+                        fb, nv2a_gfx_gl_fbo(g_cur_rt), vp4[0], vp4[1], vp4[2], vp4[3], cp, va,
                         glIsEnabled(GL_DEPTH_TEST), glIsEnabled(GL_BLEND),
                         glIsEnabled(GL_CULL_FACE), glIsEnabled(GL_SCISSOR_TEST));
             }
+#endif
             fprintf(stderr, "  [GL] draw prim=%u verts=%u inputs=%04X inline=%d\n",
                     S.prim, out_n, g_pcache[slot].inputs, inl);
             for (j = 0; j < NUM_ATTRS; j++)
@@ -3526,69 +3411,44 @@ static void do_draw(void)
           if (nosq < 0) nosq = getenv("RECOMP_WIDE_NOSQUEEZE") ? 1 : 0;
           if (nosq) g_wide_squeeze = 0; }
     }
+    /*
+     * A 3D view inside a 2D frame -- the character select's two windows onto
+     * the stage, a split screen. The title points it at a part of the screen
+     * with a window clip rectangle (and a viewport to match). Widened, its
+     * picture comes out 4:3-shaped once the window stretches it again, as
+     * everything 3D does; but its rectangle is where the title put it on a
+     * 4:3 screen, while the frame around it is an overlay and was squeezed
+     * toward the centre -- so the stretch carried the picture out from under
+     * its frame: the character slid out of his window, and the select screen
+     * drew a strip of the stage outside the panel altogether. Moved toward
+     * the centre by the same 3/4 as the frame, and clipped to the frame's
+     * squeezed rectangle, the view lines up and shows what the console's did
+     * -- the wider camera fills a narrower window. A view that fills the
+     * width is the scene itself and is left alone.
+     */
+    g_wide_shift = 0.0f;
+    if (nv2a_wide_scene() && !g_wide_squeeze && S.clip_w == 640 && S.clip_h == 480
+        && !(S.xf_mode != NV2A_XF_MODE_FIXED && g_pcache[slot].inputs == 0x1F9B)
+        && S.wclip_valid && S.wclip_type == 0) {
+        uint32_t x0 =  S.wclip_h[0]        & 0xFFFu;
+        uint32_t x1 = (S.wclip_h[0] >> 16) & 0xFFFu;
+        uint32_t y0 =  S.wclip_v[0]        & 0xFFFu;
+        uint32_t y1 = (S.wclip_v[0] >> 16) & 0xFFFu;
+        if (x1 > x0 && y1 > y0 && x1 - x0 + 1 < 600u)
+            g_wide_shift = 0.25f * (0.5f * (float)(x0 + x1 + 1) - 320.0f);
+    }
 
+    /* The vertices, where each attribute sits in them, and the value of
+     * each one the program reads that has no array (see the device). */
     { PROF_T0();
-      glBindVertexArray(g_vao);
-      glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
-      glBufferData(GL_ARRAY_BUFFER,
-                   (GLsizeiptr)out_n * stride_floats * sizeof(float),
-                   vbuf, GL_STREAM_DRAW);
+      G->vertices(vbuf, out_n, stride_floats, attr_at, const_mask,
+                  (const float (*)[4])S.const_attr);
       PROF_ADD(vbo);
       g_prof.vbo_bytes += (unsigned long)out_n * stride_floats * sizeof(float); }
-    /* The buffer is re-created every draw, so the pointers have to be re-
-     * specified only when the layout changes -- the offsets and stride are a
-     * property of the layout, not of the buffer. The layout is now the set of
-     * attributes that came from arrays and where each one sits, so the key has
-     * to be both of those and not just what the program reads: the same
-     * program drawn twice with a different attribute supplied as a constant is
-     * a different layout. */
-    {
-        uint32_t layout_key = 0, j;
-        for (j = 0; j < (uint32_t)nlive; j++)
-            layout_key = layout_key * 17u + (live[j].idx + 1u);
-        layout_key = layout_key * 65599u + const_mask;
-        if (!g_last.valid || g_last.layout != layout_key) {
-            for (i = 0; i < NUM_ATTRS; i++) {
-                if (attr_at[i] >= 0) {
-                    glEnableVertexAttribArray(i);
-                    glVertexAttribPointer(i, 4, GL_FLOAT, GL_FALSE,
-                        (GLsizei)(stride_floats * sizeof(float)),
-                        (const void *)(uintptr_t)((uint32_t)attr_at[i] * sizeof(float)));
-                } else {
-                    glDisableVertexAttribArray(i);
-                }
-            }
-            g_last.layout = layout_key;
-            g_last.const_mask = ~const_mask;   /* force the constants below */
-        }
-        /* An attribute the program reads with no array behind it is one value
-         * for the whole draw. GL has a per-attribute constant for exactly
-         * this, so it costs one call rather than four floats in every vertex. */
-        /* The mask says WHICH attributes are constant, not what they are.
-         * Comparing only the mask meant a draw that supplied the same set of
-         * constant attributes with different values inherited the previous
-         * object's -- every batch after the first in a run of them. Remember
-         * the values too, and re-send when either changes. */
-        /* Per attribute, now that the constants move with every draw (the
-         * sticky attributes): comparing the whole table re-sent every
-         * constant after every draw, because the attributes that came from
-         * arrays -- which are not sent from here at all -- had changed. */
-        if (const_mask) {
-            int all = (g_last.const_mask != const_mask);
-            for (i = 0; i < NUM_ATTRS; i++)
-                if ((const_mask & (1u << i))
-                    && (all || memcmp(g_last.const_attr[i], S.const_attr[i],
-                                      sizeof S.const_attr[i]))) {
-                    glVertexAttrib4fv(i, S.const_attr[i]);
-                    memcpy(g_last.const_attr[i], S.const_attr[i], sizeof S.const_attr[i]);
-                }
-            g_last.const_mask = const_mask;
-        }
-    }
 
     if (g_cur_slot != slot) {
         g_prof.n_prog_switch++;
-        glUseProgram(g_pcache[slot].prog);
+        G->prog_use(g_pcache[slot].prog);
         g_cur_prog = g_pcache[slot].prog;
         g_cur_slot = slot;
         /* Uniforms belong to the program object, so a switch invalidates
@@ -3712,12 +3572,12 @@ static void do_draw(void)
       if (mode == -2) { const char *v = getenv("RECOMP_GL_POSMODE");
                         mode = v ? atoi(v) : 0; }
       use = (mode == 9) ? (S.xf_mode == NV2A_XF_MODE_FIXED ? 0 : 1) : mode;
-      if (g_pcache[slot].u_posMode >= 0)
-          glUniform1i(g_pcache[slot].u_posMode, use); }
+      if (uses(slot, NV2A_U_POSMODE))
+          G->uniform_i(NV2A_U_POSMODE, use); }
     /* Whether the fog register carries a real factor or a flat 1.0. Uniforms
      * belong to the program object, so this goes in per draw like the rest. */
-    if (g_pcache[slot].u_fogEnable >= 0)
-        glUniform1i(g_pcache[slot].u_fogEnable, S.fog_enable ? 1 : 0);
+    if (uses(slot, NV2A_U_FOGENABLE))
+        G->uniform_i(NV2A_U_FOGENABLE, S.fog_enable ? 1 : 0);
     /*
      * RECOMP_GL_DRAWID: paint each draw with its own index instead of its
      * colour, so the finished frame says which draw owns which pixel.
@@ -3744,7 +3604,7 @@ static void do_draw(void)
      */
     { static int tc = -1;
       if (tc < 0) tc = getenv("RECOMP_GL_TINTCLIP") ? 1 : 0;
-      if (tc && g_pcache[slot].u_drawTint >= 0 && out_n >= 3
+      if (tc && uses(slot, NV2A_U_DRAWTINT) && out_n >= 3
              && S.xf_mode != NV2A_XF_MODE_FIXED) {
           Nv2aVshProgram vp;
           uint32_t pstart = S.prog_start < NV2A_VSH_MAX_INSNS ? S.prog_start : 0;
@@ -3769,12 +3629,12 @@ static void do_draw(void)
                 float ndcz = z01 * 2.0f - 1.0f;   /* GL clip is [-w,w]/[-1,1] */
                 if (ndcz < -1.001f || ndcz > 1.001f) clipped++; else ok++; }
           }
-          glUniform4f(g_pcache[slot].u_drawTint,
+          uni4f(NV2A_U_DRAWTINT,
                       clipped > ok ? 0.95f : 0.1f,
                       clipped > ok ? 0.1f  : 0.9f, 0.1f, 1.0f);
           goto tint_done;
       } }
-    if (g_pcache[slot].u_drawTint >= 0) {
+    if (uses(slot, NV2A_U_DRAWTINT)) {
         static int drawid = -1;
         if (drawid < 0) drawid = getenv("RECOMP_GL_DRAWID") ? 1 : 0;
         static int tintxf = -1, tintge = -1;
@@ -3797,9 +3657,9 @@ static void do_draw(void)
             /* Flat colours, since the tint replaces the combiner: GEQUAL in
              * red, everything else in a grey that still shows its shape. */
             if (S.depth_func == 0x206)
-                glUniform4f(g_pcache[slot].u_drawTint, 0.9f, 0.1f, 0.1f, 1.0f);
+                uni4f(NV2A_U_DRAWTINT, 0.9f, 0.1f, 0.1f, 1.0f);
             else
-                glUniform4f(g_pcache[slot].u_drawTint, 0.35f, 0.35f, 0.4f, 1.0f);
+                uni4f(NV2A_U_DRAWTINT, 0.35f, 0.35f, 0.4f, 1.0f);
         } else if (tintxf) {
             /* Which pipeline drew which surface, in one frame.
              *
@@ -3828,80 +3688,80 @@ static void do_draw(void)
              * the comparison that was wanted. */
             if (tintxf == 3) {
                 if (fixed || out_n <= 6)
-                    glUniform4f(g_pcache[slot].u_drawTint,
+                    uni4f(NV2A_U_DRAWTINT,
                                 1.0f, 1.0f, 1.0f, 1.0f);
                 else
-                    glUniform4f(g_pcache[slot].u_drawTint,
+                    uni4f(NV2A_U_DRAWTINT,
                                 3.0f, 0.2f, 0.2f, 1.0f);
             } else if (tintxf == 2) {
-                if (fixed) glUniform4f(g_pcache[slot].u_drawTint,
+                if (fixed) uni4f(NV2A_U_DRAWTINT,
                                        1.0f, 1.0f, 1.0f, 1.0f);
-                else       glUniform4f(g_pcache[slot].u_drawTint,
+                else       uni4f(NV2A_U_DRAWTINT,
                                        3.0f, 0.2f, 0.2f, 1.0f);
             } else
-            glUniform4f(g_pcache[slot].u_drawTint,
+            uni4f(NV2A_U_DRAWTINT,
                         fixed ? 0.25f : 1.0f, fixed ? 1.0f : 0.25f,
                         0.25f, 1.0f);
         } else if (drawid) {
             uint32_t i = S.since_present;
-            glUniform4f(g_pcache[slot].u_drawTint,
+            uni4f(NV2A_U_DRAWTINT,
                         (i & 0xFF) / 255.0f, ((i >> 8) & 0xFF) / 255.0f,
                         0.0f, 1.0f);
         } else {
-            glUniform4f(g_pcache[slot].u_drawTint, 1.0f, 0.0f, 1.0f, 1.0f);
+            uni4f(NV2A_U_DRAWTINT, 1.0f, 0.0f, 1.0f, 1.0f);
         }
     }
     tint_done: ;
     /* The fixed-function transform, for the shaders that use it. Uploaded
      * whenever it changed or the program did, since uniforms belong to the
      * program object. */
-    if (g_pcache[slot].u_zClip >= 0)
-        glUniform2f(g_pcache[slot].u_zClip, S.u.z_clip[0], S.u.z_clip[1]);
-    if (g_pcache[slot].u_litAmbient >= 0) {
+    if (uses(slot, NV2A_U_ZCLIP))
+        uni2f(NV2A_U_ZCLIP, S.u.z_clip[0], S.u.z_clip[1]);
+    if (uses(slot, NV2A_U_LITAMBIENT)) {
         /* RECOMP_GL_FF_LIGHT=<f>: how much light to add to a batch the title
          * asked the hardware to light. 0 keeps today's behaviour exactly. */
         static float amt = -1.0f;
         if (amt < 0.0f) { const char *v = getenv("RECOMP_GL_FF_LIGHT");
                           amt = v ? (float)atof(v) : 0.0f; }
-        glUniform1f(g_pcache[slot].u_litAmbient, amt);
+        uni1f(NV2A_U_LITAMBIENT, amt);
     }
     /* The fixed-function lighting's state, for a lit batch. Uploaded every
      * draw: the title changes the light's colour between batches (its pause
      * map colours each element that way), and uniforms are per program. */
-    if (g_pcache[slot].u_ltSceneAmb >= 0) {
-        glUniform4fv(g_pcache[slot].u_ffMV, 4, &S.ff_mv[0][0]);
-        glUniform4fv(g_pcache[slot].u_ffIMV, 4, &S.ff_imv[0][0]);
-        glUniform3fv(g_pcache[slot].u_ltSceneAmb, 1, S.scene_ambient);
-        glUniform3fv(g_pcache[slot].u_ltMatEm, 1, S.material_emission);
-        glUniform1f(g_pcache[slot].u_ltMatAlpha, S.material_alpha);
-        glUniform3fv(g_pcache[slot].u_ltAmb, 8, &S.light_amb[0][0]);
-        glUniform3fv(g_pcache[slot].u_ltDif, 8, &S.light_dif[0][0]);
-        glUniform3fv(g_pcache[slot].u_ltSpc, 8, &S.light_spc[0][0]);
-        glUniform3fv(g_pcache[slot].u_ltDir, 8, &S.light_dir[0][0]);
-        glUniform3fv(g_pcache[slot].u_ltHalf, 8, &S.light_half[0][0]);
-        glUniform3fv(g_pcache[slot].u_ltPos, 8, &S.light_pos[0][0]);
-        glUniform3fv(g_pcache[slot].u_ltAtt, 8, &S.light_att[0][0]);
-        glUniform1fv(g_pcache[slot].u_ltRange, 8, S.light_range);
-        glUniform4fv(g_pcache[slot].u_ltSpotDir, 8, &S.light_spot_dir[0][0]);
+    if (uses(slot, NV2A_U_LTSCENEAMB)) {
+        G->uniform_f(NV2A_U_FFMV, &S.ff_mv[0][0], 4);
+        G->uniform_f(NV2A_U_FFIMV, &S.ff_imv[0][0], 4);
+        G->uniform_f(NV2A_U_LTSCENEAMB, S.scene_ambient, 1);
+        G->uniform_f(NV2A_U_LTMATEM, S.material_emission, 1);
+        uni1f(NV2A_U_LTMATALPHA, S.material_alpha);
+        G->uniform_f(NV2A_U_LTAMB, &S.light_amb[0][0], 8);
+        G->uniform_f(NV2A_U_LTDIF, &S.light_dif[0][0], 8);
+        G->uniform_f(NV2A_U_LTSPC, &S.light_spc[0][0], 8);
+        G->uniform_f(NV2A_U_LTDIR, &S.light_dir[0][0], 8);
+        G->uniform_f(NV2A_U_LTHALF, &S.light_half[0][0], 8);
+        G->uniform_f(NV2A_U_LTPOS, &S.light_pos[0][0], 8);
+        G->uniform_f(NV2A_U_LTATT, &S.light_att[0][0], 8);
+        G->uniform_f(NV2A_U_LTRANGE, S.light_range, 8);
+        G->uniform_f(NV2A_U_LTSPOTDIR, &S.light_spot_dir[0][0], 8);
         { float eye[4]; memcpy(eye, S.eye_position, sizeof eye);
           if (eye[3] == 0.0f) eye[3] = 1.0f;
-          glUniform4fv(g_pcache[slot].u_ltEye, 1, eye); }
+          G->uniform_f(NV2A_U_LTEYE, eye, 1); }
         /* The exponent: the title hands the hardware six coefficients of
          * its own approximation (NV097_SET_SPECULAR_PARAMS), which xemu
          * fits back to an exponent. Not reconstructed here yet -- every lit
          * batch this title draws has a black specular colour. */
-        glUniform1f(g_pcache[slot].u_ltSpecPow, 16.0f);
+        uni1f(NV2A_U_LTSPECPOW, 16.0f);
     }
-    if (g_pcache[slot].u_ffMat >= 0) {
-        glUniform4fv(g_pcache[slot].u_ffMat, 4, &S.u.ff_mat[0][0]);
-        if (g_pcache[slot].u_ffVpOff >= 0)
-            glUniform4fv(g_pcache[slot].u_ffVpOff, 1, S.vp_off_reg);
-        if (g_pcache[slot].u_ffTexMat >= 0)
-            glUniform4fv(g_pcache[slot].u_ffTexMat, 16, &S.u.ff_texmat[0][0]);
+    if (uses(slot, NV2A_U_FFMAT)) {
+        G->uniform_f(NV2A_U_FFMAT, &S.u.ff_mat[0][0], 4);
+        if (uses(slot, NV2A_U_FFVPOFF))
+            G->uniform_f(NV2A_U_FFVPOFF, S.vp_off_reg, 1);
+        if (uses(slot, NV2A_U_FFTEXMAT))
+            G->uniform_f(NV2A_U_FFTEXMAT, &S.u.ff_texmat[0][0], 16);
     }
     if (S.consts_dirty) {
         PROF_T0();
-        glUniform4fv(g_pcache[slot].u_c, NV2A_VSH_NUM_CONSTS, &S.u.c[0][0]);
+        G->uniform_f(NV2A_U_C, &S.u.c[0][0], NV2A_VSH_NUM_CONSTS);
         S.consts_dirty = 0;
         PROF_ADD(unif);
         g_prof.n_const_upload++;
@@ -3913,7 +3773,8 @@ static void do_draw(void)
     memcpy(vp_scale_eff, S.u.vp_scale, sizeof vp_scale_eff);
     if (g_wide_squeeze) vp_scale_eff[0] *= 4.0f / 3.0f;
     if (memcmp(g_last.vp_scale, vp_scale_eff, sizeof vp_scale_eff)
-     || memcmp(g_last.vp_off, S.u.vp_off, sizeof S.u.vp_off)) {
+     || memcmp(g_last.vp_off, S.u.vp_off, sizeof S.u.vp_off)
+     || g_last.wide_shift != g_wide_shift) {
         /* The viewport, whenever it changes.
          *
          * The depth buffer was measured holding the entire scene inside one
@@ -3931,11 +3792,13 @@ static void do_draw(void)
                     S.u.vp_off[0], S.u.vp_off[1], S.u.vp_off[2], S.u.vp_off[3],
                     S.xf_mode);
         }
-        glUniform4fv(g_pcache[slot].u_vpScale, 1, vp_scale_eff);
-        glUniform4fv(g_pcache[slot].u_vpOff, 1, S.u.vp_off);
-        glUniform2f(g_pcache[slot].u_vpSurface, (float)g_fbo_w, (float)g_fbo_h);
+        G->uniform_f(NV2A_U_VPSCALE, vp_scale_eff, 1);
+        G->uniform_f(NV2A_U_VPOFF, S.u.vp_off, 1);
+        uni2f(NV2A_U_VPSURFACE, (float)g_fbo_w, (float)g_fbo_h);
+        uni1f(NV2A_U_WIDESHIFT, g_wide_shift);
         memcpy(g_last.vp_scale, vp_scale_eff, sizeof vp_scale_eff);
         memcpy(g_last.vp_off, S.u.vp_off, sizeof S.u.vp_off);
+        g_last.wide_shift = g_wide_shift;
     }
 
     /* Bind every stage the combiner shader samples.
@@ -3948,15 +3811,12 @@ static void do_draw(void)
     {
         int st, srcslot[4] = { -1, -1, -1, -1 };
         for (st = 0; st < 4; st++) {
-            GLuint tex = 0;
+            uint32_t tex = 0;
             float sx = 1.0f, sy = 1.0f;
+            int flip;
 
             int sslot = -1;
 
-            /* The unit first: an upload or a feedback copy binds a texture,
-             * and before this it did so on the previous stage's unit --
-             * a cache miss on stage 1 rebound stage 0 for that draw. */
-            glActiveTexture((GLenum)(GL_TEXTURE0 + st));
             if (S.psh.tex_bound[st]) {
                 tex = surface_texture_for(&S.tex[st], &sx, &sy, &sslot);
                 if (!tex) {
@@ -3971,13 +3831,15 @@ static void do_draw(void)
                     }
                 }
             }
-            glBindTexture(GL_TEXTURE_2D, tex);
+            G->texture(st, tex);
             /* A surface this backend rendered holds its picture the GL way
              * up: the vertex stage sends screen y = 0 to NDC +1, so the top
              * row of the picture is the LAST row of the framebuffer. A
              * texture decoded from guest memory is the other way up (row 0
              * is the top), and the coordinates are the title's, so sampling
-             * a surface has to turn t around: t' = 1 - t.
+             * a surface has to turn t around: t' = 1 - t. (On OpenGL, that
+             * is: Metal keeps a target top row first, the same way up as a
+             * texture, and nothing is turned -- see rt_bottom_up.)
              *
              * Without it every render-to-texture pass turned the picture
              * over. JSRF's normal frame passes through exactly one (the
@@ -3987,19 +3849,19 @@ static void do_draw(void)
              * the world rendered to a 512x512 and a 128x128 target and
              * copied into the frame -- so during a boost the world was drawn
              * upside down under a HUD that was the right way up. */
-            if (g_pcache[slot].u_tex[st] >= 0)
-                glUniform1i(g_pcache[slot].u_tex[st], st);
-            if (g_pcache[slot].u_texScale[st] >= 0)
-                glUniform2f(g_pcache[slot].u_texScale[st], sx, sslot >= 0 ? -sy : sy);
-            if (g_pcache[slot].u_texOff[st] >= 0)
-                glUniform2f(g_pcache[slot].u_texOff[st], 0.0f, sslot >= 0 ? 1.0f : 0.0f);
-            if (g_pcache[slot].u_bumpMat[st] >= 0)
-                glUniformMatrix2fv(g_pcache[slot].u_bumpMat[st], 1, GL_FALSE,
-                                   S.tex[st].bump_mat);
-            if (g_pcache[slot].u_bumpScale[st] >= 0)
-                glUniform1f(g_pcache[slot].u_bumpScale[st], S.tex[st].bump_scale);
-            if (g_pcache[slot].u_bumpOff[st] >= 0)
-                glUniform1f(g_pcache[slot].u_bumpOff[st], S.tex[st].bump_off);
+            if (uses(slot, (NV2A_U_TEX0 + st)))
+                G->uniform_i((NV2A_U_TEX0 + st), st);
+            flip = (sslot >= 0 && G->rt_bottom_up);
+            if (uses(slot, (NV2A_U_TEXSCALE0 + st)))
+                uni2f((NV2A_U_TEXSCALE0 + st), sx, flip ? -sy : sy);
+            if (uses(slot, (NV2A_U_TEXOFF0 + st)))
+                uni2f((NV2A_U_TEXOFF0 + st), 0.0f, flip ? 1.0f : 0.0f);
+            if (uses(slot, (NV2A_U_BUMPMAT0 + st)))
+                G->uniform_f((NV2A_U_BUMPMAT0 + st), S.tex[st].bump_mat, 1);
+            if (uses(slot, (NV2A_U_BUMPSCALE0 + st)))
+                uni1f((NV2A_U_BUMPSCALE0 + st), S.tex[st].bump_scale);
+            if (uses(slot, (NV2A_U_BUMPOFF0 + st)))
+                uni1f((NV2A_U_BUMPOFF0 + st), S.tex[st].bump_off);
             srcslot[st] = sslot;
         }
         g_last.tex0 = 0;    /* unit 0 is no longer what the cache remembers */
@@ -4038,8 +3900,8 @@ static void do_draw(void)
               fprintf(stderr, "%s\n", line);
           } }
     }
-    if (g_pcache[slot].u_fogColor >= 0)
-        glUniform4f(g_pcache[slot].u_fogColor,
+    if (uses(slot, NV2A_U_FOGCOLOR))
+        uni4f(NV2A_U_FOGCOLOR,
                     (S.fog_color & 0xFF) / 255.0f,          /* R: low byte */
                     ((S.fog_color >> 8) & 0xFF) / 255.0f,
                     ((S.fog_color >> 16) & 0xFF) / 255.0f,  /* B */
@@ -4060,15 +3922,15 @@ static void do_draw(void)
         if (noalpha < 0) noalpha = getenv("RECOMP_GL_NOALPHATEST") ? 1 : 0;
         af = (S.alpha_test && !noalpha) ? (S.alpha_func - 0x0200 + 1) : 0;
         if (af != g_last.alpha_func || S.alpha_ref != g_last.alpha_ref) {
-            glUniform1i(g_pcache[slot].u_alphaFunc, af);
-            glUniform1f(g_pcache[slot].u_alphaRef, S.alpha_ref);
+            G->uniform_i(NV2A_U_ALPHAFUNC, af);
+            uni1f(NV2A_U_ALPHAREF, S.alpha_ref);
             g_last.alpha_func = af; g_last.alpha_ref = S.alpha_ref;
         }
     }
 
     /* Everything about this draw that is neither a shader nor a uniform,
      * handed over in the console's own terms. What OpenGL does with it is in
-     * glb_state; what Metal does is different enough that the two cannot
+     * nv2a_gfx_gl.c; what Metal does is different enough that the two cannot
      * share the code, and similar enough that they must not disagree about
      * what the registers meant. */
     {
@@ -4195,6 +4057,9 @@ static void do_draw(void)
          * none and costs a state change per draw to say so, which is why the
          * test is here and not in a backend. */
         { static int off = -1;
+          /* In the title's pixels, the far edges exclusive. */
+          uint32_t cx0 = 0, cy0 = 0, cx1 = g_fbo_w, cy1 = g_fbo_h;
+          int clip = 0;
           if (off < 0) off = getenv("RECOMP_GL_NOWCLIP") ? 1 : 0;
           if (!off && S.wclip_valid && S.wclip_type == 0) {
               uint32_t x0 =  S.wclip_h[0]        & 0xFFFu;
@@ -4203,13 +4068,32 @@ static void do_draw(void)
               uint32_t y1 = (S.wclip_v[0] >> 16) & 0xFFFu;
               if (x1 > x0 && y1 > y0
                && (x0 > 0 || y0 > 0 || x1 + 1 < g_fbo_w || y1 + 1 < g_fbo_h)) {
-                  rs.scissor_enable = 1;
-                  rs.scissor[0] = x0; rs.scissor[1] = y0;
-                  rs.scissor[2] = x1; rs.scissor[3] = y1;
+                  /* Inclusive corners: the far edges one further. */
+                  cx0 = x0; cy0 = y0; cx1 = x1 + 1; cy1 = y1 + 1;
+                  clip = 1;
                   S.wclip_applied++;
               }
+          }
+          /* Widescreen: what moved toward the centre takes its rectangle
+           * with it, and an overlay stays inside the 4:3 screen it was
+           * drawn for -- the title parks some just past its edges, out of
+           * sight on the console and in plain view once squeezed. */
+          if (g_wide_squeeze || g_wide_shift != 0.0f) {
+              float c = 0.5f * (float)g_fbo_w;
+              float a = c + 0.75f * ((float)cx0 - c), b = c + 0.75f * ((float)cx1 - c);
+              cx0 = a > 0.0f ? (uint32_t)floorf(a) : 0u;
+              cx1 = b > 0.0f ? (uint32_t)ceilf(b) : 0u;
+              clip = 1;
+          }
+          if (clip) {
+              /* The device takes raster pixels. */
+              uint32_t sc = gl_scale();
+              rs.scissor_enable = 1;
+              rs.scissor[0] = cx0 * sc; rs.scissor[1] = cy0 * sc;
+              rs.scissor[2] = cx1 * sc; rs.scissor[3] = cy1 * sc;
           } }
-        backend()->state(&rs);
+        g_draw_rs = rs;
+        G->state(&rs);
     }
 
     if (inl) S.draws_inline++; else S.draws_array++;
@@ -4263,7 +4147,7 @@ static void do_draw(void)
            * land on screen: an off-screen vertex sits at whatever the
            * projection does to something behind the camera, and averaging
            * those in says nothing about the depth range the scene occupies. */
-          { uint32_t q; float zlo = 1e30f, zhi = -1e30f; int on = 0;
+          { uint32_t q; float zlo = 1e30f, zhi = -1e30f, wlo = 1e30f, whi = -1e30f; int on = 0;
             for (q = 0; q < out_n; q++) {
                 const float *vv = &vbuf[q * stride_floats];
                 float ax = vv[0]*S.u.ff_mat[0][0] + vv[1]*S.u.ff_mat[0][1]
@@ -4281,14 +4165,17 @@ static void do_draw(void)
                 on++;
                 if (sz < zlo) zlo = sz;
                 if (sz > zhi) zhi = sz;
+                if (aw < wlo) wlo = aw;
+                if (aw > whi) whi = aw;
             }
             if (on)
                 fprintf(stderr, "  [Z] batch of %u: %d on screen, "
                         "z/w %.0f..%.0f  -> depth %.6f..%.6f  "
-                        "(%.4f%% of the range)\n",
+                        "(%.4f%% of the range); w %.3f..%.3f (w-buffer %s)\n",
                         out_n, on, (double)zlo, (double)zhi,
                         (double)(zlo/16777215.0f), (double)(zhi/16777215.0f),
-                        (double)(100.0f*(zhi-zlo)/16777215.0f));
+                        (double)(100.0f*(zhi-zlo)/16777215.0f),
+                        (double)wlo, (double)whi, S.psh.w_buffer ? "on" : "off");
           }
           if (!shown)
               fprintf(stderr, "  [Z] composite matrix rows:\n"
@@ -4451,7 +4338,7 @@ static void do_draw(void)
 
     /* Where the movers are being PUT, once every few seconds, always on.
      *
-     * Julien's reading of the tutorial is that the characters are in the
+     * The player's reading of the tutorial is that the characters are in the
      * wrong place rather than missing, and that is a different bug from
      * everything tested so far -- every check to date has verified that the
      * machinery is correct, never that the answer it produces is sensible.
@@ -4561,7 +4448,7 @@ static void do_draw(void)
      * it gets from VirtualAlloc, and whose address it leaves at 0x264BA4.
      * The characters' skeletons come out folded -- a spine bent a hundred
      * and thirteen degrees -- in the tutorial but not on the title screen,
-     * and Julien sees them twitch. A table that something else later writes
+     * and the player sees them twitch. A table that something else later writes
      * over produces exactly that: correct early, garbage afterwards, and a
      * different garbage every frame as the other owner keeps writing.
      *
@@ -4764,7 +4651,7 @@ static void do_draw(void)
                  * without needing to know the camera: world geometry agrees
                  * with itself and sets the reference, and anything that
                  * disagrees is being drawn at the wrong size. That matters
-                 * here because Julien's reading of the x-ray was "far away or
+                 * here because the player's reading of the x-ray was "far away or
                  * not where expected", and too small is what too far away
                  * looks like.
                  *
@@ -4781,7 +4668,7 @@ static void do_draw(void)
 
               /* [BONES] -- every matrix this batch actually reads.
                *
-               * Julien's screenshots settle what the numbers could not. The
+               * The player's screenshots settle what the numbers could not. The
                * dog renders correctly. A GG renders too -- but perhaps a
                * third of the size it should be, lying flat on the pavement
                * with its limbs splayed. Two speaking characters are absent
@@ -5007,7 +4894,7 @@ static void do_draw(void)
                * 150 to 800 units away. Either that is where they belong, or
                * they are being placed far behind where the camera expects
                * them. The world geometry settles it: the pavement directly
-               * under the camera in Julien's screenshots is a few units away,
+               * under the camera in the player's screenshots is a few units away,
                * so if world draws reach small distances and no skinned draw
                * ever does, the characters are in the wrong place. Printed for
                * a wide sample of both, one burst every five seconds. */
@@ -5026,7 +4913,7 @@ static void do_draw(void)
                * vertices on any given bone are scattered over the whole mesh
                * instead, and the character comes out as a splayed tangle with
                * roughly the right overall size -- which is precisely what
-               * Julien's fourth screenshot shows, and which every measurement
+               * the player's fourth screenshot shows, and which every measurement
                * of bounding boxes and bone matrices so far would call healthy.
                *
                * So measure it: group the sampled vertices by the address
@@ -5173,7 +5060,10 @@ static void do_draw(void)
        * Both probes write to neither colour nor depth, so the frame they
        * measure is the frame that would have been drawn anyway.
        */
-      if (probe_this && !curtain_skip && slot >= 0) {
+      /* (OpenGL only: an occlusion query is a GL object, and the probe sets
+       * GL state behind the device's back and puts it back afterwards.) */
+#ifdef NV2A_GL_HAVE_GL
+      if (g_is_gl && probe_this && !curtain_skip && !g_surf_lost && slot >= 0) {
           GLuint qo = 0;
           glGenQueries(1, &qo);
           if (qo) {
@@ -5222,20 +5112,20 @@ static void do_draw(void)
                   else glDisable(GL_DEPTH_TEST);
                   if (S.cull_enable) glEnable(GL_CULL_FACE);
                   else glDisable(GL_CULL_FACE);
-                  if (g_pcache[slot].u_alphaFunc >= 0)
-                      glUniform1i(g_pcache[slot].u_alphaFunc, af);
+                  if (uses(slot, NV2A_U_ALPHAFUNC))
+                      G->uniform_i(NV2A_U_ALPHAFUNC, af);
                   /* Every pass uses "greater than t" so the counts are
                    * directly comparable; culling stays off throughout so a
                    * back face does not masquerade as a transparent one. */
                   glDisable(GL_CULL_FACE);
-                  if (g_pcache[slot].u_alphaFunc >= 0)
-                      glUniform1i(g_pcache[slot].u_alphaFunc, 0);
+                  if (uses(slot, NV2A_U_ALPHAFUNC))
+                      G->uniform_i(NV2A_U_ALPHAFUNC, 0);
                   glEnable(GL_DEPTH_TEST);
                   glDepthFunc(dfn[pass]);
 
                   r[pass] = 0;
                   glBeginQuery(GL_SAMPLES_PASSED, qo);
-                  glDrawArrays(mode, 0, (GLsizei)out_n);
+                  glDrawArrays(gl_mode_of(mode), 0, (GLsizei)out_n);
                   glEndQuery(GL_SAMPLES_PASSED);
                   glGetQueryObjectuiv(qo, GL_QUERY_RESULT, &r[pass]);
               }
@@ -5261,14 +5151,17 @@ static void do_draw(void)
               else glDisable(GL_BLEND);
               if (S.cull_enable) glEnable(GL_CULL_FACE);
               else glDisable(GL_CULL_FACE);
-              if (g_pcache[slot].u_alphaFunc >= 0) {
-                  glUniform1i(g_pcache[slot].u_alphaFunc, af);
-                  glUniform1f(g_pcache[slot].u_alphaRef, S.alpha_ref);
+              if (uses(slot, NV2A_U_ALPHAFUNC)) {
+                  G->uniform_i(NV2A_U_ALPHAFUNC, af);
+                  uni1f(NV2A_U_ALPHAREF, S.alpha_ref);
               }
               glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-              g_last_cm_reset = 1;
+              /* And the device's own idea of the state, exactly as given. */
+              G->state_invalidate();
+              G->state(&g_draw_rs);
           }
       }
+#endif /* NV2A_GL_HAVE_GL */
 
       /* [TIMELINE] -- the order things happen inside one frame.
        *
@@ -5334,21 +5227,21 @@ static void do_draw(void)
       { static int xray = -1;
         if (xray < 0) { const char *v = getenv("RECOMP_GL_XRAY");
                         xray = v ? atoi(v) : 0; }
-        if (xray && is_mover && !curtain_skip) {
-            glDisable(GL_BLEND);
-            glDisable(GL_CULL_FACE);
-            glDepthFunc(GL_ALWAYS);
-            if (g_pcache[slot].u_alphaFunc >= 0)
-                glUniform1i(g_pcache[slot].u_alphaFunc, 0);
-            PROF_T0(); glDrawArrays(mode, 0, (GLsizei)out_n); PROF_ADD(draw);
-            g_last.blend_enable = -1;
-            g_last.depth_test   = -1;
-            g_last.depth_func   = -1;
+        if (xray && is_mover && !curtain_skip && !g_surf_lost) {
+            Nv2aRenderState xr = g_draw_rs;
+            xr.blend_enable = 0;
+            xr.cull_enable = 0;
+            xr.depth_func = 0x0207;              /* ALWAYS */
+            G->state(&xr);
+            if (uses(slot, NV2A_U_ALPHAFUNC))
+                G->uniform_i(NV2A_U_ALPHAFUNC, 0);
+            PROF_T0(); G->draw(mode, out_n); PROF_ADD(draw);
+            G->state_invalidate();
             g_last.alpha_func   = -1;
             goto xray_done;
         } }
     }
-    if (!curtain_skip) { PROF_T0(); glDrawArrays(mode, 0, (GLsizei)out_n); PROF_ADD(draw); }
+    if (!curtain_skip && !g_surf_lost) { PROF_T0(); G->draw(mode, out_n); PROF_ADD(draw); }
     xray_done: ;
     /*
      * RECOMP_GL_DARKHUNT=<n>: which draw makes the frame dark.
@@ -5408,15 +5301,10 @@ static void do_draw(void)
        || (hunt_at >= 0 && (int)S.frames == hunt_at)) {
           static uint8_t small[64 * 48 * 4];
           double m = 0.0; int q;
-          GLuint keep_read;
-          glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, (GLint *)&keep_read);
-          glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
-          glPixelStorei(GL_PACK_ALIGNMENT, 1);
           /* One row every ph/48, one column every pw/64: a thumbnail without
-           * a downscale pass. glReadPixels cannot stride, so read a strip. */
-          glReadPixels(0, (GLint)((g_fbo_ph ? g_fbo_ph : g_fbo_h) / 2),
-                       64, 48, GL_RGBA, GL_UNSIGNED_BYTE, small);
-          glBindFramebuffer(GL_READ_FRAMEBUFFER, keep_read);
+           * a downscale pass. A readback cannot stride, so read a strip. */
+          G->target_read(g_cur_rt, 0, (g_fbo_ph ? g_fbo_ph : g_fbo_h) / 2,
+                         64, 48, 0, small);
           for (q = 0; q < 64 * 48; q++)
               m += small[q*4] + small[q*4+1] + small[q*4+2];
           m /= (64.0 * 48.0 * 3.0);
@@ -5478,7 +5366,7 @@ static void do_draw(void)
                  * too high, and the two look identical from outside. */
                 { int st;
                   for (st = 0; st < NUM_STAGES; st++) {
-                      GLuint surf;
+                      uint32_t surf;
                       if (!S.tex[st].enabled) {
                           fprintf(stderr, "  [DARK]   tex %d: disabled\n", st);
                           continue;
@@ -5529,7 +5417,7 @@ static void do_draw(void)
      * RECOMP_GL_OBJMAT=1: the matrix each program actually uses to place its
      * object, printed once per program.
      *
-     * Julien's description split the bug cleanly in two: buildings and roads
+     * The player's description split the bug cleanly in two: buildings and roads
      * are in the right place, and people, buses and everything else are not.
      * Static world geometry carries its position in its vertices; everything
      * that floats is placed by a per-object transform that lives in the
@@ -6510,9 +6398,10 @@ static void do_draw(void)
     /* A GL error turns every later call into a no-op, so a single bad enum
      * early on reads as "nothing draws" for the rest of the run. Check the
      * first few draws and say which one broke. */
+#ifdef NV2A_GL_HAVE_GL
     {
         static int checked;
-        if (checked < 8) {
+        if (g_is_gl && checked < 8) {
             GLenum e = glGetError();
             if (e != GL_NO_ERROR) {
                 fprintf(stderr, "  [GL] glGetError 0x%04X after draw "
@@ -6523,6 +6412,7 @@ static void do_draw(void)
             }
         }
     }
+#endif
     /* RECOMP_GL_STATE_AT=<draw number>: the full per-draw state for a few
      * draws at a chosen point in the run. Early draws answer questions about
      * bring-up; a title that renders its logos and then goes blank needs the
@@ -6758,7 +6648,7 @@ static void do_draw(void)
         static int shots;
         static const char *pfx; static int init;
         if (!init) { init = 1; pfx = getenv("RECOMP_GL_DUMP_DRAW"); }
-        if (pfx && (S.draws % 4000) == 3999) dump_fbo(pfx, &shots, 12);
+        if (pfx && (S.draws % 4000) == 3999) dump_fbo(g_cur_rt, pfx, &shots, 12);
     }
     /* RECOMP_GL_DRAW_LOG=<n>: one line per draw for the first frame that
      * contains at least n of them.
@@ -7050,63 +6940,6 @@ static void present(int is_frame);
  * times: the cap was counting passes. This says which is which. */
 static void fliplog(const char *why);
 
-/* The OpenGL half of a clear: the values are already decoded and the
- * rectangle is already in the title's coordinates, so all that is left is
- * OpenGL's own spelling of "wipe this rectangle". */
-static void glb_clear(unsigned mask, const float rgba[4], float depth,
-                      uint32_t stencil, const uint32_t rect[4])
-{
-    GLbitfield bits = 0;
-
-    if (!g_ready) return;
-    if (mask & 1u) {
-        glClearColor(rgba[0], rgba[1], rgba[2], rgba[3]);
-        /* The console's clear picks its channels from the CLEAR_SURFACE mask
-         * and ignores COLOR_MASK; GL's honours the write mask. Force it on
-         * for the clear and let the next draw re-apply the title's. */
-        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-        g_last_cm_reset = 1;
-        bits |= GL_COLOR_BUFFER_BIT;
-    }
-    if (mask & 2u) {
-        glClearDepth((double)depth);
-        glDepthMask(GL_TRUE);
-        g_last.depth_mask = -1;   /* the clear forced it; re-apply next draw */
-        bits |= GL_DEPTH_BUFFER_BIT;
-    }
-    if (mask & 4u) {
-        glClearStencil((GLint)(stencil & 0xFFu));
-        glStencilMask(0xFFu);
-        g_last_stencil_reset = 1; /* the write mask; re-apply next draw */
-        bits |= GL_STENCIL_BUFFER_BIT;
-    }
-    if (!bits) return;
-
-    /* A clear is bounded by the clear rectangle, not by the surface.
-     *
-     * Titles clear sub-rectangles constantly -- a letterbox bar, a panel
-     * behind some text, a region being re-drawn -- and a backend that ignores
-     * the rectangle wipes the whole frame every time one arrives. The symptom
-     * is a completely black frame with a healthy draw count, which reads as
-     * "nothing is being rasterised" and sends you looking in the wrong place.
-     * The rectangle arrives in surface coordinates, which run top-down, so it
-     * has to be flipped into GL's bottom-up scissor space. */
-    if (rect) {
-        uint32_t sc = gl_scale();
-        GLint x = (GLint)(rect[0] * sc);
-        GLint y = (GLint)((g_fbo_h - rect[3]) * sc);
-        GLsizei w = (GLsizei)((rect[2] - rect[0]) * sc);
-        GLsizei h = (GLsizei)((rect[3] - rect[1]) * sc);
-        if (y < 0) { h += y; y = 0; }
-        glEnable(GL_SCISSOR_TEST);
-        glScissor(x, y, w > 0 ? w : 0, h > 0 ? h : 0);
-    } else {
-        glDisable(GL_SCISSOR_TEST);
-    }
-    glClear(bits);
-    glDisable(GL_SCISSOR_TEST);
-}
-
 static void do_clear(uint32_t param)
 {
     unsigned mask = 0;
@@ -7184,15 +7017,26 @@ static void do_clear(uint32_t param)
         mask |= 4u;
     if (!mask) return;
 
-    /* A clear is bounded by the clear rectangle, not by the surface -- see
-     * glb_clear, which applies it. An empty rectangle means the whole
-     * surface, which the interface spells as no rectangle at all. */
+    /* A clear is bounded by the clear rectangle, not by the surface -- the
+     * device applies it. An empty rectangle means the whole surface, which
+     * the interface spells as no rectangle at all. In raster pixels: the
+     * title's own, times the internal resolution.
+     *
+     * The rectangle's far corner is INCLUSIVE, as the console has it (xemu
+     * clears xmax - xmin + 1 pixels): this title clears 0..639 x 0..479.
+     * Taken as exclusive, the last column and the last row were never
+     * cleared and kept whatever the target was made with -- the "1-pixel
+     * dark line along the right edge" (and the bottom one, less seen), and
+     * on Metal every clear was a drawn triangle instead of a free load
+     * action, because none of them covered the whole target. */
     if (S.clear_x1 > S.clear_x0 && S.clear_y1 > S.clear_y0) {
-        rect[0] = S.clear_x0; rect[1] = S.clear_y0;
-        rect[2] = S.clear_x1; rect[3] = S.clear_y1;
+        uint32_t sc = gl_scale();
+        rect[0] = S.clear_x0 * sc;       rect[1] = S.clear_y0 * sc;
+        rect[2] = (S.clear_x1 + 1) * sc; rect[3] = (S.clear_y1 + 1) * sc;
         rectp = rect;
     }
-    backend()->clear(mask, rgba, depth, S.clear_zstencil & 0xFFu, rectp);
+    if (!g_surf_lost)
+        G->clear(mask, rgba, depth, S.clear_zstencil & 0xFFu, rectp);
     S.clears++;
 }
 
@@ -7224,7 +7068,7 @@ static void fliplog(const char *why)
     if (budget <= 0) { prev_draws = S.draws; return; }
     budget--;
     fprintf(stderr, "  [FLIP] %-14s flip=%u surface=%08X %ux%u  draws=%u  fbo=%u\n",
-            why, S.flips, S.color_offset, S.clip_w, S.clip_h, S.draws - prev_draws, (unsigned)g_fbo);
+            why, S.flips, S.color_offset, S.clip_w, S.clip_h, S.draws - prev_draws, (unsigned)g_cur_rt);
     prev_draws = S.draws;
     fflush(stderr);
 }
@@ -7245,6 +7089,13 @@ static void fliplog(const char *why)
  * diagnostic runs want when they are trying to reach a late phase of a
  * title quickly.
  */
+/* How the pacing went, for the report: frames that reached the flip after
+ * their moment, and the time from one released frame to the next. */
+static struct {
+    uint64_t frames, late, restarts, iv[5];
+    double   late_max, last;
+} g_pace_st;
+
 static void frame_pace(void)
 {
         static double period = -1.0;
@@ -7314,7 +7165,14 @@ static void frame_pace(void)
             now = mono_now();
             if (deadline == 0.0 || deadline < now - 1.0) deadline = now;
             deadline += period;
+            g_pace_st.frames++;
+            if (now > deadline) {
+                double l = (now - deadline) * 1000.0;
+                g_pace_st.late++;
+                if (l > g_pace_st.late_max) g_pace_st.late_max = l;
+            }
             if (now > deadline + period * 4.0) {
+                g_pace_st.restarts++;
                 /* Genuinely behind -- the emulation could not keep up. Start
                  * again from here rather than sprinting to catch up on frames
                  * whose moment has passed. */
@@ -7351,6 +7209,12 @@ static void frame_pace(void)
                 while (mono_now() < deadline) { if (service) xbox_nv2a_vblank_service(); }
                 if (held && xbox_guest_lock_retake) xbox_guest_lock_retake(held);
             }
+            { double t = mono_now();
+              if (g_pace_st.last > 0.0) {
+                  double ms = (t - g_pace_st.last) * 1000.0;
+                  g_pace_st.iv[ms < 14.0 ? 0 : ms < 19.5 ? 1 : ms < 30.0 ? 2 : ms < 45.0 ? 3 : 4]++;
+              }
+              g_pace_st.last = t; }
         }
 }
 
@@ -7410,70 +7274,56 @@ static void present(int is_frame)
 
     if (is_frame) frame_pace();
 
+    /* Put the finished frame on screen: the surface the title has set up
+     * when it flips, which is what the window showed while surfaces were
+     * bound as their methods arrived (JSRF: the display buffer it copies
+     * each frame into). Surfaces are bound when used now, and the last one
+     * used at the flip is the off-screen frame instead. */
+    if (is_frame) {
+        uint32_t prt = g_cur_rt;
+        uint32_t pw = g_fbo_pw ? g_fbo_pw : g_fbo_w;
+        uint32_t ph = g_fbo_ph ? g_fbo_ph : g_fbo_h;
+        if (g_present_slot >= 0 && g_present_slot < SURF_CACHE && g_surf[g_present_slot].used) {
+            prt = g_surf[g_present_slot].rt;
+            pw = g_surf[g_present_slot].w * gl_scale();
+            ph = g_surf[g_present_slot].h * gl_scale();
+        }
 #if defined(NV2A_GL_USE_CGL)
-    /* Put the finished frame on screen.
-     *
-     * The frame is built in an offscreen framebuffer whichever way this is
-     * running, so showing it is one blit -- and the y flip in the blit is the
-     * same one the BMP writer does, because GL's framebuffer counts rows from
-     * the bottom and both a window and a bitmap want them from the top. */
-    if (g_windowed && is_frame) {
-        /* Read the finished frame and hand it to the window.
+        /* OpenGL on a Mac: read the finished frame and hand it to the window.
          *
          * Blitting straight into the window's back buffer works -- measurably,
          * the pixels arrive -- and a layer-backed view never presents what
          * another thread drew into its context. So the frame crosses as
-         * pixels and the main thread draws it. One readback a frame. */
-        static uint8_t *shot;
-        static uint32_t cap;
-        uint32_t pw = g_fbo_pw ? g_fbo_pw : g_fbo_w;
-        uint32_t ph = g_fbo_ph ? g_fbo_ph : g_fbo_h;
-        uint32_t need;
-        GLuint pfbo = g_fbo;
-        /* Show the surface the title has set up when it flips, which is what
-         * the window showed while surfaces were bound as their methods
-         * arrived (JSRF: the display buffer it copies each frame into).
-         * Surfaces are bound when used now, and the last one used at the
-         * flip is the off-screen frame instead. */
-        if (g_present_slot >= 0 && g_present_slot < SURF_CACHE && g_surf[g_present_slot].used) {
-            pfbo = g_surf[g_present_slot].fbo;
-            pw = g_surf[g_present_slot].w * gl_scale();
-            ph = g_surf[g_present_slot].h * gl_scale();
-        }
-        need = pw * ph * 4;
-        if (cap < need) { free(shot); shot = (uint8_t *)malloc(need); cap = need; }
-        if (shot) {
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, pfbo);
-            glPixelStorei(GL_PACK_ALIGNMENT, 1);
-            glReadPixels(0, 0, (GLsizei)pw, (GLsizei)ph,
-                         GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, shot);
-            glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+         * pixels and the main thread draws it. One readback a frame. (Metal
+         * draws into the window's layer itself, in present() below.) */
+        if (g_windowed && g_is_gl) {
+            static uint8_t *shot;
+            static uint32_t cap;
+            uint32_t need = pw * ph * 4;
+            if (cap < need) { free(shot); shot = (uint8_t *)malloc(need); cap = need; }
             /* At the frame's real size: the window is happy to show more
              * pixels than the title thinks it drew. */
-            nv_window_submit_frame(shot, (int)pw, (int)ph);
+            if (shot && G->target_read(prt, 0, 0, pw, ph, 1, shot))
+                nv_window_submit_frame(shot, (int)pw, (int)ph);
+            nv_window_present();
         }
-        nv_window_present();
-        if (nv_window_should_close()) {
+#elif defined(NV2A_GL_USE_SDL)
+        if (g_window) {
+            sdl_present(nv2a_gfx_gl_fbo(prt), (int)pw, (int)ph);
+            sdl_pump();
+        }
+#endif
+        /* The device's end of the frame: Metal shows it in the window's
+         * layer, and either way the frame's work is handed to the GPU. */
+        G->present(prt, pw, ph);
+#if defined(NV2A_GL_USE_CGL)
+        if (g_windowed && nv_window_should_close()) {
             fprintf(stderr, "  [GL] window closed; stopping\n");
             nv2a_gl_report();
             exit(0);
         }
-    }
-#elif defined(NV2A_GL_USE_SDL)
-    if (g_window && is_frame) {
-        GLuint pfbo = g_fbo;
-        uint32_t pw = g_fbo_pw ? g_fbo_pw : g_fbo_w;
-        uint32_t ph = g_fbo_ph ? g_fbo_ph : g_fbo_h;
-        /* The surface the title flipped to (see the CGL path above). */
-        if (g_present_slot >= 0 && g_present_slot < SURF_CACHE && g_surf[g_present_slot].used) {
-            pfbo = g_surf[g_present_slot].fbo;
-            pw = g_surf[g_present_slot].w * gl_scale();
-            ph = g_surf[g_present_slot].h * gl_scale();
-        }
-        sdl_present(pfbo, (int)pw, (int)ph);
-        sdl_pump();
-    }
 #endif
+    }
 
     va = resolve(S.color_offset);
     bpp = (S.surf_pitch && S.clip_w) ? S.surf_pitch / S.clip_w : 4;
@@ -7546,13 +7396,9 @@ static void present(int is_frame)
                                drop_tris = v ? atoi(v) : 5000; }
           if (drop && !armed && S.frame_tris >= (uint32_t)drop_tris) {
               static uint8_t strip[64 * 48 * 4];
-              double m = 0.0; int q; GLuint keep_read;
-              glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, (GLint *)&keep_read);
-              glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
-              glPixelStorei(GL_PACK_ALIGNMENT, 1);
-              glReadPixels(0, (GLint)((g_fbo_ph ? g_fbo_ph : g_fbo_h) / 2),
-                           64, 48, GL_RGBA, GL_UNSIGNED_BYTE, strip);
-              glBindFramebuffer(GL_READ_FRAMEBUFFER, keep_read);
+              double m = 0.0; int q;
+              G->target_read(g_cur_rt, 0, (g_fbo_ph ? g_fbo_ph : g_fbo_h) / 2,
+                             64, 48, 0, strip);
               for (q = 0; q < 64 * 48; q++)
                   m += strip[q*4] + strip[q*4+1] + strip[q*4+2];
               m /= (64.0 * 48.0 * 3.0);
@@ -7603,17 +7449,15 @@ static void present(int is_frame)
              * the picture somewhere other than where the capture is pointed,
              * and one image per surface says which. */
             int k;
-            GLuint keep = g_fbo;
             for (k = 0; k < SURF_CACHE; k++) {
                 char pf[256];
                 static int per_surf[SURF_CACHE];
                 if (!g_surf[k].used) continue;
                 snprintf(pf, sizeof pf, "%s_s%d_", pfx, k);
-                glBindFramebuffer(GL_FRAMEBUFFER, g_surf[k].fbo);
                 { uint32_t sw = g_fbo_w, sh = g_fbo_h, spw = g_fbo_pw, sph = g_fbo_ph;
                   g_fbo_w = g_surf[k].w; g_fbo_h = g_surf[k].h;
                   g_fbo_pw = g_surf[k].w * gl_scale(); g_fbo_ph = g_surf[k].h * gl_scale();
-                  dump_fbo(pf, &per_surf[k], 72);
+                  dump_fbo(g_surf[k].rt, pf, &per_surf[k], 72);
                   g_fbo_w = sw; g_fbo_h = sh; g_fbo_pw = spw; g_fbo_ph = sph; }
             }
             /* And the one the window shows at this flip, under its own name,
@@ -7624,15 +7468,13 @@ static void present(int is_frame)
                 int k2 = g_present_slot;
                 uint32_t sw = g_fbo_w, sh = g_fbo_h, spw = g_fbo_pw, sph = g_fbo_ph;
                 snprintf(pf, sizeof pf, "%s_shown_", pfx);
-                glBindFramebuffer(GL_FRAMEBUFFER, g_surf[k2].fbo);
                 g_fbo_w = g_surf[k2].w; g_fbo_h = g_surf[k2].h;
                 g_fbo_pw = g_surf[k2].w * gl_scale(); g_fbo_ph = g_surf[k2].h * gl_scale();
-                dump_fbo(pf, &shown_n, 72);
+                dump_fbo(g_surf[k2].rt, pf, &shown_n, 72);
                 g_fbo_w = sw; g_fbo_h = sh; g_fbo_pw = spw; g_fbo_ph = sph;
                 fprintf(stderr, "  [GL] shown at this flip: slot %d = surface %08X %ux%u\n",
                         k2, g_surf[k2].offset, g_surf[k2].w, g_surf[k2].h);
             }
-            glBindFramebuffer(GL_FRAMEBUFFER, keep);
             { char nm[256]; FILE *sf;
               snprintf(nm, sizeof nm, "%s_slots_%03d.txt",
                        pfx ? pfx : "dump", dump_shots);
@@ -7694,7 +7536,7 @@ static void present(int is_frame)
  * plausible position, a few metres out, which is exactly what "the people
  * and the buses are floating" looks like. Static world geometry is immune
  * because it shares one transform for the whole block, so the buildings and
- * the roads have been right all along, which is the split Julien described.
+ * the roads have been right all along, which is the split the player described.
  *
  * So: before new geometry joins a batch whose state has moved since the last
  * vertex arrived, draw what is already there. The check is at the geometry
@@ -7723,6 +7565,7 @@ static void present(int is_frame)
  * worth less than a wrong picture that also disagrees with itself.
  */
 static void ensure_ready(void);   /* defined just below */
+static int gfx_init(uint32_t w, uint32_t h);
 
 static void split_batch_if_state_moved(void)
 {
@@ -7752,9 +7595,9 @@ static void ensure_ready(void)
 {
     if (g_ready || g_failed) return;
     if (!S.clip_w || !S.clip_h) return;      /* wait for a surface */
-    if (!gl_init(S.clip_w, S.clip_h)) { g_failed = 1; return; }
+    if (!gfx_init(S.clip_w, S.clip_h)) { g_failed = 1; return; }
     g_ready = 1;
-    backend()->surface(S.color_offset, S.clip_w, S.clip_h, gl_scale());
+    surface_bind(S.color_offset, S.clip_w, S.clip_h);
 }
 
 /*
@@ -8625,6 +8468,18 @@ unsigned long nv2a_gl_progress(void) { return (unsigned long)S.flips; }
 void nv2a_gl_report(void)
 {
     if (!nv2a_gl_enabled()) return;
+    if (g_pace_st.frames) {
+        uint64_t n = g_pace_st.iv[0] + g_pace_st.iv[1] + g_pace_st.iv[2]
+                   + g_pace_st.iv[3] + g_pace_st.iv[4];
+        fprintf(stderr, "  [PACE] %llu frames paced at the flip: %llu reached it late "
+                "(worst %.1f ms), %llu restarts; flip to flip: under 14 ms %llu, "
+                "a 60th of a second %llu, 19-30 ms %llu, 30-45 ms %llu, longer %llu (%llu)\n",
+                (unsigned long long)g_pace_st.frames, (unsigned long long)g_pace_st.late,
+                g_pace_st.late_max, (unsigned long long)g_pace_st.restarts,
+                (unsigned long long)g_pace_st.iv[0], (unsigned long long)g_pace_st.iv[1],
+                (unsigned long long)g_pace_st.iv[2], (unsigned long long)g_pace_st.iv[3],
+                (unsigned long long)g_pace_st.iv[4], (unsigned long long)n);
+    }
     fprintf(stderr,
         "  [GL] %u draws, %u triangles, %u clears, %u presents, "
         "%u programs compiled\n"
@@ -8653,327 +8508,78 @@ void nv2a_gl_report(void)
         surf_desc(4), surf_desc(5), surf_desc(6), surf_desc(7),
         g_tex_dead[0][0], g_tex_dead[0][1], g_tex_dead[0][2],
         g_tex_dead[1][0], g_tex_dead[1][1], g_tex_dead[1][2]);
+    if (G) G->report();
     fflush(stderr);
 }
 
 
-/* ---- the backend interface ---------------------------------------------
+/* ---- the device ---------------------------------------------------------
  *
  * nv2a_backend.h draws the line between "what the NV2A was asked to do" and
  * "how this machine does it". Everything above is one copy of the pushbuffer
- * translation; below it there is an OpenGL implementation, which is this
- * file, and a Metal one, which is what makes iOS possible at all.
- *
- * The table fills in one entry at a time and the front half calls only the
- * entries that are filled: an operation is routed through here once BOTH
- * backends implement it, and until then the front half keeps calling the
- * OpenGL code directly. The stubs below are what an entry looks like before
- * its turn -- they say so rather than crashing, because "the screen went
- * black halfway through a refactor" is a much worse afternoon than a line of
- * text naming the operation nobody has moved yet.
+ * translation; below it there is an OpenGL implementation (nv2a_gfx_gl.c) and
+ * a Metal one (nv2a_metal.m), which is what macOS is moving to and what makes
+ * iOS possible at all.
  */
-static void glb_unrouted(const char *what)
-{
-    static const char *said[16]; static int n; int i;
-    for (i = 0; i < n; i++) if (said[i] == what) return;
-    if (n < 16) said[n++] = what;
-    fprintf(stderr, "  [GL] backend entry '%s' is not routed yet\n", what);
-}
-
-static int glb_init(void) { return 1; }   /* the context is already up */
-
-static void glb_surface(uint32_t offset, uint32_t w, uint32_t h, uint32_t scale)
-{
-    /* The scale is a property of this backend today -- gl_scale() reads the
-     * environment once and every size below multiplies by it -- so the
-     * parameter is accepted and checked rather than used. When the front half
-     * owns the scale, this is where it arrives. */
-    if (scale != gl_scale()) {
-        static int said;
-        if (!said++)
-            fprintf(stderr, "  [GL] surface asked for scale %u, backend is at "
-                            "%u\n", scale, gl_scale());
-    }
-    surface_bind(offset, w, h);
-}
-
-static int glb_program(const Nv2aVshProgram *vp, const Nv2aVshFixed *ff,
-                       const Nv2aPshState *ps, const struct Nv2aRenderState *rs,
-                       uint32_t hash)
-{
-    (void)vp; (void)ff; (void)ps; (void)rs; (void)hash;
-    glb_unrouted("program");
-    return -1;
-}
-
-static void glb_texture(int stage, const void *rgba, uint32_t w, uint32_t h,
-                        uint32_t key, const Nv2aSampler *smp)
-{
-    (void)stage; (void)rgba; (void)w; (void)h; (void)key; (void)smp;
-    glb_unrouted("texture");
-}
-
-/* The OpenGL half of the per-draw state.
- *
- * Still compared against what was last set rather than set outright: these
- * are the calls a title makes thousands of times a frame with the same
- * values, and OpenGL charges for each one. The comparison is now against a
- * copy of the descriptor, so a backend that is handed identical state twice
- * costs nothing whichever front half produced it. */
-/* NV097_SET_STENCIL_OP_V_*: OpenGL's own values (INCRSAT and DECRSAT are
- * GL_INCR and GL_DECR, which saturate). Anything else keeps. */
-static GLenum gl_stencil_op(uint32_t v)
-{
-    switch (v) {
-    case 0x0000: case 0x1E00: case 0x1E01: case 0x1E02: case 0x1E03:
-    case 0x150A: case 0x8507: case 0x8508:
-        return (GLenum)v;
-    default:
-        return GL_KEEP;
-    }
-}
-
-static void glb_state(const Nv2aRenderState *rs)
-{
-    if (rs->depth_test != g_last.depth_test || rs->depth_func != g_last.depth_func) {
-        if (rs->depth_test) {
-            glEnable(GL_DEPTH_TEST);
-            glDepthFunc(gl_depth_func((uint32_t)rs->depth_func));
-        } else glDisable(GL_DEPTH_TEST);
-        g_last.depth_test = rs->depth_test;
-        g_last.depth_func = rs->depth_func;
-    }
-    if (rs->depth_write != g_last.depth_mask) {
-        glDepthMask(rs->depth_write ? GL_TRUE : GL_FALSE);
-        g_last.depth_mask = rs->depth_write;
-    }
-    /* Past the far plane: clamp or cull, as the title asked -- with
-     * RECOMP_GL_DEPTHCLAMP=1/0 to force it either way for the experiment
-     * that matters: does the distant road come back when nothing beyond the
-     * far plane is thrown away. */
-    { static int last_clamp = -1, force = -2;
-      int clamp;
-      if (force == -2) { const char *v = getenv("RECOMP_GL_DEPTHCLAMP");
-                         force = v ? atoi(v) : -1; }
-      /* A w-buffered draw must not be clipped on the program's z either:
-       * its depth comes from w in the fragment stage, and the console's
-       * range test is against w, which this title's clip range never
-       * rejects. Clamp instead, and let the fragment shader overwrite. */
-      clamp = force >= 0 ? force
-            : ((rs->zclamp & 0xF0u) || rs->w_buffer) ? 1 : 0;
-      if (clamp != last_clamp) {
-          if (clamp) glEnable(GL_DEPTH_CLAMP); else glDisable(GL_DEPTH_CLAMP);
-          last_clamp = clamp;
-      } }
-    { static uint32_t last_cm = 0xFFFFFFFFu;
-      uint32_t cm = rs->color_mask ? rs->color_mask : 0x01010101u;
-      if (g_last_cm_reset) { last_cm = 0xFFFFFFFFu; g_last_cm_reset = 0; }
-      if (cm != last_cm) {
-          glColorMask((cm >> 16) & 1 ? GL_TRUE : GL_FALSE,
-                      (cm >>  8) & 1 ? GL_TRUE : GL_FALSE,
-                      (cm      ) & 1 ? GL_TRUE : GL_FALSE,
-                      (cm >> 24) & 1 ? GL_TRUE : GL_FALSE);
-          last_cm = cm;
-      } }
-    { static int nob = -1;
-      if (nob < 0) nob = getenv("RECOMP_GL_NOBLEND") ? 1 : 0;
-      if (nob) { glDisable(GL_BLEND); g_last.blend_enable = -1; } }
-    if (rs->blend_enable != g_last.blend_enable
-     || rs->blend_src != g_last.blend_src || rs->blend_dst != g_last.blend_dst) {
-        if (rs->blend_enable) {
-            glEnable(GL_BLEND);
-            glBlendFunc(gl_blend((uint32_t)rs->blend_src),
-                        gl_blend((uint32_t)rs->blend_dst));
-        } else glDisable(GL_BLEND);
-        g_last.blend_enable = rs->blend_enable;
-        g_last.blend_src = rs->blend_src;
-        g_last.blend_dst = rs->blend_dst;
-    }
-    /*
-     * Stencil.
-     *
-     * JSRF draws its shadows with stencil volumes: each shadow volume twice
-     * with colour writes off (blend ZERO/ONE), depth GEQUAL, incrementing
-     * the stencil on one pass and decrementing it on the other; then one
-     * full-screen black quad at alpha ~0.98 that the stencil test lets
-     * through only where the count is non-zero. None of this was emulated,
-     * so that quad covered the whole frame -- "the curtain" -- and has been
-     * skipped since the tutorial went black (RECOMP_GL_CURTAIN=skip), which
-     * took every shadow with it. The surfaces now carry an 8-bit stencil
-     * (depth24/stencil8) and the state is applied here.
-     */
-    { static int valid; static Nv2aRenderState last;
-      if (g_last_stencil_reset) { valid = 0; g_last_stencil_reset = 0; }
-      if (!valid || rs->stencil_test != last.stencil_test
-       || (rs->stencil_test
-           && (rs->stencil_func != last.stencil_func || rs->stencil_ref != last.stencil_ref
-            || rs->stencil_rmask != last.stencil_rmask || rs->stencil_wmask != last.stencil_wmask
-            || rs->stencil_op[0] != last.stencil_op[0] || rs->stencil_op[1] != last.stencil_op[1]
-            || rs->stencil_op[2] != last.stencil_op[2]))) {
-          if (rs->stencil_test) {
-              uint32_t f = rs->stencil_func;
-              if (f < 0x200 || f > 0x207) f = 0x207;           /* ALWAYS */
-              glEnable(GL_STENCIL_TEST);
-              glStencilFunc((GLenum)f, (GLint)(rs->stencil_ref & 0xFFu),
-                            (GLuint)(rs->stencil_rmask & 0xFFu));
-              glStencilOp(gl_stencil_op(rs->stencil_op[0]),
-                          gl_stencil_op(rs->stencil_op[1]),
-                          gl_stencil_op(rs->stencil_op[2]));
-              glStencilMask((GLuint)(rs->stencil_wmask & 0xFFu));
-          } else {
-              glDisable(GL_STENCIL_TEST);
-          }
-          last = *rs; valid = 1;
-      } }
-
-    g_last.valid = 1;
-
-    /*
-     * Culling, with the winding deliberately inverted.
-     *
-     * A cel-shaded title draws its outlines by rendering the model a second
-     * time, expanded along its normals, in black, with the front faces culled
-     * so that only the silhouette shows. Cull nothing and that second pass is
-     * an opaque black copy of the model sitting in front of the original --
-     * which is what the black bars standing over the city were.
-     *
-     * The winding has to be flipped from what the title asks for. The
-     * viewport's y scale is negative, so the transform mirrors the frame
-     * vertically, and a mirror reverses the order every triangle's vertices
-     * appear in. Passing the console's front-face convention through
-     * unchanged would therefore cull exactly the wrong half.
-     *
-     * RECOMP_GL_NOCULL puts it back, because "geometry is missing" and
-     * "geometry that should be hidden is not" look nothing alike, and having
-     * both pictures separates them in one run.
-     */
-    {
-        static int cull = -1, flip = -1;
-        if (cull < 0) { cull = getenv("RECOMP_GL_NOCULL") ? 0 : 1;
-                        flip = getenv("RECOMP_GL_CULLFLIP") ? 1 : 0; }
-        /* What the title actually asks for, counted once.
-         *
-         * Turning culling on removed most of the city, which says the inputs
-         * are not what the reasoning above assumed -- and the two registers
-         * were being read from the wrong methods until a moment ago, so
-         * nothing here has ever seen a real value. Count them before
-         * believing any convention. */
-        { static uint32_t seen_en[2], seen_cf[8], seen_ff[4]; static uint64_t n;
-          static int on = -2;
-          if (on == -2) on = getenv("RECOMP_GL_CULL_MAP") ? 1 : 0;
-          if (on) {
-              seen_en[rs->cull_enable ? 1 : 0]++;
-              seen_cf[(rs->cull_face - 0x404) & 7]++;
-              seen_ff[(rs->front_face - 0x900) & 3]++;
-              if (++n % 50000 == 0)
-                  fprintf(stderr, "  [GL] cull: off %u on %u | face F%u B%u "
-                          "FB%u other%u | front CW%u CCW%u other %u/%u\n",
-                          seen_en[0], seen_en[1], seen_cf[0], seen_cf[1],
-                          seen_cf[4], seen_cf[2] + seen_cf[3] + seen_cf[5]
-                          + seen_cf[6] + seen_cf[7],
-                          seen_ff[0], seen_ff[1], seen_ff[2], seen_ff[3]);
-          } }
-        if (!cull || !rs->cull_enable) {
-            glDisable(GL_CULL_FACE);
-        } else {
-            /* These registers hold OpenGL's own enumerants: 0x900 is
-             * GL_CW, 0x901 GL_CCW, 0x404 GL_FRONT, 0x405 GL_BACK, 0x408
-             * GL_FRONT_AND_BACK. The NV2A is a GeForce 3 and its driver
-             * spoke GL, so the values pass straight through.
-             *
-             * Straight through is also right for the winding, which took a
-             * run to establish. The transform mirrors y -- the viewport's y
-             * scale is negative -- and a mirror reverses the order a
-             * triangle's vertices appear in, so correcting for it looked
-             * obviously necessary. It is not: the console's own viewport
-             * transform has the same negative scale, so the hardware sees
-             * the reflected winding too and the register already accounts
-             * for it. Correcting again culled the visible side of every
-             * surface, which left the city as the dark insides of its own
-             * buildings. */
-            int ccw = (rs->front_face == 0x901);
-            glEnable(GL_CULL_FACE);
-            if (flip) ccw = !ccw;
-            glFrontFace(ccw ? GL_CCW : GL_CW);
-            glCullFace(rs->cull_face == 0x404 ? GL_FRONT
-                     : rs->cull_face == 0x408 ? GL_FRONT_AND_BACK : GL_BACK);
-        }
-    }
-
-    /* The window clip, as a scissor. The rectangle arrives in the title's
-     * coordinates, which run top-down; GL's run bottom-up, so the y has to be
-     * turned over, and the internal resolution multiplies all four. */
-    if (rs->scissor_enable) {
-        uint32_t sc = gl_scale();
-        GLint gy = (GLint)((g_fbo_h - (rs->scissor[3] + 1)) * sc);
-        if (gy < 0) gy = 0;
-        glEnable(GL_SCISSOR_TEST);
-        glScissor((GLint)(rs->scissor[0] * sc), gy,
-                  (GLsizei)((rs->scissor[2] - rs->scissor[0] + 1) * sc),
-                  (GLsizei)((rs->scissor[3] - rs->scissor[1] + 1) * sc));
-    } else {
-        glDisable(GL_SCISSOR_TEST);
-    }
-}
-
-static void glb_draw(int prog, int prim,
-                     const float *verts, uint32_t nverts, uint32_t stride_floats,
-                     const Nv2aAttrSlot *slots, int nslots,
-                     const Nv2aUniforms *u,
-                     uint32_t const_attr_mask, const float const_attr[16][4])
-{
-    (void)prog; (void)prim; (void)verts; (void)nverts; (void)stride_floats;
-    (void)slots; (void)nslots; (void)u; (void)const_attr_mask; (void)const_attr;
-    glb_unrouted("draw");
-}
-
-static void glb_present(const uint8_t **pixels, uint32_t *w, uint32_t *h)
-{
-    *pixels = NULL; *w = 0; *h = 0;
-    glb_unrouted("present");
-}
-
-static void glb_report(void) { nv2a_gl_report(); }
-
-static const Nv2aBackend g_gl_backend = {
-    "opengl",
-    glb_init, glb_surface, glb_clear, glb_program, glb_texture,
-    glb_state, glb_draw, glb_present, glb_report
-};
-
-const Nv2aBackend *nv2a_backend_gl(void) { return &g_gl_backend; }
 
 /* A build without the Metal backend still has to link. The header's rule is
  * that a backend which cannot be built at all returns NULL, and that is a
  * cheaper way to say "this platform has no Metal" than an #ifdef at every
  * place that might ask for one. */
 #ifndef NV2A_HAVE_METAL
-const Nv2aBackend *nv2a_backend_metal(void) { return NULL; }
+const Nv2aGfx *nv2a_gfx_metal(void) { return NULL; }
 #endif
 
 /*
  * Which one runs.
  *
- * RECOMP_BACKEND=metal asks for Metal; anything else, or a Metal build that
- * cannot bring a device up, gets OpenGL. Chosen once and remembered, because
- * a backend that changed halfway through a frame would leave its surfaces and
+ * RECOMP_BACKEND=metal or =opengl asks for one; otherwise, in a window, the
+ * stored preference (Video > Renderer on a Mac: Metal unless OpenGL was
+ * chosen), and without a window OpenGL. A Metal build that cannot bring a
+ * device up gets OpenGL, and says so. Chosen once and kept, because a
+ * backend that changed halfway through a frame would leave its surfaces and
  * programs behind in the other one.
  */
-static const Nv2aBackend *backend(void)
+static int gfx_init(uint32_t w, uint32_t h)
 {
-    static const Nv2aBackend *b;
-    if (!b) {
-        const char *v = getenv("RECOMP_BACKEND");
-        if (v && !strcmp(v, "metal")) {
-            b = nv2a_backend_metal();
-            if (b && b->init && !b->init()) b = NULL;
-            if (!b) fprintf(stderr, "  [GL] Metal backend unavailable, "
-                                    "using OpenGL\n");
+    const char *v = getenv("RECOMP_BACKEND");
+    int want_metal = 0, metal_window = 0;
+#if defined(NV2A_GL_USE_CGL)
+    /* With a window, the window has already decided (it was made for one or
+     * the other, from the same preference); without one, only the
+     * environment can ask. */
+    extern void *nv_window_metal_layer(void) __attribute__((weak));
+    extern void  nv_window_use_gl(void) __attribute__((weak));
+    if (getenv("RECOMP_WINDOW") && nv_window_is_open())
+        g_windowed = 1;
+    metal_window = nv_window_metal_layer && nv_window_metal_layer() != NULL;
+#endif
+    want_metal = (v && *v) ? !strcmp(v, "metal") : metal_window;
+#if defined(NV2A_GL_USE_NONE)
+    want_metal = 1;                   /* there is nothing else */
+#endif
+    if (want_metal) {
+        const Nv2aGfx *m = nv2a_gfx_metal();
+        if (m && m->init()) {
+            G = m;
+            g_is_gl = 0;
+            fprintf(stderr, "  [GL] backend: %s\n", G->name);
+            return 1;
         }
-        if (!b) b = &g_gl_backend;
-        fprintf(stderr, "  [GL] backend: %s\n", b->name);
+        fprintf(stderr, "  [GL] Metal backend unavailable%s\n",
+#if defined(NV2A_GL_USE_NONE)
+                "; nothing to draw with"
+#else
+                ", using OpenGL"
+#endif
+                );
+#if defined(NV2A_GL_USE_CGL)
+        if (metal_window && nv_window_use_gl) nv_window_use_gl();
+#endif
     }
-    return b;
+    if (!gl_init(w, h)) return 0;     /* the context, then the device */
+    fprintf(stderr, "  [GL] backend: %s\n", G->name);
+    return 1;
 }
 
 /* The present count -- the same number RECOMP_GL_DUMP_AFTER counts in -- for

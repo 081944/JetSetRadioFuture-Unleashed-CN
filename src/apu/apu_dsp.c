@@ -256,7 +256,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * A limiter where there used to be only the clamp below.
              *
              * With the crosstalk bins folded in, a busy moment adds up to more
-             * than full scale -- Julien's session: bins 6/7 at 2.7, the
+             * than full scale -- a player's session: bins 6/7 at 2.7, the
              * output pinned at 32767 in six seconds of play -- and the clamp
              * then squares the tops of the waveform off, which is heard as
              * crackle and pops over the loud moments. The gain now drops at

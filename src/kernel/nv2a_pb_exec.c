@@ -1446,8 +1446,20 @@ static uint32_t dma_object_base(uint32_t handle, int *ok)
     return (frame & 0xFFFFF000u) | ((flags >> 20) & 0xFFFu);
 }
 
+/* NV097_NO_OPERATION with a parameter: on the console, a software method --
+ * the GPU stops and raises a PGRAPH interrupt, and D3D's handler acts on the
+ * parameter (sub_00193F70 in JSRF: 5 sets the push-buffer "busy block"
+ * event a make-space wait sleeps on). Counted here, by parameter, so the
+ * report says whether and how often the title relies on them. */
+static unsigned long g_swm_count[17];
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
+    if (method == 0x0100 && param) {
+        extern void xbox_nv2a_software_method(uint32_t subch, uint32_t param);
+        g_swm_count[param < 16 ? param : 16]++;
+        xbox_nv2a_software_method(subch, param);
+    }
     if (subch == 0 && (method == 0x1D6C || method == 0x1D70 || method == 0x01A4)) {
         static int lg = -1, shown;
         if (lg < 0) lg = getenv("RECOMP_PB_SEMLOG") ? 1 : 0;
@@ -1844,6 +1856,23 @@ static void peek_chain(void)
 void nv2a_pb_exec_report(void)
 {
     nv2a_gl_report();
+    {
+        int k, any = 0;
+        char line[512];
+        int len = snprintf(line, sizeof line, "  [NV2A] software methods (NOP with a parameter):");
+        for (k = 1; k <= 16; k++)
+            if (g_swm_count[k]) {
+                any = 1;
+                len += snprintf(line + len, sizeof line - len, " %s%d x%lu",
+                                k == 16 ? ">=" : "", k, g_swm_count[k]);
+            }
+        if (any) {
+            extern void xbox_nv2a_swm_stats(unsigned long *, unsigned long *);
+            unsigned long raised = 0, dropped = 0;
+            xbox_nv2a_swm_stats(&raised, &dropped);
+            fprintf(stderr, "%s; delivered %lu, dropped %lu\n", line, raised, dropped);
+        }
+    }
 
     peek_addresses();
     peek_chain();

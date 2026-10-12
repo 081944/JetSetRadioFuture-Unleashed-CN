@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
 
 # Tool output (regenerated per-game)
 tools/disasm/output/
@@ -41,6 +42,7 @@ launcher/AppIcon.icns
 *.app/
 *.tar.gz
 *.zip
+*.ipa
 
 # The generated code: derived from the game's executable, never committed
 port/recomp/

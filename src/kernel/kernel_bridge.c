@@ -2417,6 +2417,115 @@ static void kernel_vblank_tick(void)
     }
 }
 
+/* The GPU's software methods, delivered.
+ *
+ * NV097_NO_OPERATION with a non-zero parameter is how D3D asks the GPU to call
+ * it back: the GPU stops on the method and raises a PGRAPH interrupt -- an
+ * "error" whose trap registers hold the method (0x100) and the parameter --
+ * and D3D's handler (CMiniport::ServiceGrInterrupt, sub_00194210 in JSRF) does
+ * what the parameter says. Parameter 5 sets the push buffer's "busy block"
+ * event, and the make-space path for a request of 32 KB or more inserts a
+ * NOP(5) and sleeps on that event. Nothing here raised the interrupt, so once
+ * in a while -- a big enough request at the wrong moment -- the game slept for
+ * good: the main thread in KeWaitForSingleObject from 0x0019151B, the push
+ * buffer drained (GET == PUT), the picture stopped.
+ *
+ * The push-buffer executor queues each one (xbox_nv2a_software_method) and
+ * this tick, on the thread that delivers the other interrupts, raises the
+ * oldest: trap registers, PGRAPH_INTR's error bit, PMC_INTR_0's PGRAPH bit,
+ * then the NV2A vector. One at a time: the next waits until the title's
+ * handler has acknowledged this one (xbox_nv2a_software_method_done). The
+ * acknowledgement comes from the port's wrapper on that handler, which also
+ * does what the console's write-1-to-clear register would -- here the
+ * register is memory and keeps the bit, and D3D's DPC calls the handler for
+ * as long as it reads anything pending. So nothing is raised for a title
+ * without such a wrapper (nv2a_title_acks_pgraph): an interrupt nothing can
+ * clear would hold its DPC in that loop for good.
+ *
+ * Only the parameters a title is known to need are delivered -- JSRF's 5 --
+ * because the others were never delivered either and the rest of the runtime
+ * may already stand in for what their handlers do (parameter 1's, for one,
+ * counts flips). RECOMP_NV2A_SWM=all delivers every one, =0 none.
+ */
+#define NV2A_PGRAPH_INTR       0x00400100u
+#define NV2A_PGRAPH_NSOURCE    0x00400108u
+#define NV2A_PGRAPH_TRAP_ADDR  0x00400704u
+#define NV2A_PGRAPH_TRAP_DATA  0x00400708u
+#define NV2A_PGRAPH_INTR_ERROR (1u << 20)
+#define NV2A_PMC_INTR_PGRAPH   (1u << 12)
+#define SWM_QUEUE 64u
+/* Overridden (strong) by a port that acknowledges PGRAPH interrupts. */
+__attribute__((weak)) int nv2a_title_acks_pgraph(void) { return 0; }
+static struct { uint32_t subch, param; } g_swm_q[SWM_QUEUE];
+static volatile uint32_t g_swm_head, g_swm_tail;
+static volatile int      g_swm_in_flight;
+static unsigned long     g_swm_raised, g_swm_dropped;
+
+static int swm_wanted(uint32_t param)
+{
+    static int mode = -1;                 /* 0 none, 1 the known ones, 2 all */
+    if (mode < 0) {
+        const char *e = getenv("RECOMP_NV2A_SWM");
+        mode = !nv2a_title_acks_pgraph() ? 0
+             : (e && !strcmp(e, "all")) ? 2 : (e && e[0] == '0') ? 0 : 1;
+    }
+    return mode == 2 || (mode == 1 && param == 5);
+}
+
+int xbox_nv2a_swm_in_flight(void) { return g_swm_in_flight; }
+
+void xbox_nv2a_software_method(uint32_t subch, uint32_t param)
+{
+    uint32_t h = g_swm_head;
+    if (!swm_wanted(param)) return;
+    if (h - __atomic_load_n(&g_swm_tail, __ATOMIC_ACQUIRE) >= SWM_QUEUE) {
+        g_swm_dropped++;
+        return;
+    }
+    g_swm_q[h % SWM_QUEUE].subch = subch;
+    g_swm_q[h % SWM_QUEUE].param = param;
+    __atomic_store_n(&g_swm_head, h + 1, __ATOMIC_RELEASE);
+}
+
+void xbox_nv2a_software_method_done(void)
+{
+    if (!g_swm_in_flight) return;
+    __atomic_store_n(&g_swm_tail, g_swm_tail + 1, __ATOMIC_RELEASE);
+    g_swm_in_flight = 0;
+}
+
+static void kernel_pgraph_tick(void)
+{
+    uint32_t t = g_swm_tail;
+    int claimed;
+    if (g_swm_in_flight || t == __atomic_load_n(&g_swm_head, __ATOMIC_ACQUIRE)) return;
+    if (!xbox_GetConnectedInterrupt(NV2A_VECTOR)) return;
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_TRAP_ADDR) =
+        0x100u | (g_swm_q[t % SWM_QUEUE].subch << 16);
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_TRAP_DATA) = g_swm_q[t % SWM_QUEUE].param;
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_NSOURCE) = 1u;   /* a notification */
+    g_swm_in_flight = 1;
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR) |= NV2A_PGRAPH_INTR_ERROR;
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)  |= NV2A_PMC_INTR_PGRAPH;
+    claimed = kernel_raise_interrupt(NV2A_VECTOR);
+    g_swm_raised++;
+    if (g_swm_raised <= 3 || claimed <= 0) {
+        static unsigned said;
+        if (said++ < 8)
+            fprintf(stderr, "  [NV2A] software method %u (#%lu) -> ISR %s\n",
+                    g_swm_q[t % SWM_QUEUE].param, g_swm_raised,
+                    claimed < 0 ? "not callable" : claimed ? "claimed it" : "declined it");
+        fflush(stderr);
+    }
+}
+
+/* For the report. */
+void xbox_nv2a_swm_stats(unsigned long *raised, unsigned long *dropped)
+{
+    if (raised) *raised = g_swm_raised;
+    if (dropped) *dropped = g_swm_dropped;
+}
+
 /* The audio processor's interrupt, delivered.
  *
  * Vector 5 on the console. DirectSound connects an ISR to it and does its
@@ -2891,6 +3000,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         }
         kernel_freeze_watch(); /* has the picture stopped? */
         kernel_vblank_tick();  /* the GPU's frame clock */
+        kernel_pgraph_tick();  /* the GPU's software methods */
         kernel_apu_tick();     /* the APU's interrupt line */
         kernel_cvfs_watch();   /* CRI's streaming file device */
         kernel_drain_dpcs();   /* deferred work, before due timers */

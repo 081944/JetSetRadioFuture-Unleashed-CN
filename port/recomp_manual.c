@@ -1658,8 +1658,8 @@ static void mscript_dump(uint32_t flow, uint32_t state)
     fflush(stderr);
 }
 extern void nv2a_set_wide_scene(int on);
-/* What the flow last said about widescreen (-1 nothing yet: the boot logos
- * stay 4:3 too, see jsrf_wide_boot). */
+/* What the flow last said about widescreen (-1 nothing yet: the boot logos,
+ * widened, see jsrf_wide_boot). */
 static int s_wide_scene_said = -1;
 static int wide_log_on(void)
 {
@@ -1667,7 +1667,15 @@ static int wide_log_on(void)
     if (on < 0) on = getenv("JSRF_WIDE_LOG") ? 1 : 0;
     return on;
 }
-__attribute__((constructor)) static void jsrf_wide_boot(void) { nv2a_set_wide_scene(0); }
+/* The boot logos (SEGA, Smilebit, Dolby) are widened like the game: each is
+ * an overlay on a cleared screen, so the logo keeps its shape and its
+ * background fills the 16:9 screen, where kept 4:3 it sat between black bars.
+ * JSRF_WIDE_BOOT=0 keeps them 4:3. */
+__attribute__((constructor)) static void jsrf_wide_boot(void)
+{
+    const char *v = getenv("JSRF_WIDE_BOOT");
+    nv2a_set_wide_scene(v && v[0] == '0' ? 0 : 1);
+}
 extern void sub_00051FC0_gen(void);
 void sub_00051FC0(void)
 {
@@ -1728,15 +1736,20 @@ void sub_00051FC0(void)
                   mscript_dump(flow, st);
               }
           } }
-        /* Widescreen by scene: the title (mission 0x5A, the attract
-         * demo and its menu) stays 4:3, pillarboxed -- its overlays park
-         * things just past the 4:3 edges (and its sky stops there), which
-         * a wider view shows as black bars down the sides. Every mission
-         * after it is widened. A flow handing over to the next one (states
-         * 93/94) has no say. */
+        /* Widescreen by scene: the title (mission 0x5A, the opening, the
+         * attract demo and its menu) stays 4:3, pillarboxed -- its opening
+         * is a composition drawn for a 4:3 screen: widened, its bars and its
+         * giant logo come apart (some are overlays and are squeezed, some
+         * are not, and black stripes open between them), and its overlays
+         * park things just past the 4:3 edges. JSRF_WIDE_TITLE=1 widens it
+         * anyway, to look. Every mission after it is widened. A flow
+         * handing over to the next one (states 93/94) has no say. */
         { uint32_t mi = *(uint32_t *)(m + flow + 0x58), st = *(uint32_t *)(m + flow + 0x5C);
           if (st != 93 && st != 94) {
-              int want = (mi != 0x5Au);
+              static int title_wide = -1;
+              int want;
+              if (title_wide < 0) title_wide = getenv("JSRF_WIDE_TITLE") ? 1 : 0;
+              want = (mi != 0x5Au) || title_wide;
               if (want != s_wide_scene_said) {
                   s_wide_scene_said = want;
                   nv2a_set_wide_scene(want);
@@ -1980,6 +1993,71 @@ void sub_001912A0(void)
     sub_001912A0_gen();
     xbox_nv2a_hurry(0);
     xbox_nv2a_kick();
+}
+
+/* ---- sub_00194210: D3D's PGRAPH interrupt handler --------------------------
+ *
+ * CMiniport::ServiceGrInterrupt, called from the NV2A DPC (0x00194480) when
+ * PMC_INTR_0 says PGRAPH. It reads PGRAPH_INTR (+0x400100) and the trap
+ * registers (+0x400704 method, +0x400708 parameter, +0x400108 source), writes
+ * PGRAPH_INTR back to acknowledge -- write-1-to-clear on the console -- and
+ * for a NOP with a parameter calls the software-method dispatcher
+ * (sub_00193F70; 5 = KeSetEvent on the push buffer's busy-block event). It
+ * returns PGRAPH_INTR as it reads it afterwards, and the DPC loops for as
+ * long as that is not zero.
+ *
+ * The runtime delivers those software methods now (kernel_pgraph_tick in
+ * xboxrecomp's kernel_bridge.c), and the register here is memory: the write
+ * that would have cleared the bits keeps them, so the DPC would call this
+ * again and again. What it read, it acknowledged; that is cleared once it
+ * returns, PMC_INTR_0's PGRAPH bit goes with it, the return value is the
+ * register as the console would read it then, and the runtime may deliver the
+ * next one. The hang this ends: the make-space wait at 0x0019151B, for good. */
+int nv2a_title_acks_pgraph(void) { return 1; }
+extern void sub_00194210_gen(void);
+extern void xbox_nv2a_software_method_done(void);
+void sub_00194210(void)
+{
+    uint8_t *m = (uint8_t *)g_xbox_mem_offset;
+    volatile uint32_t *intr = (volatile uint32_t *)(m + 0xFD400100u);
+    volatile uint32_t *pmc  = (volatile uint32_t *)(m + 0xFD000100u);
+    uint32_t seen = *intr;
+    sub_00194210_gen();
+    *intr &= ~seen;
+    if (!*intr) *pmc &= ~0x1000u;
+    g_eax = *intr;
+    if (seen & 0x00100000u) xbox_nv2a_software_method_done();
+}
+
+/* ---- sub_001910E0: how far the GPU is behind the title (test only) ---------
+ *
+ * D3D's make-space path (0x00191440) inserts NOP(5), kicks, and asks this how
+ * much of the push buffer the GPU still has to run before it reaches that
+ * point: under 32 KB it spins; 32 KB or more it sleeps until the GPU raises
+ * software method 5 -- the branch that froze the game for good while nothing
+ * delivered software methods (see sub_00194210 above). Taken only when the
+ * GPU thread happens to be far behind, so only now and then.
+ *
+ * JSRF_TEST_MAKESPACE_WAIT=1 takes it every time: the answer to the call from
+ * 0x001914C6 is never below 32 KB. With the software methods delivered the
+ * game plays on; with RECOMP_NV2A_SWM=0 it stops at the first make-space --
+ * the 3 October freeze, on demand. */
+extern void sub_001910E0_gen(void);
+void sub_001910E0(void)
+{
+    static int force = -1;
+    uint32_t from = GARG(0);
+    if (force < 0) {
+        const char *e = getenv("JSRF_TEST_MAKESPACE_WAIT");
+        force = (e && e[0] == '1') ? 1 : 0;
+    }
+    sub_001910E0_gen();
+    if (force && from == 0x001914C6u && g_eax < 0x8000u) {
+        static unsigned long n;
+        if (n++ < 3)
+            fprintf(stderr, "  [TEST] make-space: sleeping branch forced (#%lu)\n", n);
+        g_eax = 0x8000u;
+    }
 }
 
 /* ---- sub_00013A80: one pass of the game's main loop (test only log) ------
@@ -2819,7 +2897,7 @@ void sub_0005EC20(void)
  * link reads as NULL, CONTAINING_RECORD turns that into 0xFFFFFFB4, and the
  * next load lands at guest 0xFFFFFFBE: "[CRASH] signal 10 ... fault
  * addr=0x3FFFFFFBE in sub_001A2E2E" -- the black screen on New Game (23 Sep,
- * Julien's run and 1 of 2 reproductions with his settings).
+ * a player's run and 1 of 2 reproductions with those settings).
  *
  * There is nothing to retire when nobody owns the voice, so the notification
  * is dropped. Why the voice processor reports voice 0 at all is an APU

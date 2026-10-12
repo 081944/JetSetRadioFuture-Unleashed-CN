@@ -372,10 +372,13 @@ final class Launcher: NSObject, NSApplicationDelegate {
 
         // The engine writes its diagnosis to stdout and stderr; after exec
         // there is nobody left to collect them, so point them at the log now.
-        freopen(log.path, "w", stdout)
-        freopen(log.path, "a", stderr)   // append: "w" twice gives two writers
-                                         // at offset zero, interleaving the
-                                         // start of the log into nonsense
+        // Both append. "w" twice gave two writers at offset zero; "w" for
+        // stdout and "a" for stderr was still one writer at its own offset,
+        // and the engine's few stdout lines at startup landed on top of the
+        // stderr lines already there. The previous log was moved aside above,
+        // so appending starts a new file.
+        freopen(log.path, "a", stdout)
+        freopen(log.path, "a", stderr)
 
         let exe = Game.binary.path
         var argv: [UnsafeMutablePointer<CChar>?] =

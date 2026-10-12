@@ -1383,15 +1383,21 @@ SIZE_T HeapSize(HANDLE heap, DWORD flags, LPCVOID mem)
 /* Virtual memory                                                        */
 /* ===================================================================== */
 
+/* Execute permission is left out. Nothing here runs guest code from memory --
+ * the title's code was compiled ahead of time into this binary -- so for a
+ * recompiled title "executable" only ever meant "readable", and asking the
+ * host for it costs something: Apple Silicon refuses writable-and-executable
+ * pages outside MAP_JIT, and iOS refuses executable pages to an app at all,
+ * so a title committing memory PAGE_EXECUTE_READWRITE would get none. */
 static int prot_from_page(DWORD protect)
 {
     switch (protect & 0xFF) {
     case PAGE_NOACCESS:          return PROT_NONE;
     case PAGE_READONLY:          return PROT_READ;
     case PAGE_READWRITE:         return PROT_READ | PROT_WRITE;
-    case PAGE_EXECUTE:           return PROT_EXEC;
-    case PAGE_EXECUTE_READ:      return PROT_READ | PROT_EXEC;
-    case PAGE_EXECUTE_READWRITE: return PROT_READ | PROT_WRITE | PROT_EXEC;
+    case PAGE_EXECUTE:           return PROT_READ;
+    case PAGE_EXECUTE_READ:      return PROT_READ;
+    case PAGE_EXECUTE_READWRITE: return PROT_READ | PROT_WRITE;
     default:                     return PROT_READ | PROT_WRITE;
     }
 }

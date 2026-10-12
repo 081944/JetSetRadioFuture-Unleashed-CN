@@ -1,120 +1,804 @@
 /*
  * The NV2A's back half, in Metal.
  *
- * Written against nv2a_backend.h, which is where the reasoning about what a
- * backend has to get right lives. The notes here are about the ways Metal
- * differs from OpenGL in this particular job -- and there are only a few, but
- * they are structural rather than cosmetic:
+ * The other implementation of the device in nv2a_backend.h, beside the
+ * OpenGL one in nv2a_gfx_gl.c -- same operations, same order, and written to
+ * be read side by side with it, because when the two pictures differ the
+ * question is always "which of these two functions disagrees". The front half
+ * (nv2a_gl.c) is shared, so everything here is about how Metal does a thing,
+ * never about what the console asked for.
  *
- *   Blend state belongs to the pipeline. In GL it is a state toggle set
- *   between draws; in Metal it is compiled into the render pipeline object.
- *   So the pipeline cache key has to include it, and a title that draws the
- *   same geometry with two blend modes needs two pipelines. That is why the
- *   key here is wider than the GL backend's.
+ * Where Metal differs from OpenGL in this job, structurally:
  *
- *   There is no alpha test. It does not exist in Metal at all, and the
- *   fragment translator already knows how to emit a discard instead -- which
- *   is also what modern GL wants, so nothing diverges.
+ *   State lives in objects. Blend state and the colour write mask are
+ *   compiled into the render pipeline, depth and stencil state into a
+ *   depth-stencil object; both are cached here, keyed on exactly what went
+ *   into them, and looked up at draw time from the last state() call. The
+ *   rest (cull, winding, scissor, depth clamp, stencil reference) is encoder
+ *   state and is set when it changes.
  *
- *   A clear is a property of a render pass, not a command inside one. A
- *   full-surface clear therefore ends the current pass and begins another; a
- *   sub-rectangle clear, which this title does constantly, cannot be expressed
- *   that way at all and is drawn as a scissored quad.
+ *   Work is recorded, then submitted. A frame's draws go into one command
+ *   buffer, committed at the flip; vertices, constants and index lists are
+ *   written into a per-frame arena of shared buffers, three frames of them,
+ *   so the CPU never writes a buffer the GPU is still reading.
  *
- *   Depth goes from 0 to w, not -w to w. The shared epilogue emits the right
- *   one under NV2A_CLIP_Z01, which is defined here and not in the GL path.
+ *   A render target is drawn in passes. Switching target, copying out of one
+ *   or reading it back ends the pass; the next draw begins another that loads
+ *   what was there. A clear at the start of a pass is a load action (free on
+ *   this hardware); anywhere else it is a triangle drawn with the clear
+ *   colour, depth and stencil.
  *
- * Everything else -- the surfaces, the texture cache, the program cache, the
- * vertex layout -- is the same shape as the OpenGL backend, deliberately, so
- * that the two can be read side by side when one of them is wrong.
+ *   There are no generic vertex attributes and no triangle fans. Vertices are
+ *   pulled (the generated vertex function reads a packed float buffer through
+ *   a table of offsets), with one value per draw for an attribute that has no
+ *   array -- kept here as OpenGL kept it, including the value a draw that
+ *   supplies neither inherits. Fans and line loops are drawn indexed.
+ *
+ *   Pictures are the right way up in memory: a target's row 0 is the top of
+ *   the screen, as a texture's is, so sampling a surface turns nothing over
+ *   and read-backs flip rows to hand out OpenGL's bottom-up order.
+ *
+ *   The window is fed by a thread of its own, which waits for the display so
+ *   that nothing else has to (see "the window", at mtl_present).
+ *
+ * Built with ARC (CMakeLists.txt asks for it for this file alone).
  */
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
+#include <time.h>
+#include <pthread.h>
+#include <TargetConditionals.h>
 
 #include "../nv2a_gl/nv2a_backend.h"
 
-/* ---- small caches, sized from what this title actually uses -------------- */
+#if !__has_feature(objc_arc)
+#error "nv2a_metal.m is written for ARC: compile it with -fobjc-arc"
+#endif
 
-#define MTL_SURF_CACHE   8
-#define MTL_PROG_CACHE   2048     /* see nv2a_backend.h on why not 128 */
-#define MTL_TEX_CACHE    4096
-#define MTL_RING_BYTES   (8u << 20)
+/* In nv2a_window_mac.m: the window's CAMetalLayer, when there is a window and
+ * it was made for Metal; and nv2a_gl.c's widescreen state, for the picture's
+ * shape at the flip. */
+void *nv_window_metal_layer(void) __attribute__((weak));
+int   nv_window_visible(void) __attribute__((weak));
+int   nv_window_refresh_hz(void) __attribute__((weak));
+/* iOS (port/ios/jsrf_ios.m) returns from this once the app is in front: GPU
+ * work submitted from the background is refused there, so a frame finished
+ * while the app is away is held until it is back -- and the game with it.
+ * Elsewhere this default does nothing. A weak definition rather than a weak
+ * reference: Mach-O will not link a weak reference nothing defines. */
+__attribute__((weak)) void nv_window_wait_visible(void);
+__attribute__((weak)) void nv_window_wait_visible(void) { }
+int   nv2a_wide_scene(void);
+
 #define MTL_FRAMES_IN_FLIGHT 3
+#define MTL_ARENA_CHUNK      (8u << 20)
+#define MTL_MAX_TEX          8192
+#define MTL_MAX_RT           64
+#define MTL_MAX_PROG         4096
+#define MTL_PSO_CACHE        16384     /* power of two */
+#define MTL_DSS_CACHE        1024      /* power of two */
+#define MTL_SMP_CACHE        64
+
+static int env_on(const char *n) { const char *v = getenv(n); return v && *v && *v != '0'; }
+
+/* ---- the device ----------------------------------------------------------- */
+
+static id<MTLDevice>               g_dev;
+static id<MTLCommandQueue>         g_queue;
+static id<MTLCommandBuffer>        g_cb;      /* this frame's, while recording */
+static id<MTLRenderCommandEncoder> g_enc;     /* the open pass, if any */
+static dispatch_semaphore_t        g_inflight;
+static int      g_frame_open;                 /* a frame has begun recording */
+static uint32_t g_frame_slot;
+
+/* ---- handles: textures, targets, programs ---------------------------------- */
 
 typedef struct {
-    uint32_t offset, w, h, scale;
-    int      used;
-    void    *color;      /* id<MTLTexture> */
-    void    *depth;
-} MtlSurface;
+    id<MTLTexture>      tex;
+    id<MTLSamplerState> smp;
+    uint32_t            w, h;
+    int                 used;
+} MtlTex;
+static MtlTex   g_tex[MTL_MAX_TEX];
+static uint32_t g_tex_hint;
 
 typedef struct {
-    uint32_t hash;
-    uint32_t last_draw;
-    int      used;
-    void    *pso;        /* id<MTLRenderPipelineState> */
-    uint16_t inputs;
-} MtlProgram;
+    uint32_t       color;      /* texture handle of the colour buffer */
+    id<MTLTexture> ds;         /* depth32float + stencil8 */
+    uint32_t       pw, ph;
+    int            used;
+} MtlRT;
+static MtlRT    g_rt[MTL_MAX_RT];
+static uint32_t g_cur_rt;
 
 typedef struct {
-    uint32_t key, w, h;
-    int      used;
-    uint32_t last_draw;
-    void    *tex;        /* id<MTLTexture> */
-} MtlTexture;
+    id<MTLFunction> vf, ff;
+    uint64_t        uses;      /* bit per Nv2aUniformId the source reads */
+    uint32_t        gen;       /* changes each time the slot is reused */
+    int             used;
+} MtlProg;
+static MtlProg  g_prog[MTL_MAX_PROG];
+static uint32_t g_prog_gen;
+static uint32_t g_cur_prog;
 
-static id<MTLDevice>       g_dev;
-static id<MTLCommandQueue> g_queue;
-static id<MTLCommandBuffer>        g_cb;
-static id<MTLRenderCommandEncoder> g_enc;
+typedef struct {
+    uint64_t key;
+    id<MTLRenderPipelineState> pso;
+} MtlPso;
+static MtlPso g_pso[MTL_PSO_CACHE];
 
-static MtlSurface g_surf[MTL_SURF_CACHE];
-static MtlProgram g_prog[MTL_PROG_CACHE];
-static MtlTexture g_tex[MTL_TEX_CACHE];
-static int        g_cur_surf = -1;
+typedef struct {
+    uint64_t key;
+    id<MTLDepthStencilState> dss;
+    int used;
+} MtlDss;
+static MtlDss g_dss[MTL_DSS_CACHE];
 
-/* One ring per frame in flight for vertices and one for uniforms. Metal's
- * setVertexBytes has a 4 kB limit and a draw here can be a megabyte, so the
- * data goes into a buffer the GPU reads directly -- and it has to be a
- * different buffer from the one the GPU is still reading. */
-static id<MTLBuffer> g_vring[MTL_FRAMES_IN_FLIGHT];
-static id<MTLBuffer> g_uring[MTL_FRAMES_IN_FLIGHT];
-static uint32_t      g_vpos, g_upos, g_frame_slot;
-static dispatch_semaphore_t g_inflight;
+typedef struct { uint32_t key; id<MTLSamplerState> smp; } MtlSmp;
+static MtlSmp g_smp[MTL_SMP_CACHE];
+static int    g_nsmp;
 
-static id<MTLSamplerState> g_sampler[4];
-static id<MTLDepthStencilState> g_ds_cache[16];
-static uint32_t g_draws, g_progs_built, g_tex_built;
-static uint8_t *g_readback;
-static uint32_t g_readback_bytes;
+static uint32_t g_snap_tex;              /* target_snapshot()'s copy */
+static id<MTLTexture>      g_black;      /* what an unbound stage samples */
+static id<MTLSamplerState> g_black_smp;
 
-/* ---- the pieces the interface hands over -------------------------------- */
+/* The clear and present pipelines, built once. */
+static id<MTLLibrary>              g_util_lib;
+static id<MTLRenderPipelineState> g_clear_pso[2];      /* colour off / on */
+static id<MTLRenderPipelineState> g_blit_pso;          /* to the drawable */
+static id<MTLSamplerState>         g_linear_clamp;
 
-static MTLPrimitiveType prim_of(int p)
+/* ---- per-draw state ----------------------------------------------------------- */
+
+static Nv2aRenderState g_rs;              /* the last state() */
+static uint32_t g_bound[4];               /* texture handles per unit */
+
+static uint8_t  *g_vu, *g_fu;             /* the two uniform structs */
+static uint32_t  g_vu_size, g_fu_size;
+static float     g_consts[NV2A_VSH_NUM_CONSTS][4];
+static int       g_consts_dirty = 1;
+static id<MTLBuffer> g_consts_buf;        /* where the constants last went */
+static uint32_t  g_consts_off;
+
+static Nv2aMslAttrTable g_attr;
+static float     g_generic[16][4];        /* GL's current attribute values */
+static id<MTLBuffer> g_vbuf;              /* the vertices of the coming draws */
+static uint32_t  g_voff;
+
+static id<MTLBuffer> g_fan;               /* 0,1,2, 0,2,3, ... */
+static uint32_t  g_fan_verts;
+
+/* What the open encoder has been given, so a draw sets only what changed. */
+static struct {
+    __unsafe_unretained id<MTLRenderPipelineState> pso;
+    __unsafe_unretained id<MTLDepthStencilState>   dss;
+    int      cull, wind, clip;
+    uint32_t stencil_ref;
+    MTLScissorRect sc;
+    __unsafe_unretained id<MTLBuffer> vbuf, cbuf;
+    uint32_t voff, coff;
+    uint32_t tex[4];
+    int      valid;
+} E;
+
+/* Clear load actions waiting for the next pass on the bound target. */
+static struct { unsigned mask; float rgba[4]; float depth; uint32_t stencil; } g_pending_clear;
+
+/* Counters for the report. */
+static uint64_t g_n_draws, g_n_passes, g_n_frames, g_n_quad_clears, g_n_load_clears;
+static uint32_t g_n_progs, g_n_psos, g_n_tex, g_n_readbacks, g_n_snapshots;
+static uint64_t g_arena_peak;
+/* The window's, kept by two threads (see mtl_present). */
+static _Atomic uint64_t g_n_presented, g_n_no_drawable, g_n_skipped, g_n_hidden;
+static double   g_ms_compile, g_ms_pso, g_ms_pso_max;   /* time spent building */
+
+static double now_ms(void)
 {
-    /* The NV2A's primitive numbering, and the two it has that Metal does not:
-     * quads and polygons, which the front half has already expanded into
-     * triangles by the time a draw arrives here. */
-    switch (p) {
-    case 1: return MTLPrimitiveTypePoint;
-    case 2: return MTLPrimitiveTypeLine;
-    case 3: return MTLPrimitiveTypeLineStrip;
-    case 4: return MTLPrimitiveTypeTriangle;
-    case 5: return MTLPrimitiveTypeTriangleStrip;
-    default: return MTLPrimitiveTypeTriangle;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+/* ---- the arena ------------------------------------------------------------------ */
+
+typedef struct {
+    id<MTLBuffer> chunk[16];
+    uint32_t      nchunk, cur, pos;
+    uint64_t      used;
+} MtlArena;
+static MtlArena g_arena[MTL_FRAMES_IN_FLIGHT];
+
+/* `n` bytes in this frame's arena, aligned to 256 (constant buffers want it,
+ * and nothing is the worse for it). */
+static void *arena_alloc(uint32_t n, id<MTLBuffer> __strong *buf, uint32_t *off)
+{
+    MtlArena *a = &g_arena[g_frame_slot];
+    uint32_t need = (n + 255u) & ~255u;
+    for (;;) {
+        if (a->cur < a->nchunk) {
+            id<MTLBuffer> b = a->chunk[a->cur];
+            if (a->pos + need <= (uint32_t)[b length]) {
+                *buf = b;
+                *off = a->pos;
+                a->pos += need;
+                a->used += need;
+                if (a->used > g_arena_peak) g_arena_peak = a->used;
+                return (uint8_t *)[b contents] + *off;
+            }
+            a->cur++;
+            a->pos = 0;
+            continue;
+        }
+        if (a->nchunk >= 16) {
+            static int said;
+            if (!said++) fprintf(stderr, "  [MTL] frame arena full (%u chunks)\n", a->nchunk);
+            return NULL;
+        }
+        {
+            uint32_t sz = need > MTL_ARENA_CHUNK ? need : MTL_ARENA_CHUNK;
+            a->chunk[a->nchunk] = [g_dev newBufferWithLength:sz
+                                                      options:MTLResourceStorageModeShared];
+            if (!a->chunk[a->nchunk]) return NULL;
+            a->nchunk++;
+        }
     }
 }
 
-static MTLCompareFunction cmp_of(int nv)
+/* ---- frames and passes ------------------------------------------------------------ */
+
+static void enc_end(void)
 {
-    /* NV097_SET_DEPTH_FUNC carries the GL enum, which is what the pushbuffer
-     * contains -- the console's D3D driver writes GL-numbered comparison
-     * functions because the hardware's are the same numbers. */
-    switch (nv) {
+    if (g_enc) { [g_enc endEncoding]; g_enc = nil; }
+    E.valid = 0;
+}
+
+/* A command buffer to record into. The first one of a frame waits until the
+ * frame that last used this arena slot has finished on the GPU. */
+static void frame_begin(void)
+{
+    if (g_cb) return;
+    if (!g_frame_open) {
+        dispatch_semaphore_wait(g_inflight, DISPATCH_TIME_FOREVER);
+        g_frame_slot = (g_frame_slot + 1) % MTL_FRAMES_IN_FLIGHT;
+        g_arena[g_frame_slot].cur = 0;
+        g_arena[g_frame_slot].pos = 0;
+        g_arena[g_frame_slot].used = 0;
+        g_frame_open = 1;
+        g_consts_dirty = 1;          /* last frame's copy is in another slot */
+        g_vbuf = nil;
+    }
+    g_cb = [g_queue commandBuffer];
+}
+
+/* Submit what is recorded. At the end of a frame, the arena slot is released
+ * when the GPU is done with it; in the middle of one (a read-back), the frame
+ * carries on into a new command buffer and keeps its slot. */
+static void submit(int end_of_frame, int wait)
+{
+    enc_end();
+    if (!g_cb) {
+        if (end_of_frame && g_frame_open) {
+            g_frame_open = 0;
+            dispatch_semaphore_signal(g_inflight);
+        }
+        return;
+    }
+    if (end_of_frame) {
+        dispatch_semaphore_t sem = g_inflight;
+        [g_cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+            (void)b; dispatch_semaphore_signal(sem);
+        }];
+        g_frame_open = 0;
+    }
+    [g_cb commit];
+    if (wait) [g_cb waitUntilCompleted];
+    if ([g_cb status] == MTLCommandBufferStatusError) {
+        static int said;
+        if (said++ < 5)
+            fprintf(stderr, "  [MTL] command buffer failed: %s\n",
+                    [[[g_cb error] localizedDescription] UTF8String]);
+    }
+    g_cb = nil;
+}
+
+static int rt_ok(uint32_t h) { return h && h <= MTL_MAX_RT && g_rt[h - 1].used; }
+static int tex_ok(uint32_t h) { return h && h <= MTL_MAX_TEX && g_tex[h - 1].used; }
+
+/* Open a pass on the bound target, loading what it holds -- or clearing,
+ * for a target never drawn into or a full clear that arrived first. */
+static int enc_begin(void)
+{
+    MtlRT *rt;
+    MTLRenderPassDescriptor *rp;
+    unsigned clear;
+
+    if (g_enc) return 1;
+    if (!rt_ok(g_cur_rt)) return 0;
+    rt = &g_rt[g_cur_rt - 1];
+    frame_begin();
+
+    clear = g_pending_clear.mask;
+    rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = g_tex[rt->color - 1].tex;
+    rp.colorAttachments[0].loadAction = (clear & 1) ? MTLLoadActionClear : MTLLoadActionLoad;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    rp.colorAttachments[0].clearColor =
+        MTLClearColorMake(g_pending_clear.rgba[0], g_pending_clear.rgba[1],
+                          g_pending_clear.rgba[2], g_pending_clear.rgba[3]);
+    rp.depthAttachment.texture = rt->ds;
+    rp.depthAttachment.loadAction = (clear & 2) ? MTLLoadActionClear : MTLLoadActionLoad;
+    rp.depthAttachment.storeAction = MTLStoreActionStore;
+    rp.depthAttachment.clearDepth = g_pending_clear.depth;
+    rp.stencilAttachment.texture = rt->ds;
+    rp.stencilAttachment.loadAction = (clear & 4) ? MTLLoadActionClear : MTLLoadActionLoad;
+    rp.stencilAttachment.storeAction = MTLStoreActionStore;
+    rp.stencilAttachment.clearStencil = g_pending_clear.stencil & 0xFFu;
+    g_pending_clear.mask = 0;
+
+    g_enc = [g_cb renderCommandEncoderWithDescriptor:rp];
+    if (!g_enc) return 0;
+    [g_enc setViewport:(MTLViewport){ 0.0, 0.0, (double)rt->pw, (double)rt->ph, 0.0, 1.0 }];
+    E.valid = 0;
+    g_n_passes++;
+    return 1;
+}
+
+static void flush_pending_clear(void);
+
+/* ---- textures ------------------------------------------------------------------------- */
+
+static uint32_t tex_slot(void)
+{
+    uint32_t i;
+    for (i = 0; i < MTL_MAX_TEX; i++) {
+        uint32_t k = (g_tex_hint + i) % MTL_MAX_TEX;
+        if (!g_tex[k].used) { g_tex_hint = k + 1; return k + 1; }
+    }
+    fprintf(stderr, "  [MTL] out of texture handles\n");
+    return 0;
+}
+
+static id<MTLSamplerState> sampler_for(const Nv2aSampler *s)
+{
+    static const MTLSamplerAddressMode wrap[3] = {
+        MTLSamplerAddressModeClampToEdge, MTLSamplerAddressModeRepeat,
+        MTLSamplerAddressModeMirrorRepeat };
+    uint32_t key = (uint32_t)s->min_linear | (uint32_t)s->mag_linear << 1
+                 | (uint32_t)(s->mip & 3) << 2 | (uint32_t)(s->wrap_s & 3) << 4
+                 | (uint32_t)(s->wrap_t & 3) << 6 | (uint32_t)s->aniso << 8;
+    MTLSamplerDescriptor *d;
+    int i;
+    for (i = 0; i < g_nsmp; i++) if (g_smp[i].key == key) return g_smp[i].smp;
+    d = [MTLSamplerDescriptor new];
+    d.minFilter = s->min_linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+    d.magFilter = s->mag_linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+    d.mipFilter = s->mip == 1 ? MTLSamplerMipFilterNearest
+                : s->mip == 2 ? MTLSamplerMipFilterLinear : MTLSamplerMipFilterNotMipmapped;
+    d.sAddressMode = wrap[s->wrap_s < 3 ? s->wrap_s : 0];
+    d.tAddressMode = wrap[s->wrap_t < 3 ? s->wrap_t : 0];
+    if (s->mip && s->aniso > 1) d.maxAnisotropy = s->aniso > 16 ? 16 : s->aniso;
+    if (g_nsmp < MTL_SMP_CACHE) {
+        g_smp[g_nsmp].key = key;
+        g_smp[g_nsmp].smp = [g_dev newSamplerStateWithDescriptor:d];
+        return g_smp[g_nsmp++].smp;
+    }
+    return [g_dev newSamplerStateWithDescriptor:d];
+}
+
+static uint32_t mtl_tex_new(uint32_t w, uint32_t h, const void *rgba, const Nv2aSampler *s)
+{
+    uint32_t hnd;
+    MTLTextureDescriptor *td;
+    id<MTLTexture> t;
+    if (!w || !h) return 0;
+    hnd = tex_slot();
+    if (!hnd) return 0;
+    @autoreleasepool {
+        td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                width:w height:h
+                                                            mipmapped:s->mip ? YES : NO];
+        td.usage = MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModeShared;
+        t = [g_dev newTextureWithDescriptor:td];
+        if (!t) return 0;
+        if (rgba)
+            [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
+                   withBytes:rgba bytesPerRow:w * 4];
+        if (s->mip && [t mipmapLevelCount] > 1) {
+            /* A command buffer of its own, committed now: queued ahead of
+             * the frame being recorded, so the chain exists before any draw
+             * of this frame samples it. */
+            id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+            id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+            [bl generateMipmapsForTexture:t];
+            [bl endEncoding];
+            [cb commit];
+        }
+        g_tex[hnd - 1].tex = t;
+        g_tex[hnd - 1].smp = sampler_for(s);
+        g_tex[hnd - 1].w = w; g_tex[hnd - 1].h = h;
+        g_tex[hnd - 1].used = 1;
+    }
+    g_n_tex++;
+    return hnd;
+}
+
+static void mtl_tex_free(uint32_t hnd)
+{
+    int u;
+    if (!tex_ok(hnd)) return;
+    /* A command buffer in flight keeps its own reference; this is ours. */
+    g_tex[hnd - 1].tex = nil;
+    g_tex[hnd - 1].smp = nil;
+    g_tex[hnd - 1].used = 0;
+    for (u = 0; u < 4; u++) if (g_bound[u] == hnd) g_bound[u] = 0;
+    for (u = 0; u < 4; u++) if (E.tex[u] == hnd) E.tex[u] = 0xFFFFFFFFu;
+}
+
+/* Texels back as BGRA, row 0 first (a texture is not a target: no flip). */
+static int read_texture(id<MTLTexture> t, MTLRegion r, int bgra, int flip, uint8_t *out)
+{
+    uint32_t w = (uint32_t)r.size.width, h = (uint32_t)r.size.height, y, x;
+    id<MTLBuffer> rb;
+    id<MTLBlitCommandEncoder> bl;
+    const uint8_t *src;
+    if (!w || !h) return 0;
+    rb = [g_dev newBufferWithLength:(NSUInteger)w * h * 4 options:MTLResourceStorageModeShared];
+    if (!rb) return 0;
+    enc_end();
+    frame_begin();
+    bl = [g_cb blitCommandEncoder];
+    [bl copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:r.origin sourceSize:r.size
+               toBuffer:rb destinationOffset:0 destinationBytesPerRow:w * 4
+destinationBytesPerImage:(NSUInteger)w * h * 4];
+    [bl endEncoding];
+    submit(0, 1);
+    g_n_readbacks++;
+    src = (const uint8_t *)[rb contents];
+    for (y = 0; y < h; y++) {
+        const uint8_t *s = src + (size_t)(flip ? h - 1 - y : y) * w * 4;
+        uint8_t *d = out + (size_t)y * w * 4;
+        if (!bgra) { memcpy(d, s, (size_t)w * 4); continue; }
+        for (x = 0; x < w; x++) {
+            d[x*4+0] = s[x*4+2]; d[x*4+1] = s[x*4+1];
+            d[x*4+2] = s[x*4+0]; d[x*4+3] = s[x*4+3];
+        }
+    }
+    return 1;
+}
+
+static int mtl_tex_read(uint32_t hnd, uint32_t w, uint32_t h, void *bgra)
+{
+    if (!tex_ok(hnd) || !bgra) return 0;
+    return read_texture(g_tex[hnd - 1].tex, MTLRegionMake2D(0, 0, w, h), 1, 0, (uint8_t *)bgra);
+}
+
+/* ---- render targets -------------------------------------------------------------------- */
+
+static uint32_t mtl_target_new(uint32_t pw, uint32_t ph)
+{
+    int i;
+    uint32_t c;
+    MTLTextureDescriptor *cd, *dd;
+    Nv2aSampler s;
+    for (i = 0; i < MTL_MAX_RT; i++) if (!g_rt[i].used) break;
+    if (i == MTL_MAX_RT) { fprintf(stderr, "  [MTL] out of render targets\n"); return 0; }
+    c = tex_slot();
+    if (!c) return 0;
+    memset(&s, 0, sizeof s);
+    s.min_linear = s.mag_linear = 1;
+    @autoreleasepool {
+        cd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                width:pw height:ph mipmapped:NO];
+        cd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        cd.storageMode = MTLStorageModePrivate;
+        dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
+                                                                width:pw height:ph mipmapped:NO];
+        dd.usage = MTLTextureUsageRenderTarget;
+        dd.storageMode = MTLStorageModePrivate;
+        g_tex[c - 1].tex = [g_dev newTextureWithDescriptor:cd];
+        g_rt[i].ds = [g_dev newTextureWithDescriptor:dd];
+        if (!g_tex[c - 1].tex || !g_rt[i].ds) {
+            g_tex[c - 1].tex = nil;
+            g_rt[i].ds = nil;
+            fprintf(stderr, "  [MTL] could not make a %ux%u target\n", pw, ph);
+            return 0;
+        }
+        g_tex[c - 1].smp = sampler_for(&s);
+        g_tex[c - 1].w = pw; g_tex[c - 1].h = ph;
+        g_tex[c - 1].used = 1;
+    }
+    g_rt[i].color = c;
+    g_rt[i].pw = pw; g_rt[i].ph = ph;
+    g_rt[i].used = 1;
+    /* A new texture holds whatever the memory held. Zero it now, the way a
+     * driver's fresh renderbuffer usually comes, so that a surface sampled
+     * before anything is drawn into it reads as nothing rather than noise:
+     * an empty pass that clears and stores. The pass open on the bound
+     * target (if any) ends; its next draw loads what it had. */
+    enc_end();
+    frame_begin();
+    @autoreleasepool {
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        id<MTLRenderCommandEncoder> e;
+        rp.colorAttachments[0].texture = g_tex[c - 1].tex;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        rp.depthAttachment.texture = g_rt[i].ds;
+        rp.depthAttachment.loadAction = MTLLoadActionClear;
+        rp.depthAttachment.clearDepth = 1.0;
+        rp.depthAttachment.storeAction = MTLStoreActionStore;
+        rp.stencilAttachment.texture = g_rt[i].ds;
+        rp.stencilAttachment.loadAction = MTLLoadActionClear;
+        rp.stencilAttachment.clearStencil = 0;
+        rp.stencilAttachment.storeAction = MTLStoreActionStore;
+        e = [g_cb renderCommandEncoderWithDescriptor:rp];
+        [e endEncoding];
+    }
+    return (uint32_t)i + 1;
+}
+
+static void mtl_target_free(uint32_t h)
+{
+    if (!rt_ok(h)) return;
+    if (g_cur_rt == h) { flush_pending_clear(); enc_end(); g_cur_rt = 0; g_pending_clear.mask = 0; }
+    mtl_tex_free(g_rt[h - 1].color);
+    g_rt[h - 1].ds = nil;
+    g_rt[h - 1].used = 0;
+    g_rt[h - 1].color = 0;
+}
+
+/* A clear still waiting for the bound target's next pass has to happen
+ * before anything else does: open the pass, which performs it. */
+static void flush_pending_clear(void)
+{
+    if (g_pending_clear.mask && rt_ok(g_cur_rt)) enc_begin();
+}
+
+static void mtl_target_bind(uint32_t h)
+{
+    if (!rt_ok(h) || h == g_cur_rt) return;
+    flush_pending_clear();
+    enc_end();
+    g_cur_rt = h;
+    g_pending_clear.mask = 0;
+}
+
+static uint32_t mtl_target_texture(uint32_t h)
+{
+    return rt_ok(h) ? g_rt[h - 1].color : 0;
+}
+
+/* Sampling the target being drawn into: the pass ends, the picture as it
+ * stands is copied out, and the next draw resumes the pass. */
+static uint32_t mtl_target_snapshot(uint32_t h)
+{
+    MtlRT *rt;
+    id<MTLBlitCommandEncoder> bl;
+    if (!rt_ok(h)) return 0;
+    rt = &g_rt[h - 1];
+    /* A clear still waiting: the copy has to see what the title believes
+     * is there. */
+    if (h == g_cur_rt) flush_pending_clear();
+    if (!tex_ok(g_snap_tex) || g_tex[g_snap_tex - 1].w != rt->pw
+                            || g_tex[g_snap_tex - 1].h != rt->ph) {
+        MTLTextureDescriptor *td;
+        Nv2aSampler s;
+        if (tex_ok(g_snap_tex)) mtl_tex_free(g_snap_tex);
+        g_snap_tex = tex_slot();
+        if (!g_snap_tex) return 0;
+        memset(&s, 0, sizeof s);
+        s.min_linear = s.mag_linear = 1;
+        td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                width:rt->pw height:rt->ph
+                                                            mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        g_tex[g_snap_tex - 1].tex = [g_dev newTextureWithDescriptor:td];
+        g_tex[g_snap_tex - 1].smp = sampler_for(&s);
+        g_tex[g_snap_tex - 1].w = rt->pw; g_tex[g_snap_tex - 1].h = rt->ph;
+        g_tex[g_snap_tex - 1].used = 1;
+    }
+    enc_end();
+    frame_begin();
+    bl = [g_cb blitCommandEncoder];
+    [bl copyFromTexture:g_tex[rt->color - 1].tex sourceSlice:0 sourceLevel:0
+           sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(rt->pw, rt->ph, 1)
+              toTexture:g_tex[g_snap_tex - 1].tex destinationSlice:0 destinationLevel:0
+      destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [bl endEncoding];
+    g_n_snapshots++;
+    return g_snap_tex;
+}
+
+/* Colour back, rows bottom-up as glReadPixels gives them; (x, y) from the
+ * bottom-left. A target holds row 0 at the top, so the region is turned over
+ * on the way in and the rows on the way out. */
+static int mtl_target_read(uint32_t h, uint32_t x, uint32_t y, uint32_t w,
+                           uint32_t ht, int bgra, void *out)
+{
+    MtlRT *rt;
+    if (!rt_ok(h) || !out || !w || !ht) return 0;
+    rt = &g_rt[h - 1];
+    if (x >= rt->pw || y >= rt->ph) return 0;
+    if (x + w > rt->pw) w = rt->pw - x;
+    if (y + ht > rt->ph) ht = rt->ph - y;
+    if (h == g_cur_rt) flush_pending_clear();
+    return read_texture(g_tex[rt->color - 1].tex,
+                        MTLRegionMake2D(x, rt->ph - y - ht, w, ht), bgra, 1, (uint8_t *)out);
+}
+
+static int mtl_target_read_depth(uint32_t h, uint32_t pw, uint32_t ph, float *out)
+{
+    (void)h; (void)pw; (void)ph; (void)out;
+    return 0;
+}
+
+/* ---- programs ------------------------------------------------------------------------------ */
+
+static int word_in(const char *hay, const char *word)
+{
+    size_t n = strlen(word);
+    const char *p = hay;
+    while ((p = strstr(p, word)) != NULL) {
+        char a = p == hay ? ' ' : p[-1], b = p[n];
+        int ida = (a == '_' || (a >= '0' && a <= '9') || (a >= 'A' && a <= 'Z') || (a >= 'a' && a <= 'z'));
+        int idb = (b == '_' || (b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z'));
+        if (!ida && !idb && a != '.') return 1;
+        p += n;
+    }
+    return 0;
+}
+
+/* Which uniforms a program reads: its bodies (everything after the marker
+ * the emitters put there), searched for each name. The structs and #defines
+ * above the marker name every uniform, so they are not looked at. */
+static uint64_t uniforms_used(const char *vsrc, const char *fsrc)
+{
+    const char *vb = strstr(vsrc, "// nv2a body"), *fb = strstr(fsrc, "// nv2a body");
+    uint64_t m = 0;
+    int id;
+    if (!vb) vb = vsrc;
+    if (!fb) fb = fsrc;
+    for (id = 0; id < NV2A_U_COUNT; id++) {
+        const Nv2aUniformDesc *d = &nv2a_uniform_desc[id];
+        if (d->type == NV2A_UT_SAMPLER) continue;
+        if (word_in(d->frag ? fb : vb, d->name)) m |= 1ull << id;
+    }
+    /* nv_fog() reads fogEnable through a macro the body only names. */
+    if (word_in(vb, "nv_fog")) m |= 1ull << NV2A_U_FOGENABLE;
+    return m;
+}
+
+static id<MTLFunction> compile_fn(const char *src, NSString *name, const char *what, int stage)
+{
+    static int fast = -1;
+    NSError *err = nil;
+    MTLCompileOptions *o;
+    id<MTLLibrary> lib;
+    if (fast < 0) fast = env_on("RECOMP_MTL_FASTMATH");
+    o = [MTLCompileOptions new];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    o.fastMathEnabled = fast ? YES : NO;
+#pragma clang diagnostic pop
+    lib = [g_dev newLibraryWithSource:[NSString stringWithUTF8String:src] options:o error:&err];
+    if (!lib) {
+        fprintf(stderr, "  [MTL] %s (%s) failed to compile:\n%s\n", what,
+                stage ? "fragment" : "vertex", [[err localizedDescription] UTF8String]);
+        if (getenv("RECOMP_GL_DUMP_SHADER"))
+            fprintf(stderr, "----- source -----\n%s\n------------------\n", src);
+        return nil;
+    }
+    return [lib newFunctionWithName:name];
+}
+
+static uint32_t mtl_prog_new(const char *vsrc, const char *fsrc, const char *what)
+{
+    uint32_t i;
+    id<MTLFunction> vf, ff;
+    if (!vsrc || !fsrc) return 0;
+    for (i = 0; i < MTL_MAX_PROG; i++) if (!g_prog[i].used) break;
+    if (i == MTL_MAX_PROG) { fprintf(stderr, "  [MTL] out of program slots\n"); return 0; }
+    @autoreleasepool {
+        double t0 = now_ms();
+        vf = compile_fn(vsrc, @"nv2a_vsh_main", what, 0);
+        ff = vf ? compile_fn(fsrc, @"nv2a_psh_main", what, 1) : nil;
+        g_ms_compile += now_ms() - t0;
+        if (!vf || !ff) return 0;
+        g_prog[i].vf = vf;
+        g_prog[i].ff = ff;
+    }
+    g_prog[i].uses = uniforms_used(vsrc, fsrc);
+    g_prog[i].gen = ++g_prog_gen;
+    g_prog[i].used = 1;
+    g_n_progs++;
+    return i + 1;
+}
+
+static int prog_ok(uint32_t h) { return h && h <= MTL_MAX_PROG && g_prog[h - 1].used; }
+
+static void mtl_prog_free(uint32_t h)
+{
+    if (!prog_ok(h)) return;
+    /* Its pipelines stay in the cache under its old generation and are
+     * never matched again; they go as their slots are reused. */
+    g_prog[h - 1].vf = nil;
+    g_prog[h - 1].ff = nil;
+    g_prog[h - 1].used = 0;
+    if (g_cur_prog == h) g_cur_prog = 0;
+}
+
+static int mtl_prog_uses(uint32_t h, int id)
+{
+    if (!prog_ok(h) || id < 0 || id >= NV2A_U_COUNT) return 0;
+    return (g_prog[h - 1].uses >> id) & 1;
+}
+
+static void mtl_prog_use(uint32_t h) { if (prog_ok(h)) g_cur_prog = h; }
+
+/* ---- uniforms -------------------------------------------------------------------------------- */
+
+static void mtl_uniform_f(int id, const float *v, int n)
+{
+    const Nv2aUniformDesc *d;
+    uint32_t off, stride;
+    uint8_t *base;
+    int k;
+    if (id < 0 || id >= NV2A_U_COUNT || !v || n <= 0) return;
+    d = &nv2a_uniform_desc[id];
+    if (n > d->count) n = d->count;
+    if (id == NV2A_U_C) {
+        memcpy(g_consts, v, (size_t)n * 16);
+        g_consts_dirty = 1;
+        return;
+    }
+    if (!nv2a_uniform_msl_offset(id, &off, &stride)) return;
+    base = d->frag ? g_fu : g_vu;
+    switch (d->type) {
+    case NV2A_UT_VEC3:     /* packed threes in, sixteen-byte slots out */
+        for (k = 0; k < n; k++) memcpy(base + off + (uint32_t)k * stride, v + 3 * k, 12);
+        break;
+    case NV2A_UT_FLOAT: memcpy(base + off, v, (size_t)n * 4);  break;
+    case NV2A_UT_VEC2:  memcpy(base + off, v, (size_t)n * 8);  break;
+    case NV2A_UT_VEC4:  memcpy(base + off, v, (size_t)n * 16); break;
+    case NV2A_UT_MAT2:  memcpy(base + off, v, (size_t)n * 16); break;  /* two columns of two */
+    default: break;
+    }
+}
+
+static void mtl_uniform_i(int id, int v)
+{
+    uint32_t off, stride;
+    const Nv2aUniformDesc *d;
+    int32_t i32 = v;
+    if (id < 0 || id >= NV2A_U_COUNT) return;
+    d = &nv2a_uniform_desc[id];
+    if (d->type != NV2A_UT_INT) return;          /* sampler units: bound by index */
+    if (!nv2a_uniform_msl_offset(id, &off, &stride)) return;
+    memcpy((d->frag ? g_fu : g_vu) + off, &i32, 4);
+}
+
+static void mtl_texture(int unit, uint32_t tex)
+{
+    if (unit >= 0 && unit < 4) g_bound[unit] = tex;
+}
+
+/* ---- state ------------------------------------------------------------------------------------ */
+
+static void mtl_state(const Nv2aRenderState *rs) { g_rs = *rs; }
+static void mtl_state_invalidate(void) { E.valid = 0; }
+
+static MTLCompareFunction cmp_of(uint32_t gl)
+{
+    switch (gl) {
     case 0x0200: return MTLCompareFunctionNever;
     case 0x0201: return MTLCompareFunctionLess;
     case 0x0202: return MTLCompareFunctionEqual;
@@ -122,13 +806,14 @@ static MTLCompareFunction cmp_of(int nv)
     case 0x0204: return MTLCompareFunctionGreater;
     case 0x0205: return MTLCompareFunctionNotEqual;
     case 0x0206: return MTLCompareFunctionGreaterEqual;
-    default:     return MTLCompareFunctionAlways;
+    case 0x0207: return MTLCompareFunctionAlways;
+    default:     return MTLCompareFunctionLessEqual;   /* as GL's mapping */
     }
 }
 
-static MTLBlendFactor blend_of(int nv)
+static MTLBlendFactor blend_of(uint32_t f)
 {
-    switch (nv) {
+    switch (f) {
     case 0x0000: return MTLBlendFactorZero;
     case 0x0001: return MTLBlendFactorOne;
     case 0x0300: return MTLBlendFactorSourceColor;
@@ -144,495 +829,842 @@ static MTLBlendFactor blend_of(int nv)
     }
 }
 
+static MTLStencilOperation sop_of(uint32_t v)
+{
+    switch (v) {
+    case 0x0000: return MTLStencilOperationZero;
+    case 0x1E01: return MTLStencilOperationReplace;
+    case 0x1E02: return MTLStencilOperationIncrementClamp;
+    case 0x1E03: return MTLStencilOperationDecrementClamp;
+    case 0x150A: return MTLStencilOperationInvert;
+    case 0x8507: return MTLStencilOperationIncrementWrap;
+    case 0x8508: return MTLStencilOperationDecrementWrap;
+    default:     return MTLStencilOperationKeep;
+    }
+}
+
+/* The colour write mask: the console's bits (blue 0, green 8, red 16, alpha
+ * 24; 0 meaning never written, so everything) in Metal's. */
+static MTLColorWriteMask cmask_of(uint32_t cm)
+{
+    MTLColorWriteMask m = MTLColorWriteMaskNone;
+    if (!cm) cm = 0x01010101u;
+    if ((cm >> 16) & 1) m |= MTLColorWriteMaskRed;
+    if ((cm >>  8) & 1) m |= MTLColorWriteMaskGreen;
+    if ( cm        & 1) m |= MTLColorWriteMaskBlue;
+    if ((cm >> 24) & 1) m |= MTLColorWriteMaskAlpha;
+    return m;
+}
+
+static id<MTLRenderPipelineState> pso_for(uint32_t prog)
+{
+    static int nob = -1;
+    MtlProg *p = &g_prog[prog - 1];
+    int blend;
+    uint32_t src, dst, cm, i;
+    uint64_t key, h;
+    MTLRenderPipelineDescriptor *pd;
+    NSError *err = nil;
+    id<MTLRenderPipelineState> pso;
+
+    if (nob < 0) nob = env_on("RECOMP_GL_NOBLEND");
+    blend = g_rs.blend_enable && !nob;
+    src = blend ? (uint32_t)g_rs.blend_src & 0xFFFF : 0;
+    dst = blend ? (uint32_t)g_rs.blend_dst & 0xFFFF : 0;
+    cm = (uint32_t)cmask_of(g_rs.color_mask);
+    /* program generation | blending | write mask | source | destination;
+     * the factors are GL enums, 0x0000-0x0001 and 0x0300-0x0308, which fit
+     * in 12 bits each. Never 0: 0 marks an empty slot. */
+    key = (uint64_t)p->gen << 32 | (uint64_t)(blend ? 1 : 0) << 31 | (uint64_t)cm << 27
+        | (uint64_t)(src & 0xFFF) << 12 | (uint64_t)(dst & 0xFFF);
+    key = key * 2 + 1;
+    h = key * 0x9E3779B97F4A7C15ull;
+    for (i = 0; i < MTL_PSO_CACHE; i++) {
+        MtlPso *e = &g_pso[(h + i) & (MTL_PSO_CACHE - 1)];
+        if (e->key == key) return e->pso;
+        if (!e->key) break;
+    }
+    @autoreleasepool {
+        pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = p->vf;
+        pd.fragmentFunction = p->ff;
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        pd.colorAttachments[0].writeMask = (MTLColorWriteMask)cm;
+        if (blend) {
+            pd.colorAttachments[0].blendingEnabled = YES;
+            pd.colorAttachments[0].sourceRGBBlendFactor = blend_of(src);
+            pd.colorAttachments[0].destinationRGBBlendFactor = blend_of(dst);
+            pd.colorAttachments[0].sourceAlphaBlendFactor = blend_of(src);
+            pd.colorAttachments[0].destinationAlphaBlendFactor = blend_of(dst);
+            pd.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+            pd.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+        }
+        pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+        pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+        {
+            double t0 = now_ms(), dt;
+            pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+            dt = now_ms() - t0;
+            g_ms_pso += dt;
+            if (dt > g_ms_pso_max) g_ms_pso_max = dt;
+        }
+    }
+    if (!pso) {
+        static int said;
+        if (said++ < 10)
+            fprintf(stderr, "  [MTL] pipeline failed: %s\n", [[err localizedDescription] UTF8String]);
+        return nil;
+    }
+    g_n_psos++;
+    /* Into the first empty slot of the chain, or over the slot it hashes to
+     * when the chain is full (the table is sized never to be). */
+    for (i = 0; i < MTL_PSO_CACHE; i++) {
+        MtlPso *e = &g_pso[(h + i) & (MTL_PSO_CACHE - 1)];
+        if (!e->key) { e->key = key; e->pso = pso; return pso; }
+    }
+    g_pso[h & (MTL_PSO_CACHE - 1)].key = key;
+    g_pso[h & (MTL_PSO_CACHE - 1)].pso = pso;
+    return pso;
+}
+
+/* Depth and stencil as one object, keyed on all of it. A depth test that is
+ * off neither tests nor writes -- OpenGL's rule, which Metal does not have:
+ * "always" with writes on would write. Likewise a stencil test that is off
+ * leaves the stencil alone. */
+static id<MTLDepthStencilState> dss_for(void)
+{
+    uint64_t key = 0, h;
+    uint32_t i, sf = 0, ops = 0;
+    int dt = g_rs.depth_test, st = g_rs.stencil_test;
+    MTLDepthStencilDescriptor *d;
+    if (dt) key |= 1ull | (uint64_t)((uint32_t)g_rs.depth_func & 0xF) << 1
+                        | (uint64_t)(g_rs.depth_write ? 1 : 0) << 5;
+    if (st) {
+        sf = g_rs.stencil_func;
+        if (sf < 0x200 || sf > 0x207) sf = 0x207;
+        ops = (uint32_t)sop_of(g_rs.stencil_op[0]) | (uint32_t)sop_of(g_rs.stencil_op[1]) << 3
+            | (uint32_t)sop_of(g_rs.stencil_op[2]) << 6;
+        key |= 1ull << 6 | (uint64_t)(sf & 0xF) << 7 | (uint64_t)(g_rs.stencil_rmask & 0xFF) << 11
+             | (uint64_t)(g_rs.stencil_wmask & 0xFF) << 19 | (uint64_t)ops << 27;
+    }
+    key = key * 2 + 1;
+    h = key * 0x9E3779B97F4A7C15ull;
+    for (i = 0; i < MTL_DSS_CACHE; i++) {
+        MtlDss *e = &g_dss[(h + i) & (MTL_DSS_CACHE - 1)];
+        if (e->used && e->key == key) return e->dss;
+        if (!e->used) break;
+    }
+    d = [MTLDepthStencilDescriptor new];
+    d.depthCompareFunction = dt ? cmp_of((uint32_t)g_rs.depth_func) : MTLCompareFunctionAlways;
+    d.depthWriteEnabled = (dt && g_rs.depth_write) ? YES : NO;
+    if (st) {
+        MTLStencilDescriptor *s = [MTLStencilDescriptor new];
+        s.stencilCompareFunction = cmp_of(sf);
+        s.stencilFailureOperation = sop_of(g_rs.stencil_op[0]);
+        s.depthFailureOperation = sop_of(g_rs.stencil_op[1]);
+        s.depthStencilPassOperation = sop_of(g_rs.stencil_op[2]);
+        s.readMask = g_rs.stencil_rmask & 0xFFu;
+        s.writeMask = g_rs.stencil_wmask & 0xFFu;
+        d.frontFaceStencil = s;
+        d.backFaceStencil = s;
+    }
+    for (i = 0; i < MTL_DSS_CACHE; i++) {
+        MtlDss *e = &g_dss[(h + i) & (MTL_DSS_CACHE - 1)];
+        if (!e->used) {
+            e->used = 1; e->key = key;
+            e->dss = [g_dev newDepthStencilStateWithDescriptor:d];
+            return e->dss;
+        }
+    }
+    return [g_dev newDepthStencilStateWithDescriptor:d];
+}
+
+/* ---- vertices and draws ----------------------------------------------------------------- */
+
+static void mtl_vertices(const float *v, uint32_t nverts, uint32_t stride_floats,
+                         const int attr_at[16], uint32_t const_mask,
+                         const float const_attr[16][4])
+{
+    uint32_t i, bytes = nverts * stride_floats * (uint32_t)sizeof(float);
+    void *dst;
+    id<MTLBuffer> b = nil;
+    uint32_t off = 0;
+
+    frame_begin();
+    dst = arena_alloc(bytes ? bytes : 16, &b, &off);
+    if (!dst) { g_vbuf = nil; return; }
+    if (bytes) memcpy(dst, v, bytes);
+    g_vbuf = b; g_voff = off;
+
+    g_attr.stride = stride_floats;
+    g_attr.mask = 0;
+    for (i = 0; i < 16; i++) {
+        if (attr_at[i] >= 0) {
+            g_attr.mask |= 1u << i;
+            g_attr.off[i] = (uint32_t)attr_at[i];
+        } else {
+            g_attr.off[i] = 0;
+            if (const_mask & (1u << i)) memcpy(g_generic[i], const_attr[i], 16);
+        }
+        memcpy(g_attr.value[i], g_generic[i], 16);
+    }
+}
+
+static void fan_indices(uint32_t nverts)
+{
+    uint32_t n, i, *p;
+    if (g_fan && g_fan_verts >= nverts) return;
+    n = 1024;
+    while (n < nverts) n *= 2;
+    g_fan = [g_dev newBufferWithLength:(NSUInteger)(n - 2) * 3 * 4
+                               options:MTLResourceStorageModeShared];
+    p = (uint32_t *)[g_fan contents];
+    for (i = 0; i + 2 < n; i++) { p[i*3] = 0; p[i*3+1] = i + 1; p[i*3+2] = i + 2; }
+    g_fan_verts = n;
+}
+
+/* Everything the open encoder needs for a draw that it does not have yet. */
+static int encode_state(void)
+{
+    static int cull_on = -1, flip = -1, force_clamp = -2;
+    MtlRT *rt = &g_rt[g_cur_rt - 1];
+    id<MTLRenderPipelineState> pso;
+    id<MTLDepthStencilState> dss;
+    int cull, wind, clip, u;
+    MTLScissorRect sc;
+
+    if (cull_on < 0) { cull_on = !env_on("RECOMP_GL_NOCULL"); flip = env_on("RECOMP_GL_CULLFLIP"); }
+    if (force_clamp == -2) { const char *v = getenv("RECOMP_GL_DEPTHCLAMP");
+                             force_clamp = v ? atoi(v) : -1; }
+
+    pso = pso_for(g_cur_prog);
+    if (!pso) return 0;
+    if (!E.valid || E.pso != pso) { [g_enc setRenderPipelineState:pso]; E.pso = pso; }
+    dss = dss_for();
+    if (!E.valid || E.dss != dss) { [g_enc setDepthStencilState:dss]; E.dss = dss; }
+    if (g_rs.stencil_test && (!E.valid || E.stencil_ref != (g_rs.stencil_ref & 0xFFu))) {
+        [g_enc setStencilReferenceValue:g_rs.stencil_ref & 0xFFu];
+        E.stencil_ref = g_rs.stencil_ref & 0xFFu;
+    }
+
+    /* Culling: the registers hold GL's enums (0x404 front, 0x405 back, 0x408
+     * both; 0x900 clockwise, 0x901 counter-clockwise), which pass straight
+     * through for the reason nv2a_gfx_gl.c gives. Both is not a Metal cull
+     * mode; draw() skips the triangles instead. */
+    cull = (cull_on && g_rs.cull_enable)
+         ? (g_rs.cull_face == 0x404 ? 1 : g_rs.cull_face == 0x408 ? 3 : 2) : 0;
+    wind = (g_rs.front_face == 0x901) ^ flip;
+    if (!E.valid || E.cull != cull) {
+        [g_enc setCullMode:cull == 1 ? MTLCullModeFront : cull == 2 ? MTLCullModeBack : MTLCullModeNone];
+        E.cull = cull;
+    }
+    if (!E.valid || E.wind != wind) {
+        [g_enc setFrontFacingWinding:wind ? MTLWindingCounterClockwise : MTLWindingClockwise];
+        E.wind = wind;
+    }
+    clip = force_clamp >= 0 ? force_clamp : ((g_rs.zclamp & 0xF0u) || g_rs.w_buffer) ? 1 : 0;
+    if (!E.valid || E.clip != clip) {
+        [g_enc setDepthClipMode:clip ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
+        E.clip = clip;
+    }
+
+    /* The scissor, inside the target: Metal refuses one that is not. */
+    if (g_rs.scissor_enable) {
+        uint32_t x0 = g_rs.scissor[0], y0 = g_rs.scissor[1];
+        uint32_t x1 = g_rs.scissor[2], y1 = g_rs.scissor[3];
+        if (x1 > rt->pw) x1 = rt->pw;
+        if (y1 > rt->ph) y1 = rt->ph;
+        if (x0 > x1) x0 = x1;
+        if (y0 > y1) y0 = y1;
+        sc = (MTLScissorRect){ x0, y0, x1 - x0, y1 - y0 };
+    } else {
+        sc = (MTLScissorRect){ 0, 0, rt->pw, rt->ph };
+    }
+    if (!sc.width || !sc.height) return 0;          /* clipped to nothing */
+    if (!E.valid || memcmp(&E.sc, &sc, sizeof sc)) { [g_enc setScissorRect:sc]; E.sc = sc; }
+
+    /* Buffers: vertices, constants, the two uniform structs, the fetch
+     * table. The constants only when they changed (3 KB a time). */
+    if (!g_vbuf) return 0;
+    if (!E.valid || E.vbuf != g_vbuf || E.voff != g_voff) {
+        [g_enc setVertexBuffer:g_vbuf offset:g_voff atIndex:NV2A_MSL_BUF_VERTS];
+        E.vbuf = g_vbuf; E.voff = g_voff;
+    }
+    if (g_consts_dirty || !g_consts_buf) {
+        id<MTLBuffer> b = nil; uint32_t off = 0;
+        void *dst = arena_alloc(sizeof g_consts, &b, &off);
+        if (!dst) return 0;
+        memcpy(dst, g_consts, sizeof g_consts);
+        g_consts_buf = b; g_consts_off = off;
+        g_consts_dirty = 0;
+    }
+    if (!E.valid || E.cbuf != g_consts_buf || E.coff != g_consts_off) {
+        [g_enc setVertexBuffer:g_consts_buf offset:g_consts_off atIndex:NV2A_MSL_BUF_CONSTS];
+        E.cbuf = g_consts_buf; E.coff = g_consts_off;
+    }
+    [g_enc setVertexBytes:g_vu length:g_vu_size atIndex:NV2A_MSL_BUF_VU];
+    [g_enc setVertexBytes:&g_attr length:sizeof g_attr atIndex:NV2A_MSL_BUF_ATTRS];
+    [g_enc setFragmentBytes:g_fu length:g_fu_size atIndex:NV2A_MSL_BUF_FU];
+
+    for (u = 0; u < 4; u++) {
+        uint32_t t = g_bound[u];
+        if (!tex_ok(t)) t = 0;
+        if (E.valid && E.tex[u] == t) continue;
+        /* Nothing bound reads as (0, 0, 0, 1), which is what OpenGL gives a
+         * shader sampling texture 0 -- and Metal gives no promise at all. */
+        [g_enc setFragmentTexture:t ? g_tex[t - 1].tex : g_black atIndex:(NSUInteger)u];
+        [g_enc setFragmentSamplerState:t ? g_tex[t - 1].smp : g_black_smp atIndex:(NSUInteger)u];
+        E.tex[u] = t;
+    }
+    E.valid = 1;
+    return 1;
+}
+
+static void mtl_draw(int prim, uint32_t count)
+{
+    MTLPrimitiveType pt;
+    if (!count || !rt_ok(g_cur_rt) || !prog_ok(g_cur_prog)) return;
+    if (prim >= NV2A_PRIM_TRIANGLES && g_rs.cull_enable && g_rs.cull_face == 0x408
+        && !env_on("RECOMP_GL_NOCULL"))
+        return;                                       /* front and back culled */
+    if (!enc_begin()) return;
+    if (!encode_state()) return;
+    switch (prim) {
+    case NV2A_PRIM_POINTS:     pt = MTLPrimitiveTypePoint; break;
+    case NV2A_PRIM_LINES:      pt = MTLPrimitiveTypeLine; break;
+    case NV2A_PRIM_LINE_STRIP: pt = MTLPrimitiveTypeLineStrip; break;
+    case NV2A_PRIM_TRIANGLE_STRIP: pt = MTLPrimitiveTypeTriangleStrip; break;
+    case NV2A_PRIM_LINE_LOOP: {
+        /* A strip that comes back to the start. */
+        id<MTLBuffer> b = nil; uint32_t off = 0, i;
+        uint32_t *ix = (uint32_t *)arena_alloc((count + 1) * 4, &b, &off);
+        if (!ix) return;
+        for (i = 0; i < count; i++) ix[i] = i;
+        ix[count] = 0;
+        [g_enc drawIndexedPrimitives:MTLPrimitiveTypeLineStrip indexCount:count + 1
+                           indexType:MTLIndexTypeUInt32 indexBuffer:b indexBufferOffset:off];
+        g_n_draws++;
+        return;
+    }
+    case NV2A_PRIM_TRIANGLE_FAN:
+        if (count < 3) return;
+        fan_indices(count);
+        [g_enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:(count - 2) * 3
+                           indexType:MTLIndexTypeUInt32 indexBuffer:g_fan indexBufferOffset:0];
+        g_n_draws++;
+        return;
+    default:                   pt = MTLPrimitiveTypeTriangle; break;
+    }
+    [g_enc drawPrimitives:pt vertexStart:0 vertexCount:count];
+    g_n_draws++;
+}
+
+/* ---- clears -------------------------------------------------------------------------------------- */
+
+/* The utility shaders: a triangle that covers the target, one colour and one
+ * depth (the clear), and a texture copied with filtering (the flip). */
+static const char *UTIL_MSL =
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct ClearIn  { float4 color; float depth; };\n"
+"struct ClearOut { float4 color [[color(0)]]; float depth [[depth(any)]]; };\n"
+"struct BlitV    { float4 pos [[position]]; float2 uv; };\n"
+"vertex float4 nv_clear_v(uint vid [[vertex_id]]) {\n"
+"    float2 p = float2((vid << 1) & 2, vid & 2);\n"
+"    return float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+"}\n"
+"fragment ClearOut nv_clear_f(constant ClearIn &c [[buffer(0)]]) {\n"
+"    ClearOut o; o.color = c.color; o.depth = c.depth; return o;\n"
+"}\n"
+"vertex BlitV nv_blit_v(uint vid [[vertex_id]]) {\n"
+"    float2 p = float2((vid << 1) & 2, vid & 2);\n"
+"    BlitV o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+"    o.uv = float2(p.x, 1.0 - p.y);\n"
+"    return o;\n"
+"}\n"
+"fragment float4 nv_blit_f(BlitV in [[stage_in]], texture2d<float> t [[texture(0)]],\n"
+"                          sampler s [[sampler(0)]]) {\n"
+"    return float4(t.sample(s, in.uv).rgb, 1.0);\n"
+"}\n";
+
+static int util_init(void)
+{
+    NSError *err = nil;
+    MTLRenderPipelineDescriptor *pd;
+    MTLSamplerDescriptor *sd;
+    int i;
+    g_util_lib = [g_dev newLibraryWithSource:[NSString stringWithUTF8String:UTIL_MSL]
+                                     options:[MTLCompileOptions new] error:&err];
+    if (!g_util_lib) {
+        fprintf(stderr, "  [MTL] utility shaders: %s\n", [[err localizedDescription] UTF8String]);
+        return 0;
+    }
+    for (i = 0; i < 2; i++) {
+        pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = [g_util_lib newFunctionWithName:@"nv_clear_v"];
+        pd.fragmentFunction = [g_util_lib newFunctionWithName:@"nv_clear_f"];
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        pd.colorAttachments[0].writeMask = i ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
+        pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+        pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+        g_clear_pso[i] = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (!g_clear_pso[i]) {
+            fprintf(stderr, "  [MTL] clear pipeline: %s\n", [[err localizedDescription] UTF8String]);
+            return 0;
+        }
+    }
+    pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [g_util_lib newFunctionWithName:@"nv_blit_v"];
+    pd.fragmentFunction = [g_util_lib newFunctionWithName:@"nv_blit_f"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    g_blit_pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!g_blit_pso) {
+        fprintf(stderr, "  [MTL] present pipeline: %s\n", [[err localizedDescription] UTF8String]);
+        return 0;
+    }
+    sd = [MTLSamplerDescriptor new];
+    sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
+    sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    g_linear_clamp = [g_dev newSamplerStateWithDescriptor:sd];
+    return 1;
+}
+
+static void mtl_clear(unsigned mask, const float rgba[4], float depth,
+                      uint32_t stencil, const uint32_t rect[4])
+{
+    MtlRT *rt;
+    uint32_t x0 = 0, y0 = 0, x1, y1;
+    int full;
+    struct { float color[4]; float depth; float pad[3]; } cin;
+
+    mask &= 7u;
+    if (!mask || !rt_ok(g_cur_rt)) return;
+    rt = &g_rt[g_cur_rt - 1];
+    x1 = rt->pw; y1 = rt->ph;
+    if (rect) {
+        x0 = rect[0] < rt->pw ? rect[0] : rt->pw;
+        y0 = rect[1] < rt->ph ? rect[1] : rt->ph;
+        x1 = rect[2] < rt->pw ? rect[2] : rt->pw;
+        y1 = rect[3] < rt->ph ? rect[3] : rt->ph;
+        if (x1 <= x0 || y1 <= y0) return;
+    }
+    full = (x0 == 0 && y0 == 0 && x1 == rt->pw && y1 == rt->ph);
+
+    /* At the start of a pass a whole-target clear is the pass's load action:
+     * the hardware does it as the tiles are set up, for nothing. */
+    if (full && !g_enc) {
+        if (mask & 1) memcpy(g_pending_clear.rgba, rgba, sizeof g_pending_clear.rgba);
+        if (mask & 2) g_pending_clear.depth = depth;
+        if (mask & 4) g_pending_clear.stencil = stencil;
+        g_pending_clear.mask |= mask;
+        g_n_load_clears++;
+        return;
+    }
+
+    /* Anywhere else, a triangle over the rectangle that writes the clear
+     * values and passes every test. */
+    if (!enc_begin()) return;
+    [g_enc setRenderPipelineState:g_clear_pso[(mask & 1) ? 1 : 0]];
+    {
+        uint64_t key = (mask & 2 ? 1u : 0u) | (mask & 4 ? 2u : 0u);
+        static id<MTLDepthStencilState> ds[4];
+        if (!ds[key]) {
+            MTLDepthStencilDescriptor *d = [MTLDepthStencilDescriptor new];
+            d.depthCompareFunction = MTLCompareFunctionAlways;
+            d.depthWriteEnabled = (key & 1) ? YES : NO;
+            if (key & 2) {
+                MTLStencilDescriptor *s = [MTLStencilDescriptor new];
+                s.stencilCompareFunction = MTLCompareFunctionAlways;
+                s.depthStencilPassOperation = MTLStencilOperationReplace;
+                s.stencilFailureOperation = MTLStencilOperationReplace;
+                s.depthFailureOperation = MTLStencilOperationReplace;
+                s.readMask = 0xFF; s.writeMask = 0xFF;
+                d.frontFaceStencil = s; d.backFaceStencil = s;
+            }
+            ds[key] = [g_dev newDepthStencilStateWithDescriptor:d];
+        }
+        [g_enc setDepthStencilState:ds[key]];
+    }
+    [g_enc setStencilReferenceValue:stencil & 0xFFu];
+    [g_enc setCullMode:MTLCullModeNone];
+    [g_enc setDepthClipMode:MTLDepthClipModeClamp];
+    [g_enc setScissorRect:(MTLScissorRect){ x0, y0, x1 - x0, y1 - y0 }];
+    memset(&cin, 0, sizeof cin);
+    memcpy(cin.color, rgba, sizeof cin.color);
+    cin.depth = depth;
+    [g_enc setFragmentBytes:&cin length:sizeof cin atIndex:0];
+    [g_enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    E.valid = 0;                    /* everything above was the clear's */
+    g_n_quad_clears++;
+}
+
+/* ---- the window ---------------------------------------------------------------------
+ *
+ * A finished frame reaches the window through a thread of its own.
+ *
+ * The first version presented from the render thread at the flip, and so
+ * could never wait for the display: the boot sequence and the loading screens
+ * run as fast as they can, hundreds of frames a second, while a drawable is
+ * only handed out as fast as the display takes them -- waiting for one held
+ * the title back thirty seconds. So it showed a frame only while fewer than
+ * two were still on their way to the screen, and dropped it otherwise. Right
+ * for the boot, wrong for everything else: in a window a frame takes two to
+ * three refreshes to reach the glass (the GPU, the compositor, the display),
+ * so at a steady sixty, one frame in three found two still in flight and was
+ * dropped. A player's log showed exactly 400 of every 600 frames shown,
+ * minute after minute -- forty a second, unevenly, which is a stutter.
+ *
+ * Now the flip only hands the frame over: a copy on the GPU into one of three
+ * slots, and a note of which slot is the newest. The presenter waits for a
+ * new frame, then for the display to give it a drawable, for as long as that
+ * takes -- nothing else waits on it -- and shows the newest frame there is.
+ * At sixty, every frame is shown. Faster than the display, the newest wins at
+ * each refresh, as in the OpenGL window, which hands frames to the main
+ * thread the same way. On a display faster than sixty (a ProMotion screen
+ * runs at 120) each frame is also held for at least the refreshes a 60 Hz
+ * frame should get, so that one arriving just after a refresh is not shown
+ * for one and the next for three.
+ */
+
+typedef struct {
+    id<MTLTexture> tex;      /* a copy of a finished frame */
+    uint32_t       w, h;     /* its size, in pixels */
+    int            wide;     /* to be shown at 16:9 (nv2a_wide_scene at its flip) */
+} MtlShown;
+static MtlShown        g_shown[3];
+static pthread_mutex_t g_shown_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_shown_cv = PTHREAD_COND_INITIALIZER;
+static int             g_shown_new = -1;    /* the newest slot handed over */
+static int             g_shown_busy = -1;   /* the slot being put on screen now */
+static uint64_t        g_shown_serial;      /* frames handed over so far */
+static int             g_presenter;         /* 0 not started, 1 running, -1 failed */
+
+/* How long frames stayed on the screen, from the display's own timestamps:
+ * the measure of smoothness, printed by the report. */
+static pthread_mutex_t g_pace_mu = PTHREAD_MUTEX_INITIALIZER;
+static double   g_pace_last;      /* when the previous frame appeared */
+static uint64_t g_pace[6];        /* <12 ms, ~1/60 s, ~1.5/60, ~2/60, longer, pauses */
+static uint64_t g_pace_lost;      /* drawables the system never showed */
+
+static void pace_note(CFTimeInterval t)
+{
+    pthread_mutex_lock(&g_pace_mu);
+    if (t <= 0.0) {
+        g_pace_lost++;
+    } else {
+        if (g_pace_last > 0.0 && t > g_pace_last) {
+            double ms = (t - g_pace_last) * 1000.0;
+            g_pace[ms < 12.0 ? 0 : ms < 21.0 ? 1 : ms < 29.0 ? 2 : ms < 38.0 ? 3
+                   : ms < 70.0 ? 4 : 5]++;
+        }
+        g_pace_last = t;
+    }
+    pthread_mutex_unlock(&g_pace_mu);
+}
+
+/* At least this long between two frames on the screen, in seconds (0: no
+ * minimum). A display at sixty paces a 60 Hz game by itself. A faster one
+ * shows each frame from the refresh after it arrives, so a frame that lands
+ * just after a refresh is up for one refresh and the next for three; held to
+ * just under the whole number of refreshes a sixtieth of a second takes, each
+ * gets its two at 120 Hz. RECOMP_MTL_PACE=<ms> sets it, 0 turns it off. */
+static double present_min_interval(void)
+{
+    static int env = -1;
+    static double env_s;
+    int hz, n;
+    if (env < 0) {
+        const char *v = getenv("RECOMP_MTL_PACE");
+        env = (v && *v) ? 1 : 0;
+        env_s = env ? atof(v) / 1000.0 : 0.0;
+    }
+    if (env) return env_s > 0.0 ? env_s : 0.0;
+    hz = nv_window_refresh_hz ? nv_window_refresh_hz() : 0;
+    if (hz < 100) return 0.0;
+    n = (int)(hz / 60.0 + 0.05);
+    return n >= 2 ? (n - 0.5) / hz : 0.0;
+}
+
+static void present_one(CAMetalLayer *layer, uint64_t *seen)
+{
+    id<CAMetalDrawable> drw;
+    id<MTLCommandBuffer> cb;
+    MtlShown *s;
+    int slot;
+    uint64_t serial;
+    double gap;
+
+    if (layer.device != g_dev) layer.device = g_dev;
+    drw = [layer nextDrawable];              /* as long as the display takes */
+    pthread_mutex_lock(&g_shown_mu);
+    slot = g_shown_new;
+    serial = g_shown_serial;
+    if (drw && slot >= 0) g_shown_busy = slot;
+    pthread_mutex_unlock(&g_shown_mu);
+    if (!drw || slot < 0) {
+        if (!drw) atomic_fetch_add(&g_n_no_drawable, 1);
+        atomic_fetch_add(&g_n_skipped, serial - *seen);
+        *seen = serial;
+        return;
+    }
+    /* Frames handed over while this waited, and replaced before they could be
+     * shown: the display had no room for them. */
+    if (serial - *seen > 1) atomic_fetch_add(&g_n_skipped, serial - *seen - 1);
+    *seen = serial;
+
+    s = &g_shown[slot];
+    cb = [g_queue commandBuffer];
+    {
+        id<MTLTexture> dt = drw.texture;
+        double vw = (double)dt.width, vh = (double)dt.height, fw, fh, dw = vw, dh = vh;
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        id<MTLRenderCommandEncoder> e;
+        /* The frame keeps its shape, between black bars; the 16:9 scene the
+         * widescreen mode draws (squeezed into 4:3) shown at 16:9 -- as the
+         * OpenGL view does it. */
+        fw = s->w; fh = s->h;
+        if (s->wide) { fw = 16.0; fh = 9.0; }
+        if (vw * fh > vh * fw) dw = vh * fw / fh; else dh = vw * fh / fw;
+        rp.colorAttachments[0].texture = dt;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        e = [cb renderCommandEncoderWithDescriptor:rp];
+        [e setViewport:(MTLViewport){ (vw - dw) / 2.0, (vh - dh) / 2.0, dw, dh, 0.0, 1.0 }];
+        [e setRenderPipelineState:g_blit_pso];
+        [e setFragmentTexture:s->tex atIndex:0];
+        [e setFragmentSamplerState:g_linear_clamp atIndex:0];
+        [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [e endEncoding];
+        if (atomic_fetch_add(&g_n_presented, 1) == 0)
+            fprintf(stderr, "  [MTL] first frame into the window: %.0fx%.0f drawable, "
+                    "picture %.0fx%.0f from a %ux%u frame; at least %.1f ms a frame on "
+                    "screen (%d Hz display)\n", vw, vh, dw, dh, s->w, s->h,
+                    present_min_interval() * 1000.0,
+                    nv_window_refresh_hz ? nv_window_refresh_hz() : 0);
+    }
+#if TARGET_OS_SIMULATOR
+    /* The iOS Simulator has neither the presented-time handler nor a minimum
+     * duration: no pacing statistics there, and plain presents. */
+    gap = present_min_interval();
+    (void)gap;
+    [cb presentDrawable:drw];
+#else
+    [drw addPresentedHandler:^(id<MTLDrawable> d) { pace_note(d.presentedTime); }];
+    gap = present_min_interval();
+    if (gap > 0.0) [cb presentDrawable:drw afterMinimumDuration:gap];
+    else           [cb presentDrawable:drw];
+#endif
+    [cb commit];
+    pthread_mutex_lock(&g_shown_mu);
+    g_shown_busy = -1;
+    pthread_mutex_unlock(&g_shown_mu);
+}
+
+static void *presenter_main(void *arg)
+{
+    uint64_t seen = 0;
+    (void)arg;
+    pthread_setname_np("nv2a-present");
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    for (;;) {
+        pthread_mutex_lock(&g_shown_mu);
+        while (g_shown_serial == seen) pthread_cond_wait(&g_shown_cv, &g_shown_mu);
+        pthread_mutex_unlock(&g_shown_mu);
+        @autoreleasepool {
+            CAMetalLayer *layer = nv_window_metal_layer
+                                ? (__bridge CAMetalLayer *)nv_window_metal_layer() : nil;
+            if (layer && (!nv_window_visible || nv_window_visible())) {
+                present_one(layer, &seen);
+            } else {
+                /* Hidden, minimised or gone: nothing to show them on. */
+                pthread_mutex_lock(&g_shown_mu);
+                atomic_fetch_add(&g_n_hidden, g_shown_serial - seen);
+                seen = g_shown_serial;
+                pthread_mutex_unlock(&g_shown_mu);
+            }
+        }
+    }
+    return NULL;
+}
+
+static void presenter_start(void)
+{
+    pthread_t t;
+    pthread_attr_t a;
+    g_presenter = -1;
+    pthread_attr_init(&a);
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&t, &a, presenter_main, NULL) == 0) g_presenter = 1;
+    pthread_attr_destroy(&a);
+    if (g_presenter != 1)
+        fprintf(stderr, "  [MTL] could not start the presenter thread: nothing will be "
+                "shown in the window\n");
+}
+
+/* A slot's texture, at the frame's size. Only ever called for a slot the
+ * presenter is not using and will not pick (see mtl_present). */
+static int shown_fit(int slot, uint32_t w, uint32_t h)
+{
+    MtlShown *s = &g_shown[slot];
+    if (s->tex && s->tex.width == w && s->tex.height == h) return 1;
+    @autoreleasepool {
+        MTLTextureDescriptor *d =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                               width:w height:h mipmapped:NO];
+        d.usage = MTLTextureUsageShaderRead;
+        d.storageMode = MTLStorageModePrivate;
+        s->tex = [g_dev newTextureWithDescriptor:d];
+    }
+    return s->tex != nil;
+}
+
+static void mtl_present(uint32_t h, uint32_t pw, uint32_t ph)
+{
+    int give = -1;
+    (void)pw; (void)ph;
+
+    /* A frame that ends with a clear still waiting: do it, so what is shown
+     * (and what the next frame loads) is what the title asked for. */
+    flush_pending_clear();
+    enc_end();
+
+    /* Hand the frame to the presenter: copy it into a slot that is neither
+     * the newest one (the presenter may be about to take that) nor the one
+     * being shown -- of three, there is always one -- and publish it once
+     * the copy is committed. The presenter's own command buffer, committed
+     * later on the same queue, then reads a finished copy. */
+    if (rt_ok(h) && nv_window_metal_layer && nv_window_metal_layer()
+        && (!nv_window_visible || nv_window_visible())) {
+        MtlRT *rt = &g_rt[h - 1];
+        int slot;
+        if (!g_presenter) presenter_start();
+        pthread_mutex_lock(&g_shown_mu);
+        for (slot = 0; slot < 3; slot++)
+            if (slot != g_shown_new && slot != g_shown_busy) break;
+        pthread_mutex_unlock(&g_shown_mu);
+        if (g_presenter == 1 && slot < 3 && shown_fit(slot, rt->pw, rt->ph)) {
+            id<MTLBlitCommandEncoder> b;
+            frame_begin();
+            b = [g_cb blitCommandEncoder];
+            [b copyFromTexture:g_tex[rt->color - 1].tex sourceSlice:0 sourceLevel:0
+                  sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(rt->pw, rt->ph, 1)
+                     toTexture:g_shown[slot].tex destinationSlice:0 destinationLevel:0
+             destinationOrigin:MTLOriginMake(0, 0, 0)];
+            [b endEncoding];
+            g_shown[slot].w = rt->pw;
+            g_shown[slot].h = rt->ph;
+            g_shown[slot].wide = nv2a_wide_scene();
+            give = slot;
+        }
+    } else if (nv_window_metal_layer && nv_window_metal_layer()) {
+        atomic_fetch_add(&g_n_hidden, 1);
+    }
+    nv_window_wait_visible();
+    submit(1, 0);
+    if (give >= 0) {
+        pthread_mutex_lock(&g_shown_mu);
+        g_shown_new = give;
+        g_shown_serial++;
+        pthread_cond_signal(&g_shown_cv);
+        pthread_mutex_unlock(&g_shown_mu);
+    }
+    g_n_frames++;
+}
+
+/* ---- the rest ------------------------------------------------------------------------------------ */
+
 static int mtl_init(void)
 {
     int i;
     g_dev = MTLCreateSystemDefaultDevice();
     if (!g_dev) return 0;
     g_queue = [g_dev newCommandQueue];
+    if (!g_queue) return 0;
     g_inflight = dispatch_semaphore_create(MTL_FRAMES_IN_FLIGHT);
-    for (i = 0; i < MTL_FRAMES_IN_FLIGHT; i++) {
-        g_vring[i] = [g_dev newBufferWithLength:MTL_RING_BYTES
-                                        options:MTLResourceStorageModeShared];
-        g_uring[i] = [g_dev newBufferWithLength:MTL_RING_BYTES
-                                        options:MTLResourceStorageModeShared];
-    }
-    /* Four samplers rather than one per texture: the NV2A's wrap and filter
-     * combinations that this title uses come to a handful, and a sampler is
-     * expensive to create and free to switch. */
-    for (i = 0; i < 4; i++) {
-        MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
-        sd.minFilter = (i & 1) ? MTLSamplerMinMagFilterLinear
-                               : MTLSamplerMinMagFilterNearest;
-        sd.magFilter = sd.minFilter;
-        sd.sAddressMode = (i & 2) ? MTLSamplerAddressModeClampToEdge
-                                  : MTLSamplerAddressModeRepeat;
-        sd.tAddressMode = sd.sAddressMode;
-        g_sampler[i] = [g_dev newSamplerStateWithDescriptor:sd];
-    }
-    fprintf(stderr, "  [MTL] %s, %u MB of ring buffers, %d frames in flight\n",
-            [[g_dev name] UTF8String],
-            (unsigned)(MTL_RING_BYTES * 2 * MTL_FRAMES_IN_FLIGHT >> 20),
-            MTL_FRAMES_IN_FLIGHT);
-    return 1;
-}
-
-static void end_encoder(void)
-{
-    if (g_enc) { [g_enc endEncoding]; g_enc = nil; }
-}
-
-static void begin_frame_if_needed(void)
-{
-    if (g_cb) return;
-    dispatch_semaphore_wait(g_inflight, DISPATCH_TIME_FOREVER);
-    g_frame_slot = (g_frame_slot + 1) % MTL_FRAMES_IN_FLIGHT;
-    g_vpos = g_upos = 0;
-    g_cb = [g_queue commandBuffer];
-}
-
-/* A pass on the current surface. `clear` picks the load action; Metal has no
- * way to clear inside a pass, which is why this exists as its own step. */
-static void begin_pass(int clear, const float rgba[4], float depth)
-{
-    MtlSurface *s;
-    if (g_cur_surf < 0) return;
-    s = &g_surf[g_cur_surf];
-    end_encoder();
-    begin_frame_if_needed();
-    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
-    rp.colorAttachments[0].texture = (__bridge id<MTLTexture>)s->color;
-    rp.colorAttachments[0].loadAction = clear ? MTLLoadActionClear
-                                              : MTLLoadActionLoad;
-    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-    if (clear && rgba)
-        rp.colorAttachments[0].clearColor =
-            MTLClearColorMake(rgba[0], rgba[1], rgba[2], rgba[3]);
-    rp.depthAttachment.texture = (__bridge id<MTLTexture>)s->depth;
-    rp.depthAttachment.loadAction = clear ? MTLLoadActionClear
-                                          : MTLLoadActionLoad;
-    rp.depthAttachment.storeAction = MTLStoreActionStore;
-    if (clear) rp.depthAttachment.clearDepth = depth;
-    g_enc = [g_cb renderCommandEncoderWithDescriptor:rp];
-    [g_enc setViewport:(MTLViewport){ 0.0, 0.0,
-        (double)(s->w * s->scale), (double)(s->h * s->scale), 0.0, 1.0 }];
-}
-
-static void mtl_surface(uint32_t offset, uint32_t w, uint32_t h, uint32_t scale)
-{
-    int i, slot = -1;
-    if (!w || !h) return;
-    for (i = 0; i < MTL_SURF_CACHE; i++) {
-        if (g_surf[i].used && g_surf[i].offset == offset
-         && g_surf[i].w == w && g_surf[i].h == h && g_surf[i].scale == scale) {
-            slot = i; break;
-        }
-        if (!g_surf[i].used && slot < 0) slot = i;
-    }
-    if (slot < 0) slot = 0;
-    if (!g_surf[slot].used || g_surf[slot].offset != offset
-     || g_surf[slot].w != w || g_surf[slot].h != h
-     || g_surf[slot].scale != scale) {
-        uint32_t pw = w * (scale ? scale : 1), ph = h * (scale ? scale : 1);
-        MTLTextureDescriptor *cd =
-            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                               width:pw height:ph mipmapped:NO];
-        cd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-        cd.storageMode = MTLStorageModePrivate;
-        MTLTextureDescriptor *dd =
-            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
-                                                               width:pw height:ph mipmapped:NO];
-        dd.usage = MTLTextureUsageRenderTarget;
-        dd.storageMode = MTLStorageModePrivate;
-        g_surf[slot].color = (__bridge_retained void *)[g_dev newTextureWithDescriptor:cd];
-        g_surf[slot].depth = (__bridge_retained void *)[g_dev newTextureWithDescriptor:dd];
-        g_surf[slot].used = 1;
-        g_surf[slot].offset = offset;
-        g_surf[slot].w = w; g_surf[slot].h = h; g_surf[slot].scale = scale;
-        fprintf(stderr, "  [MTL] surface %08X: new %ux%u target, rastered %ux%u\n",
-                offset, w, h, pw, ph);
-    }
-    if (g_cur_surf != slot) {
-        g_cur_surf = slot;
-        begin_pass(0, NULL, 1.0f);
-    }
-}
-
-/* ---- clears ------------------------------------------------------------- */
-
-static void mtl_clear(unsigned mask, const float rgba[4], float depth,
-                      uint32_t stencil, const uint32_t rect[4])
-{
-    MtlSurface *s;
-    (void)stencil;
-    if (g_cur_surf < 0) return;
-    s = &g_surf[g_cur_surf];
-
-    /* Whole surface: begin a new pass and let the hardware clear on load,
-     * which is free on a tile-based GPU and the reason Metal expresses clears
-     * this way at all. */
-    if (!rect || (rect[0] == 0 && rect[1] == 0
-                  && rect[2] >= s->w && rect[3] >= s->h)) {
-        begin_pass(1, (mask & 1) ? rgba : NULL, (mask & 2) ? depth : 1.0f);
-        return;
-    }
-    /* A sub-rectangle cannot be a load action. This title clears one
-     * constantly -- a letterbox bar, a panel behind some text -- so it is
-     * worth doing properly rather than promoting it to a full clear, which
-     * would wipe the frame. Drawn as a scissored quad in a moment; for now the
-     * pass is preserved and the rectangle recorded for the clear pipeline. */
-    if (!g_enc) begin_pass(0, NULL, 1.0f);
+    if (!util_init()) return 0;
     {
-        uint32_t sc = s->scale ? s->scale : 1;
-        MTLScissorRect sr;
-        sr.x = rect[0] * sc;
-        sr.y = rect[1] * sc;
-        sr.width  = (rect[2] > rect[0]) ? (rect[2] - rect[0]) * sc : 0;
-        sr.height = (rect[3] > rect[1]) ? (rect[3] - rect[1]) * sc : 0;
-        if (sr.width && sr.height) {
-            [g_enc setScissorRect:sr];
-            /* The quad itself needs a pipeline of its own; until that exists
-             * the scissor is set and the clear is skipped rather than
-             * promoted, because skipping leaves stale pixels and promoting
-             * erases the frame, and stale pixels are the smaller lie. */
-            [g_enc setScissorRect:(MTLScissorRect){ 0, 0,
-                s->w * sc, s->h * sc }];
-        }
-    }
-}
-
-/* ---- programs ----------------------------------------------------------- */
-
-static int prog_find(uint32_t hash)
-{
-    uint32_t i;
-    for (i = 0; i < MTL_PROG_CACHE; i++) {
-        uint32_t k = (hash + i) & (MTL_PROG_CACHE - 1);
-        if (!g_prog[k].used) return -1;
-        if (g_prog[k].hash == hash) { g_prog[k].last_draw = g_draws; return (int)k; }
-    }
-    return -1;
-}
-
-static int prog_alloc(uint32_t hash)
-{
-    uint32_t i, oldest = 0xFFFFFFFFu;
-    int victim = (int)(hash & (MTL_PROG_CACHE - 1));
-    for (i = 0; i < MTL_PROG_CACHE; i++) {
-        uint32_t k = (hash + i) & (MTL_PROG_CACHE - 1);
-        if (!g_prog[k].used) return (int)k;
-        if (g_prog[k].last_draw < oldest) { oldest = g_prog[k].last_draw; victim = (int)k; }
-    }
-    return victim;
-}
-
-static int mtl_program(const Nv2aVshProgram *vp, const Nv2aVshFixed *ff,
-                       const Nv2aPshState *ps, const Nv2aRenderState *rs,
-                       uint32_t hash)
-{
-    char *vsrc = NULL, *fsrc = NULL;
-    int slot, ok = 0;
-    uint16_t inputs = 0;
-
-    slot = prog_find(hash);
-    if (slot >= 0) return slot;
-
-    vsrc = (char *)malloc(96 * 1024);
-    fsrc = (char *)malloc(96 * 1024);
-    if (!vsrc || !fsrc) { free(vsrc); free(fsrc); return -1; }
-
-    if (ff) { ok = nv2a_vsh_emit_ff_msl(ff, vsrc, 96 * 1024); inputs = ff->inputs_read; }
-    else if (vp) { ok = nv2a_vsh_emit_msl(vp, vsrc, 96 * 1024); inputs = vp->inputs_read; }
-    if (ok) ok = nv2a_psh_emit_msl(ps, fsrc, 96 * 1024);
-    if (!ok) { free(vsrc); free(fsrc); return -1; }
-
-    @autoreleasepool {
-        NSError *err = nil;
-        MTLCompileOptions *opts = [MTLCompileOptions new];
-        NSString *vs = [NSString stringWithUTF8String:vsrc];
-        NSString *fs = [NSString stringWithUTF8String:fsrc];
-        free(vsrc); free(fsrc);
-
-        id<MTLLibrary> vlib = [g_dev newLibraryWithSource:vs options:opts error:&err];
-        if (!vlib) {
-            fprintf(stderr, "  [MTL] vertex shader %08X: %s\n", hash,
-                    [[err localizedDescription] UTF8String]);
-            return -1;
-        }
-        id<MTLLibrary> flib = [g_dev newLibraryWithSource:fs options:opts error:&err];
-        if (!flib) {
-            fprintf(stderr, "  [MTL] fragment shader %08X: %s\n", hash,
-                    [[err localizedDescription] UTF8String]);
-            return -1;
-        }
-
-        MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
-        /* Filled per draw would mean a pipeline per layout; the layout is part
-         * of the program's identity here because the shader declares exactly
-         * the inputs it reads, so one descriptor per program is right. The
-         * offsets come from the draw and are the same every time for a given
-         * program, which the front half guarantees. */
-        {
-            int i, n = 0;
-            for (i = 0; i < 16; i++)
-                if (inputs & (1u << i)) {
-                    vd.attributes[i].format = MTLVertexFormatFloat4;
-                    vd.attributes[i].offset = (NSUInteger)n * 16;
-                    vd.attributes[i].bufferIndex = 0;
-                    n++;
-                }
-            vd.layouts[0].stride = (NSUInteger)(n ? n : 1) * 16;
-            vd.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
-        }
-
-        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
-        pd.vertexFunction   = [vlib newFunctionWithName:@"nv2a_vsh_main"];
-        pd.fragmentFunction = [flib newFunctionWithName:@"nv2a_psh_main"];
-        pd.vertexDescriptor = vd;
-        pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-        pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
-        /* Blend state is compiled in -- see the note at the top of the file.
-         * The caller has already folded it into the hash, so a given hash
-         * always means the same blend and this pipeline stays valid for as
-         * long as it is cached. */
-        if (rs && rs->blend_enable) {
-            MTLRenderPipelineColorAttachmentDescriptor *ca = pd.colorAttachments[0];
-            ca.blendingEnabled = YES;
-            ca.sourceRGBBlendFactor = blend_of(rs->blend_src);
-            ca.destinationRGBBlendFactor = blend_of(rs->blend_dst);
-            ca.sourceAlphaBlendFactor = blend_of(rs->blend_src);
-            ca.destinationAlphaBlendFactor = blend_of(rs->blend_dst);
-            ca.rgbBlendOperation = MTLBlendOperationAdd;
-            ca.alphaBlendOperation = MTLBlendOperationAdd;
-        }
-
-        id<MTLRenderPipelineState> pso =
-            [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
-        if (!pso) {
-            fprintf(stderr, "  [MTL] pipeline %08X: %s\n", hash,
-                    [[err localizedDescription] UTF8String]);
-            return -1;
-        }
-        slot = prog_alloc(hash);
-        if (g_prog[slot].pso) CFRelease(g_prog[slot].pso);
-        g_prog[slot].pso = (__bridge_retained void *)pso;
-        g_prog[slot].hash = hash;
-        g_prog[slot].used = 1;
-        g_prog[slot].inputs = inputs;
-        g_prog[slot].last_draw = g_draws;
-        g_progs_built++;
-    }
-    return slot;
-}
-
-/* ---- textures ----------------------------------------------------------- */
-
-static void mtl_texture(int stage, const void *rgba, uint32_t w, uint32_t h,
-                        uint32_t key, const Nv2aSampler *s)
-{
-    uint32_t i, slot = 0, oldest = 0xFFFFFFFFu;
-    id<MTLTexture> t = nil;
-
-    if (stage < 0 || stage > 3 || !w || !h) return;
-
-    for (i = 0; i < MTL_TEX_CACHE; i++) {
-        uint32_t k = (key + i) & (MTL_TEX_CACHE - 1);
-        if (g_tex[k].used && g_tex[k].key == key
-         && g_tex[k].w == w && g_tex[k].h == h) {
-            g_tex[k].last_draw = g_draws;
-            t = (__bridge id<MTLTexture>)g_tex[k].tex;
-            break;
-        }
-        if (!g_tex[k].used) { slot = k; break; }
-        if (g_tex[k].last_draw < oldest) { oldest = g_tex[k].last_draw; slot = k; }
-    }
-
-    if (!t) {
-        if (!rgba) return;
-        @autoreleasepool {
-            MTLTextureDescriptor *td =
-                [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                                                   width:w height:h mipmapped:NO];
-            td.usage = MTLTextureUsageShaderRead;
-            td.storageMode = MTLStorageModeShared;
-            t = [g_dev newTextureWithDescriptor:td];
-            [t replaceRegion:MTLRegionMake2D(0, 0, w, h)
-                 mipmapLevel:0 withBytes:rgba bytesPerRow:w * 4];
-            if (g_tex[slot].tex) CFRelease(g_tex[slot].tex);
-            g_tex[slot].tex = (__bridge_retained void *)t;
-            g_tex[slot].key = key; g_tex[slot].w = w; g_tex[slot].h = h;
-            g_tex[slot].used = 1; g_tex[slot].last_draw = g_draws;
-            g_tex_built++;
-        }
-    }
-    if (g_enc && t) {
-        int si = 0;
-        if (s) si = (s->min_filter ? 1 : 0) | (s->wrap_s ? 2 : 0);
-        [g_enc setFragmentTexture:t atIndex:(NSUInteger)stage];
-        [g_enc setFragmentSamplerState:g_sampler[si] atIndex:(NSUInteger)stage];
-    }
-}
-
-/* ---- the rest of the state ---------------------------------------------- */
-
-static Nv2aRenderState g_rs;
-
-static void mtl_state(const Nv2aRenderState *rs)
-{
-    if (rs) g_rs = *rs;
-    if (!g_enc) return;
-
-    /* Depth-stencil state is an object, and there are only a handful of
-     * distinct ones, so they are made once and switched. */
-    {
-        int key = ((g_rs.depth_func & 7) << 1) | (g_rs.depth_write ? 1 : 0);
-        if (!g_ds_cache[key & 15]) {
-            MTLDepthStencilDescriptor *dsd = [MTLDepthStencilDescriptor new];
-            dsd.depthCompareFunction = g_rs.depth_test
-                                     ? cmp_of(g_rs.depth_func)
-                                     : MTLCompareFunctionAlways;
-            dsd.depthWriteEnabled = g_rs.depth_write ? YES : NO;
-            g_ds_cache[key & 15] = [g_dev newDepthStencilStateWithDescriptor:dsd];
-        }
-        [g_enc setDepthStencilState:g_ds_cache[key & 15]];
-    }
-
-    /* Winding and culling are encoder state in both APIs. The registers hold
-     * literal GL enums -- 0x900 clockwise, 0x901 counter-clockwise, 0x404
-     * front, 0x405 back -- because that is what the console's driver writes. */
-    [g_enc setFrontFacingWinding:(g_rs.front_face == 0x901)
-                                 ? MTLWindingCounterClockwise
-                                 : MTLWindingClockwise];
-    if (!g_rs.cull_enable)
-        [g_enc setCullMode:MTLCullModeNone];
-    else
-        [g_enc setCullMode:(g_rs.cull_face == 0x404) ? MTLCullModeFront
-                                                     : MTLCullModeBack];
-}
-
-/* ---- draws -------------------------------------------------------------- */
-
-static void mtl_draw(int prog, int prim,
-                     const float *verts, uint32_t nverts, uint32_t stride_floats,
-                     const Nv2aAttrSlot *slots, int nslots,
-                     const Nv2aUniforms *u,
-                     uint32_t const_attr_mask, const float const_attr[16][4])
-{
-    uint32_t vbytes, ubytes;
-    (void)slots; (void)nslots; (void)const_attr_mask; (void)const_attr;
-
-    if (prog < 0 || !g_prog[prog].used || !nverts || !verts) return;
-    if (!g_enc) begin_pass(0, NULL, 1.0f);
-    if (!g_enc) return;
-
-    vbytes = nverts * stride_floats * (uint32_t)sizeof(float);
-    ubytes = (uint32_t)sizeof(Nv2aUniforms);
-    if (g_vpos + vbytes > MTL_RING_BYTES || g_upos + ubytes > MTL_RING_BYTES) {
-        /* The ring is full for this frame. Rather than corrupt a draw the GPU
-         * is still reading, drop this one and say so once -- a missing object
-         * is a bug that can be seen, and a torn vertex buffer is one that
-         * cannot. */
-        static int said;
-        if (!said++)
-            fprintf(stderr, "  [MTL] vertex ring exhausted in one frame; "
-                            "raise MTL_RING_BYTES\n");
-        return;
-    }
-
-    memcpy((uint8_t *)[g_vring[g_frame_slot] contents] + g_vpos, verts, vbytes);
-    memcpy((uint8_t *)[g_uring[g_frame_slot] contents] + g_upos, u, ubytes);
-
-    [g_enc setRenderPipelineState:
-        (__bridge id<MTLRenderPipelineState>)g_prog[prog].pso];
-    [g_enc setVertexBuffer:g_vring[g_frame_slot] offset:g_vpos atIndex:0];
-    [g_enc setVertexBuffer:g_uring[g_frame_slot] offset:g_upos
-                   atIndex:NV2A_MSL_VSH_UNIFORM_INDEX];
-    [g_enc setFragmentBuffer:g_uring[g_frame_slot] offset:g_upos
-                     atIndex:NV2A_MSL_PSH_UNIFORM_INDEX];
-    [g_enc drawPrimitives:prim_of(prim) vertexStart:0 vertexCount:nverts];
-
-    g_vpos += (vbytes + 255u) & ~255u;   /* Metal wants 256-byte alignment */
-    g_upos += (ubytes + 255u) & ~255u;
-    g_draws++;
-}
-
-/* ---- presenting --------------------------------------------------------- */
-
-static void mtl_present(const uint8_t **pixels, uint32_t *w, uint32_t *h)
-{
-    MtlSurface *s;
-    uint32_t pw, ph, need;
-
-    if (pixels) *pixels = NULL;
-    if (g_cur_surf < 0 || !g_cb) return;
-    s = &g_surf[g_cur_surf];
-    pw = s->w * (s->scale ? s->scale : 1);
-    ph = s->h * (s->scale ? s->scale : 1);
-
-    end_encoder();
-
-    need = pw * ph * 4;
-    if (g_readback_bytes < need) {
-        free(g_readback);
-        g_readback = (uint8_t *)malloc(need);
-        g_readback_bytes = need;
-    }
-
-    /* The render target is private -- the GPU's own memory, which is the fast
-     * place for it -- so reading it costs a blit into something the CPU can
-     * see. On a machine with unified memory that blit is a copy rather than a
-     * transfer, which is why it is affordable once a frame and would not be
-     * affordable once a draw. */
-    @autoreleasepool {
+        static const uint8_t px[4] = { 0, 0, 0, 255 };
         MTLTextureDescriptor *td =
-            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                               width:pw height:ph mipmapped:NO];
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                               width:1 height:1 mipmapped:NO];
+        Nv2aSampler s;
         td.usage = MTLTextureUsageShaderRead;
         td.storageMode = MTLStorageModeShared;
-        id<MTLTexture> staging = [g_dev newTextureWithDescriptor:td];
-        id<MTLBlitCommandEncoder> blit = [g_cb blitCommandEncoder];
-        [blit copyFromTexture:(__bridge id<MTLTexture>)s->color
-                  sourceSlice:0 sourceLevel:0
-                 sourceOrigin:MTLOriginMake(0, 0, 0)
-                   sourceSize:MTLSizeMake(pw, ph, 1)
-                    toTexture:staging destinationSlice:0 destinationLevel:0
-            destinationOrigin:MTLOriginMake(0, 0, 0)];
-        [blit endEncoding];
-
-        __block dispatch_semaphore_t sem = g_inflight;
-        [g_cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
-            (void)b; dispatch_semaphore_signal(sem);
-        }];
-        [g_cb commit];
-        [g_cb waitUntilCompleted];
-        if (g_readback)
-            [staging getBytes:g_readback bytesPerRow:pw * 4
-                   fromRegion:MTLRegionMake2D(0, 0, pw, ph) mipmapLevel:0];
+        g_black = [g_dev newTextureWithDescriptor:td];
+        [g_black replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:px bytesPerRow:4];
+        memset(&s, 0, sizeof s);
+        g_black_smp = sampler_for(&s);
     }
-    g_cb = nil;
-
-    if (pixels) *pixels = g_readback;
-    if (w) *w = pw;
-    if (h) *h = ph;
+    g_vu_size = nv2a_uniform_msl_struct_size(0);
+    g_fu_size = nv2a_uniform_msl_struct_size(1);
+    g_vu = (uint8_t *)calloc(1, g_vu_size);
+    g_fu = (uint8_t *)calloc(1, g_fu_size);
+    if (!g_vu || !g_fu) return 0;
+    for (i = 0; i < 16; i++) { g_generic[i][0] = g_generic[i][1] = g_generic[i][2] = 0.0f;
+                               g_generic[i][3] = 1.0f; }
+    fprintf(stderr, "  [MTL] %s; uniforms %u + %u bytes a draw, constants 3 KB when "
+            "they change; %d frames in flight\n",
+            [[g_dev name] UTF8String], g_vu_size, g_fu_size, MTL_FRAMES_IN_FLIGHT);
+    return 1;
 }
 
 static void mtl_report(void)
 {
-    fprintf(stderr, "  [MTL] %u draws, %u pipelines built, %u textures built\n",
-            g_draws, g_progs_built, g_tex_built);
+    uint32_t live_tex = 0, live_rt = 0, live_prog = 0, i;
+    for (i = 0; i < MTL_MAX_TEX; i++)  if (g_tex[i].used)  live_tex++;
+    for (i = 0; i < MTL_MAX_RT; i++)   if (g_rt[i].used)   live_rt++;
+    for (i = 0; i < MTL_MAX_PROG; i++) if (g_prog[i].used) live_prog++;
+    fprintf(stderr, "  [MTL] %llu draws in %llu passes over %llu frames; %u programs, "
+            "%u pipelines, %u textures made\n",
+            (unsigned long long)g_n_draws, (unsigned long long)g_n_passes,
+            (unsigned long long)g_n_frames, g_n_progs, g_n_psos, g_n_tex);
+    /* What is alive now, as against made so far: the numbers a leak moves. */
+    fprintf(stderr, "  [MTL] alive: %u textures (of them %u render targets), %u programs\n",
+            live_tex, live_rt, live_prog);
+    fprintf(stderr, "  [MTL] building: %.0f ms compiling %u programs, %.0f ms making %u "
+            "pipelines (slowest %.1f ms)\n", g_ms_compile, g_n_progs, g_ms_pso, g_n_psos,
+            g_ms_pso_max);
+    fprintf(stderr, "  [MTL] clears: %llu as load actions, %llu drawn; %u surface copies, "
+            "%u read-backs; arena peak %.1f MB a frame\n",
+            (unsigned long long)g_n_load_clears, (unsigned long long)g_n_quad_clears,
+            g_n_snapshots, g_n_readbacks, (double)g_arena_peak / (1024.0 * 1024.0));
+    {
+        uint64_t shown = atomic_load(&g_n_presented), skipped = atomic_load(&g_n_skipped);
+        uint64_t hidden = atomic_load(&g_n_hidden), nodrw = atomic_load(&g_n_no_drawable);
+        uint64_t p[6], lost, tot = 0;
+        int i;
+        if (shown || skipped || hidden || nodrw) {
+            fprintf(stderr, "  [MTL] window: %llu frames shown, %llu replaced by a newer one "
+                    "before the display had room, %llu while hidden, %llu without a drawable\n",
+                    (unsigned long long)shown, (unsigned long long)skipped,
+                    (unsigned long long)hidden, (unsigned long long)nodrw);
+            pthread_mutex_lock(&g_pace_mu);
+            memcpy(p, g_pace, sizeof p);
+            lost = g_pace_lost;
+            pthread_mutex_unlock(&g_pace_mu);
+            for (i = 0; i < 5; i++) tot += p[i];
+            if (tot)
+                fprintf(stderr, "  [MTL] on screen, each frame stayed: under 12 ms %.1f%%, "
+                        "a 60th of a second %.1f%%, 1.5 %.1f%%, 2 %.1f%%, longer %.1f%% "
+                        "(and %llu pauses over 70 ms; %llu frames the system never showed)\n",
+                        100.0 * p[0] / tot, 100.0 * p[1] / tot, 100.0 * p[2] / tot,
+                        100.0 * p[3] / tot, 100.0 * p[4] / tot,
+                        (unsigned long long)p[5], (unsigned long long)lost);
+        }
+    }
 }
 
-static const Nv2aBackend g_metal_backend = {
-    "metal",
+static const Nv2aGfx g_metal = {
+    "metal", NV2A_LANG_MSL, 0,
     mtl_init,
-    mtl_surface,
-    mtl_clear,
-    mtl_program,
-    mtl_texture,
-    mtl_state,
-    mtl_draw,
-    mtl_present,
-    mtl_report,
+    mtl_target_new, mtl_target_free, mtl_target_bind, mtl_target_texture,
+    mtl_target_snapshot, mtl_target_read, mtl_target_read_depth,
+    mtl_tex_new, mtl_tex_free, mtl_tex_read,
+    mtl_prog_new, mtl_prog_free, mtl_prog_uses, mtl_prog_use,
+    mtl_uniform_f, mtl_uniform_i,
+    mtl_texture, mtl_state, mtl_state_invalidate,
+    mtl_vertices, mtl_draw, mtl_clear, mtl_present, mtl_report,
 };
 
-const Nv2aBackend *nv2a_backend_metal(void) { return &g_metal_backend; }
+const Nv2aGfx *nv2a_gfx_metal(void) { return &g_metal; }

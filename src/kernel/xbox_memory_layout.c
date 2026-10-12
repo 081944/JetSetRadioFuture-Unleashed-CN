@@ -647,11 +647,14 @@ static void vblank_intr_tick(volatile uint32_t *regs)
     if (v & NV2A_VBLANK_PENDING_TAG)
         return;                       /* raised, not yet acknowledged */
 
-    /* Acknowledged (or never raised): complete it. */
+    /* Acknowledged (or never raised): complete it. A PGRAPH software method
+     * still with the title keeps its bit (see kernel_pgraph_tick). */
     if (v)
         *pcrtc = 0;
-    if (*pmc)
-        *pmc = 0;
+    if (*pmc) {
+        extern int xbox_nv2a_swm_in_flight(void);
+        *pmc = xbox_nv2a_swm_in_flight() ? (*pmc & (1u << 12)) : 0;
+    }
 }
 
 /* The same, for code that keeps this thread away from its loop.
@@ -679,6 +682,11 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+            extern int xbox_nv2a_swm_in_flight(void);
+            /* A software method the title has not acknowledged yet keeps its
+             * PGRAPH status: the handler is about to read it. */
+            if (NV2A_ACK[i].offset == 0x400100u && xbox_nv2a_swm_in_flight())
+                continue;
             if (*r & NV2A_ACK[i].busy_mask) {
                 *r &= ~NV2A_ACK[i].busy_mask;
             }
@@ -720,6 +728,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             DWORD now_ms = GetTickCount();
             uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
             if (put != last_put || (now_ms - last_put_ms) > 2000) {
+                int idle = put == last_put, reported = 0;
                 /* Survey the segment the title just submitted, once. */
                 {
                     extern uint32_t nv2a_pb_scan(uint32_t, uint32_t);
@@ -764,6 +773,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     if (now_ms - last_report > 10000) {
                         last_report = now_ms;
                         nv2a_pb_scan_report();
+                        reported = 1;
                     }
                 }
                 last_put = put; last_put_ms = now_ms;
@@ -775,15 +785,26 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                  * Dashboard reads them: its D3D holds a register-block pointer
                  * in its device struct rather than assuming 0xFD800000, and
                  * mirroring the wrong block leaves it spinning on a GET that
-                 * never moves. */
+                 * never moves.
+                 *
+                 * Not at every kick: a title kicks a couple of thousand times
+                 * a second, and one line each was 97% of a player's log (145
+                 * of 150 MB in twenty minutes) and a formatted write on the
+                 * GPU's own thread every time. Now with the periodic report,
+                 * when nothing has been submitted for two seconds (the case
+                 * the pair is for), or at every kick with RECOMP_NV2A_TRACE. */
                 {
+                    static int every = -1;
                     uint32_t g = *(volatile uint32_t *)
                                  ((char *)regs + NV2A_USER_DMA_GET);
-                    fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
-                            "0x%08X%s\n", put, g,
-                            g == put ? "" : "  (GPU behind)");
+                    if (every < 0) every = getenv("RECOMP_NV2A_TRACE") != NULL;
+                    if (every || idle || reported) {
+                        fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
+                                "0x%08X%s\n", put, g,
+                                g == put ? "" : "  (GPU behind)");
+                        fflush(stderr);
+                    }
                 }
-                fflush(stderr);
             }
         }
         if (s_nv2a_trace) {

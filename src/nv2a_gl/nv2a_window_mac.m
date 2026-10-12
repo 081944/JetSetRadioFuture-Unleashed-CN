@@ -29,9 +29,11 @@
 
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
+#import <Metal/Metal.h>
 #import <OpenGL/OpenGL.h>
 #import <OpenGL/gl.h>
 #include <pthread.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -53,6 +55,18 @@ static GLuint          g_tex;
 
 static NvGLView *g_view;
 
+/*
+ * The Metal renderer's view: a layer the renderer draws the finished frame
+ * into itself, from its own thread, which is what CAMetalLayer is for -- no
+ * readback, no hand-over of pixels, no drawing on the main thread. The view
+ * only keeps the layer's drawable the size of its backing store.
+ */
+@interface NvMetalView : NSView
+@end
+
+static NvMetalView  *g_mview;
+static CAMetalLayer *g_mlayer;
+
 /* The frame is sRGB: the console's output is video with BT.709 primaries,
  * which are sRGB's, and every colour the title chose was chosen on that.
  * An OpenGL layer is not colour-matched unless it is told what its content
@@ -68,9 +82,9 @@ static void nv_window_colour_space(void)
     static int on = -1, done;
     CALayer *layer;
     NSColorSpace *scr;
-    if (done || !g_window || !g_view) return;
+    if (done || !g_window || (!g_view && !g_mview)) return;
     if (on < 0) { const char *e = getenv("RECOMP_WINDOW_SRGB"); on = e ? atoi(e) : 1; }
-    layer = [g_view layer];
+    layer = g_mview ? (CALayer *)g_mlayer : [g_view layer];
     if (!layer) return;                    /* not yet: try at the next draw */
     done = 1;
     scr = [[g_window screen] colorSpace];
@@ -80,6 +94,10 @@ static void nv_window_colour_space(void)
             CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
             ((CAOpenGLLayer *)layer).colorspace = cs;
             CGColorSpaceRelease(cs);
+        } else if ([layer isKindOfClass:[CAMetalLayer class]]) {
+            CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+            ((CAMetalLayer *)layer).colorspace = cs;
+            CGColorSpaceRelease(cs);
         }
     }
     fprintf(stderr, "[WIN] screen colour space: %s; window %s; layer %s%s\n",
@@ -87,7 +105,9 @@ static void nv_window_colour_space(void)
             [g_window colorSpace] ? [[[g_window colorSpace] localizedName] UTF8String] : "(screen's)",
             [NSStringFromClass([layer class]) UTF8String],
             !on ? " (untagged: RECOMP_WINDOW_SRGB=0)"
-                : [layer isKindOfClass:[CAOpenGLLayer class]] ? " tagged sRGB" : " (not a GL layer: window only)");
+                : ([layer isKindOfClass:[CAOpenGLLayer class]]
+                   || [layer isKindOfClass:[CAMetalLayer class]]) ? " tagged sRGB"
+                : " (not a GL layer: window only)");
     fflush(stderr);
 }
 
@@ -187,11 +207,137 @@ static void nv_window_colour_space(void)
 }
 @end
 
+@implementation NvMetalView
+
+- (BOOL)isOpaque          { return YES; }
+- (BOOL)acceptsFirstResponder { return YES; }
+- (BOOL)wantsUpdateLayer  { return YES; }
+
+- (CALayer *)makeBackingLayer
+{
+    CAMetalLayer *l = [CAMetalLayer layer];
+    const char *v = getenv("RECOMP_VSYNC");
+    l.device = MTLCreateSystemDefaultDevice();
+    l.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    l.framebufferOnly = YES;
+    l.opaque = YES;
+    /* In step with the display, like the OpenGL view's swap interval of
+     * one; RECOMP_VSYNC=0 lets frames go as soon as they are ready. */
+    l.displaySyncEnabled = (v && v[0] == '0') ? NO : YES;
+    g_mlayer = l;
+    return l;
+}
+
+/* The drawable follows the view, in pixels: a Retina window has twice as
+ * many as points, and the renderer draws the frame letterboxed into it. */
+- (void)nvSyncDrawable
+{
+    NSSize sz = [self convertSizeToBacking:[self bounds].size];
+    if (!g_mlayer) return;
+    g_mlayer.contentsScale = [[self window] backingScaleFactor] > 0
+                           ? [[self window] backingScaleFactor] : 1.0;
+    if (sz.width >= 1 && sz.height >= 1) {
+        CGSize was = g_mlayer.drawableSize;
+        if (was.width != sz.width || was.height != sz.height)
+            fprintf(stderr, "[WIN] drawable %.0fx%.0f\n", sz.width, sz.height);
+        g_mlayer.drawableSize = sz;
+    }
+}
+- (void)setFrameSize:(NSSize)s { [super setFrameSize:s]; [self nvSyncDrawable]; }
+- (void)viewDidChangeBackingProperties { [super viewDidChangeBackingProperties]; [self nvSyncDrawable]; }
+- (void)viewDidMoveToWindow { [super viewDidMoveToWindow]; [self nvSyncDrawable]; nv_window_colour_space(); }
+@end
+
+/* Whether the window should be made for Metal: RECOMP_BACKEND if it says,
+ * else the stored choice -- and only where there is a Metal device. */
+static int nv_window_wants_metal(void)
+{
+    const char *v = getenv("RECOMP_BACKEND");
+    extern int nv_window_pref_metal(void);
+    int want = (v && *v) ? !strcmp(v, "metal") : nv_window_pref_metal();
+    if (!want) return 0;
+    @autoreleasepool {
+        id<MTLDevice> d = MTLCreateSystemDefaultDevice();
+        int ok = d != nil;
+#if !__has_feature(objc_arc)
+        [d release];
+#endif
+        return ok;
+    }
+}
+
+/* For the renderer (nv2a_metal.m): the layer to present into, or NULL when
+ * the window is not a Metal one. */
+void *nv_window_metal_layer(void);
+void *nv_window_metal_layer(void)
+{
+    return (g_open && g_mlayer) ? (__bridge void *)g_mlayer : NULL;
+}
+
+static NvGLView *make_gl_view(NSRect frame);
+
+/* The renderer asked for Metal, the window was made for it, and the device
+ * would not come up after all: put an OpenGL view in its place, so that the
+ * frames OpenGL hands over as pixels have somewhere to go. */
+void nv_window_use_gl(void);
+void nv_window_use_gl(void)
+{
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NvGLView *v;
+        if (!g_window || g_view) return;
+        v = make_gl_view([[g_window contentView] frame]);
+        if (!v) return;
+        g_view = v;
+        [g_window setContentView:g_view];
+        [g_window makeFirstResponder:g_view];
+        g_mview = nil;
+        g_mlayer = nil;
+        fprintf(stderr, "[WIN] Metal unavailable: the window draws with OpenGL\n");
+    });
+}
+
 @interface NvWindowDelegate : NSObject <NSWindowDelegate>
 @end
+/* Whether any of the window can be seen: the Metal renderer does not ask
+ * a hidden or minimised window's layer for drawables, which it would only
+ * hand out once the window came back -- holding the game up meanwhile. */
+static volatile int g_visible = 1;
+int nv_window_visible(void);
+int nv_window_visible(void) { return g_visible; }
+
+/* The window's display, in refreshes a second (0: not known). The Metal
+ * presenter paces a sixty-frame game on a faster screen by it -- a MacBook
+ * Pro's runs at up to 120. Kept here, from the main thread, because the
+ * presenter's thread should not ask AppKit. */
+static volatile int g_refresh_hz;
+int nv_window_refresh_hz(void);
+int nv_window_refresh_hz(void) { return g_refresh_hz; }
+static void nv_window_note_refresh(void)
+{
+    int hz = 0;
+    NSScreen *scr = g_window ? [g_window screen] : nil;
+    if (@available(macOS 12.0, *)) hz = scr ? (int)[scr maximumFramesPerSecond] : 0;
+    if (hz != g_refresh_hz) {
+        g_refresh_hz = hz;
+        fprintf(stderr, "[WIN] display: %s, up to %d refreshes a second\n",
+                scr ? [[scr localizedName] UTF8String] : "?", hz);
+        fflush(stderr);
+    }
+}
+
 @implementation NvWindowDelegate
 - (BOOL)windowShouldClose:(NSWindow *)sender
 { (void)sender; g_should_close = 1; return NO; }
+- (void)windowDidChangeOcclusionState:(NSNotification *)n
+{
+    (void)n;
+    g_visible = ([g_window occlusionState] & NSWindowOcclusionStateVisible) ? 1 : 0;
+}
+- (void)windowDidChangeScreen:(NSNotification *)n
+{
+    (void)n;
+    nv_window_note_refresh();
+}
 @end
 
 /* ---- the keyboard as a gamepad -------------------------------------------
@@ -338,6 +484,22 @@ int nv_window_pref_widescreen(void)
     }
 }
 
+/* Video > Renderer: Metal or OpenGL, stored as the "renderer" default
+ * ("metal" / "opengl") and read once, when the renderer starts -- it cannot
+ * change under a running frame. RECOMP_BACKEND in the environment wins
+ * (gfx_init in nv2a_gl.c reads it first). */
+/* Video > Renderer, as stored: Metal unless OpenGL was chosen. Metal is the
+ * Mac's renderer now; OpenGL stays for a Mac where Metal will not start
+ * (nv_window_use_gl) and as the other half of any comparison. */
+int nv_window_pref_metal(void);
+int nv_window_pref_metal(void)
+{
+    @autoreleasepool {
+        NSString *r = [[NSUserDefaults standardUserDefaults] stringForKey:@"renderer"];
+        return (r && [r isEqualToString:@"opengl"]) ? 0 : 1;
+    }
+}
+
 /* The window in the picture's shape: 16:9 or 4:3, keeping its height (and
  * fitting the screen). Not while full screen -- the frame is letterboxed
  * there anyway. */
@@ -367,12 +529,62 @@ static void nv_window_shape_for_mode(void)
 
 @interface NvMenuTarget : NSObject
 - (void)pickScale:(id)sender;
+- (void)pickRenderer:(id)sender;
 - (void)toggleWidescreen:(id)sender;
 - (void)showKeys:(id)sender;
 - (void)showPad:(id)sender;
 @end
 
 @implementation NvMenuTarget
+/* Video > Renderer. Like the resolution, set when the game starts: the
+ * window's view and every surface, texture and program belong to one API. */
+- (void)pickRenderer:(id)sender
+{
+    NSInteger want = [(NSMenuItem *)sender tag];        /* 1 Metal, 0 OpenGL */
+    int running = g_mview ? 1 : 0;
+    NSAlert *a;
+    NSModalResponse r;
+    NSMenuItem *it;
+
+    if (want == running && want == nv_window_pref_metal()) return;
+    kb_release_all();
+    a = [[NSAlert alloc] init];
+    a.messageText = want ? @"Render with Metal?" : @"Render with OpenGL?";
+    a.informativeText = want
+        ? @"Metal is the Mac's own graphics API: the frame goes straight to the "
+           "window, without the copy OpenGL needs. The renderer is chosen when the "
+           "game starts; restarting now loses anything you have not saved."
+        : @"OpenGL is the renderer the game used on the Mac before Metal, kept as a "
+           "fallback. The renderer is chosen when the game starts; restarting now "
+           "loses anything you have not saved.";
+    [a addButtonWithTitle:@"Restart Now"];
+    [a addButtonWithTitle:@"At Next Launch"];
+    [a addButtonWithTitle:@"Cancel"];
+    r = [a runModal];
+    if (r != NSAlertFirstButtonReturn && r != NSAlertSecondButtonReturn) return;
+
+    [[NSUserDefaults standardUserDefaults] setObject:(want ? @"metal" : @"opengl")
+                                              forKey:@"renderer"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    for (it in [[(NSMenuItem *)sender menu] itemArray])
+        [it setState:([it tag] == want) ? NSControlStateValueOn : NSControlStateValueOff];
+    fprintf(stderr, "[WIN] renderer: %s from the next launch\n", want ? "Metal" : "OpenGL");
+    if (r != NSAlertFirstButtonReturn) return;
+    {
+        extern void recomp_restart_self(void) __attribute__((weak));
+        /* The relaunch inherits the environment, where RECOMP_BACKEND would
+         * outrank the choice just made. */
+        unsetenv("RECOMP_BACKEND");
+        if (recomp_restart_self) recomp_restart_self();   /* does not return on success */
+        {
+            NSAlert *b = [[NSAlert alloc] init];
+            b.messageText = @"Restart to change the renderer";
+            b.informativeText = @"Quit and launch again and the game will use the "
+                                 "renderer you picked.";
+            [b runModal];
+        }
+    }
+}
 - (void)toggleWidescreen:(id)sender
 {
     extern int nv2a_widescreen(void);
@@ -520,6 +732,25 @@ static void build_menu(void)
     [resItem setSubmenu:res];
     [video addItem:resItem];
     {
+        /* Renderer: which API draws the game, checked as it is running. */
+        NSMenu *ren = [[NSMenu alloc] initWithTitle:@"Renderer"];
+        NSMenuItem *renItem = [[NSMenuItem alloc] initWithTitle:@"Renderer"
+                                                         action:nil keyEquivalent:@""];
+        NSString *names[2] = { @"OpenGL", @"Metal" };
+        int r, running = g_mview ? 1 : 0;
+        for (r = 1; r >= 0; r--) {
+            NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:names[r]
+                                                        action:@selector(pickRenderer:)
+                                                 keyEquivalent:@""];
+            [it setTag:r];
+            [it setTarget:g_menu_target];
+            [it setState:(r == running) ? NSControlStateValueOn : NSControlStateValueOff];
+            [ren addItem:it];
+        }
+        [renItem setSubmenu:ren];
+        [video addItem:renItem];
+    }
+    {
         /* No target: it goes up the responder chain to the window, which
          * implements toggleFullScreen: and retitles the item itself. */
         NSMenuItem *fs = [[NSMenuItem alloc] initWithTitle:@"Enter Full Screen"
@@ -571,18 +802,32 @@ static void build_menu(void)
 
 /* Must be called on the main thread: AppKit refuses to create a window
  * anywhere else, and says so by throwing. Returns 1 on success. */
+/* The OpenGL view, with the context its drawRect: draws in. */
+static NvGLView *make_gl_view(NSRect frame)
+{
+    NSOpenGLPixelFormatAttribute attrs[] = {
+        NSOpenGLPFAColorSize,  24,
+        NSOpenGLPFAAlphaSize,   8,
+        NSOpenGLPFADoubleBuffer,
+        NSOpenGLPFAAccelerated,
+        0
+    };
+    NSOpenGLPixelFormat *pf = [[NSOpenGLPixelFormat alloc] initWithAttributes:attrs];
+    NvGLView *v;
+    GLint one = 1;
+    if (!pf) { fprintf(stderr, "[WIN] no pixel format\n"); return nil; }
+    v = [[NvGLView alloc] initWithFrame:frame pixelFormat:pf];
+    if (!v) { fprintf(stderr, "[WIN] no GL view\n"); return nil; }
+    [v setWantsBestResolutionOpenGLSurface:YES];
+    [[v openGLContext] setValues:&one forParameter:NSOpenGLContextParameterSwapInterval];
+    return v;
+}
+
 int nv_window_prepare(int width, int height, const char *title)
 {
     @autoreleasepool {
-        NSOpenGLPixelFormatAttribute attrs[] = {
-            NSOpenGLPFAColorSize,  24,
-            NSOpenGLPFAAlphaSize,   8,
-            NSOpenGLPFADoubleBuffer,
-            NSOpenGLPFAAccelerated,
-            0
-        };
-        NSOpenGLPixelFormat *pf;
         NSRect frame;
+        int metal = nv_window_wants_metal();
         NSWindowStyleMask mask = NSWindowStyleMaskTitled |
                                  NSWindowStyleMaskClosable |
                                  NSWindowStyleMaskMiniaturizable |
@@ -635,9 +880,6 @@ int nv_window_prepare(int width, int height, const char *title)
           } }
         frame = NSMakeRect(0, 0, width, height);
 
-        pf = [[NSOpenGLPixelFormat alloc] initWithAttributes:attrs];
-        if (!pf) { fprintf(stderr, "[WIN] no pixel format\n"); return 0; }
-
         g_window = [[NSWindow alloc]
             initWithContentRect:frame
                       styleMask:mask
@@ -654,22 +896,35 @@ int nv_window_prepare(int width, int height, const char *title)
         [g_window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
         [g_window center];
 
-        g_view = [[NvGLView alloc] initWithFrame:frame pixelFormat:pf];
-        if (!g_view) { fprintf(stderr, "[WIN] no GL view\n"); return 0; }
-        [g_view setWantsBestResolutionOpenGLSurface:YES];
-        [g_window setContentView:g_view];
-        [g_window makeFirstResponder:g_view];
+        if (metal) {
+            g_mview = [[NvMetalView alloc] initWithFrame:frame];
+            [g_mview setWantsLayer:YES];
+            [g_window setContentView:g_mview];
+            [g_window makeFirstResponder:g_mview];
+            [g_mview nvSyncDrawable];
+        } else {
+            g_view = make_gl_view(frame);
+            if (!g_view) return 0;
+            [g_window setContentView:g_view];
+            [g_window makeFirstResponder:g_view];
+        }
         build_menu();
-        [g_window makeKeyAndOrderFront:nil];
-        [NSApp activateIgnoringOtherApps:YES];
-
-        { GLint one = 1;
-          [[g_view openGLContext] setValues:&one
-              forParameter:NSOpenGLContextParameterSwapInterval]; }
+        if (getenv("RECOMP_WINDOW_NOACTIVATE")) {
+            /* Test runs: on screen, but the keyboard stays with whoever is
+             * using the Mac -- a scripted run needs no keys, and someone
+             * typing elsewhere should not be steering the game. */
+            [g_window orderFrontRegardless];
+        } else {
+            [g_window makeKeyAndOrderFront:nil];
+            [NSApp activateIgnoringOtherApps:YES];
+        }
+        nv_window_note_refresh();
 
         g_w = width; g_h = height; g_open = 1;
-        fprintf(stderr, "[WIN] %dx%d window open (drawn on the main thread)\n",
-                width, height);
+        fprintf(stderr, "[WIN] %dx%d window open (%s), window number %ld\n", width, height,
+                metal ? "Metal: the renderer presents into its layer"
+                      : "OpenGL: drawn on the main thread",
+                (long)[g_window windowNumber]);
         return 1;
     }
 }
@@ -694,6 +949,144 @@ void nv_window_submit_frame(const void *pixels, int width, int height)
     pthread_mutex_unlock(&g_lock);
 }
 
+/*
+ * RECOMP_KEY_SCRIPT="t keycode[@secs];..." (test only): real key events,
+ * posted into this application's own event queue at those times (seconds
+ * from the window opening; key codes as kVK_*, e.g. 36 Return, 49 Space,
+ * 13 W), held 0.25 s or as long as asked. They come out of the same
+ * nextEventMatchingMask below that a physical key press does, so a scripted
+ * run exercises the whole keyboard path -- window, mapping, merge with the
+ * pad -- with nobody at the keyboard. While a script is running the keys are
+ * not let go when the window loses focus, so that someone using the Mac
+ * during a test does not cut it short.
+ */
+static struct { double t, dur; unsigned short code; int state; } g_keys[48];
+static int    g_nkeys = -1;
+static double g_keys_t0;
+
+static double key_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+static void key_script_post(unsigned short code, int down)
+{
+    NSEvent *ev = [NSEvent keyEventWithType:down ? NSEventTypeKeyDown : NSEventTypeKeyUp
+                                   location:NSZeroPoint
+                              modifierFlags:0
+                                  timestamp:[[NSProcessInfo processInfo] systemUptime]
+                               windowNumber:[g_window windowNumber]
+                                    context:nil
+                                 characters:@""
+                charactersIgnoringModifiers:@""
+                                  isARepeat:NO
+                                    keyCode:code];
+    if (ev) [NSApp postEvent:ev atStart:NO];
+}
+
+static void key_script_step(void)
+{
+    double now;
+    int i;
+    if (g_nkeys < 0) {
+        const char *s = getenv("RECOMP_KEY_SCRIPT");
+        g_nkeys = 0;
+        g_keys_t0 = key_now();
+        while (s && *s && g_nkeys < 48) {
+            char *e;
+            double t = strtod(s, &e);
+            unsigned long code;
+            if (e == s) break;
+            s = e;
+            while (*s == ' ') s++;
+            code = strtoul(s, &e, 10);
+            if (e == s) break;
+            s = e;
+            g_keys[g_nkeys].t = t;
+            g_keys[g_nkeys].code = (unsigned short)code;
+            g_keys[g_nkeys].dur = 0.25;
+            if (*s == '@') g_keys[g_nkeys].dur = strtod(s + 1, &e), s = e;
+            g_keys[g_nkeys].state = 0;
+            g_nkeys++;
+            while (*s == ' ' || *s == ';') s++;
+        }
+        if (g_nkeys)
+            fprintf(stderr, "[WIN] key script: %d presses\n", g_nkeys);
+    }
+    if (!g_nkeys) return;
+    now = key_now() - g_keys_t0;
+    for (i = 0; i < g_nkeys; i++) {
+        if (g_keys[i].state == 0 && now >= g_keys[i].t) {
+            key_script_post(g_keys[i].code, 1);
+            g_keys[i].state = 1;
+            fprintf(stderr, "[WIN] key %u down at %.1fs\n", g_keys[i].code, now);
+        } else if (g_keys[i].state == 1 && now >= g_keys[i].t + g_keys[i].dur) {
+            key_script_post(g_keys[i].code, 0);
+            g_keys[i].state = 2;
+        }
+    }
+}
+
+/*
+ * RECOMP_WIN_SCRIPT="t action;..." (test only): window operations at those
+ * times (seconds from the window opening), done on the main thread as a
+ * click or a menu choice would do them -- fs (full screen on/off), min,
+ * restore, wide (widescreen on/off, not stored), size WxH (content size in
+ * points). For checking that the renderer follows the window through all of
+ * it with nobody at the Mac.
+ */
+static struct { double t; char act[24]; int done; } g_wops[16];
+static int    g_nwops = -1;
+static double g_wops_t0;
+
+static void win_script_step(void)
+{
+    double now;
+    int i;
+    if (g_nwops < 0) {
+        const char *s = getenv("RECOMP_WIN_SCRIPT");
+        g_nwops = 0;
+        g_wops_t0 = key_now();
+        while (s && *s && g_nwops < 16) {
+            char *e;
+            double t = strtod(s, &e);
+            int n = 0;
+            if (e == s) break;
+            while (*e == ' ') e++;
+            while (e[n] && e[n] != ';' && n < 23) { g_wops[g_nwops].act[n] = e[n]; n++; }
+            g_wops[g_nwops].act[n] = 0;
+            g_wops[g_nwops].t = t;
+            g_wops[g_nwops].done = 0;
+            g_nwops++;
+            s = strchr(e, ';');
+            if (!s) break;
+            s++;
+        }
+    }
+    if (!g_nwops || !g_window) return;
+    now = key_now() - g_wops_t0;
+    for (i = 0; i < g_nwops; i++) {
+        const char *a = g_wops[i].act;
+        int w, h;
+        if (g_wops[i].done || now < g_wops[i].t) continue;
+        g_wops[i].done = 1;
+        fprintf(stderr, "[WINOP] t=%.1f %s\n", now, a);
+        if (!strcmp(a, "fs")) [g_window toggleFullScreen:nil];
+        else if (!strcmp(a, "min")) [g_window miniaturize:nil];
+        else if (!strcmp(a, "restore")) [g_window deminiaturize:nil];
+        else if (!strcmp(a, "wide")) {
+            extern int nv2a_widescreen(void);
+            extern void nv2a_set_widescreen(int on);
+            nv2a_set_widescreen(!nv2a_widescreen());
+            nv_window_shape_for_mode();
+        } else if (sscanf(a, "size %dx%d", &w, &h) == 2)
+            [g_window setContentSize:NSMakeSize(w, h)];
+        fflush(stderr);
+    }
+}
+
 /* Drain the event queue and draw. Main thread only. */
 void nv_window_pump(void)
 {
@@ -702,6 +1095,8 @@ void nv_window_pump(void)
         int have;
 
         if (!g_window) return;
+        key_script_step();
+        win_script_step();
         while ((e = [NSApp nextEventMatchingMask:NSEventMaskAny
                                        untilDate:[NSDate distantPast]
                                           inMode:NSDefaultRunLoopMode
@@ -725,12 +1120,12 @@ void nv_window_pump(void)
 
         pthread_mutex_lock(&g_lock);
         have = g_px_new;
-        if (g_window && ![g_window isKeyWindow] && (g_kb_buttons || g_kb_analog[0] ||
+        if (g_window && g_nkeys <= 0 && ![g_window isKeyWindow] && (g_kb_buttons || g_kb_analog[0] ||
             g_kb_analog[1] || g_kb_analog[2] || g_kb_analog[3] || g_kb_analog[4] ||
             g_kb_analog[5] || g_kb_analog[6] || g_kb_analog[7]))
             kb_release_all();
         pthread_mutex_unlock(&g_lock);
-        if (have) [g_view display];
+        if (have && g_view) [g_view display];
     }
 }
 
@@ -745,8 +1140,8 @@ void nv_window_size(int *w, int *h) { if (w) *w = g_w; if (h) *h = g_h; }
 void nv_window_drawable_size(int *w, int *h)
 {
     @autoreleasepool {
-        NSRect r = g_view ? [g_view convertRectToBacking:[g_view bounds]]
-                          : NSMakeRect(0, 0, g_w, g_h);
+        NSView *v = g_mview ? (NSView *)g_mview : (NSView *)g_view;
+        NSRect r = v ? [v convertRectToBacking:[v bounds]] : NSMakeRect(0, 0, g_w, g_h);
         if (w) *w = (int)r.size.width;
         if (h) *h = (int)r.size.height;
     }

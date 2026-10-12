@@ -16,6 +16,17 @@ if(WIN32)
     # Offline smoke test for the pure format layer (no D3D11 device needed).
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_smoke
                      ${CMAKE_CURRENT_BINARY_DIR}/d3d8_smoke)
+elseif(APPLE)
+    # Nothing to build: a title that brings its own D3D (JSRF's is linked into
+    # its executable) reaches the GPU through the pushbuffer and nv2a_gl, and
+    # the OpenGL D3D8 below wants SDL2 and libepoxy, which a Mac only has
+    # through a package manager -- the Intel Homebrew's x86_64 copies, which
+    # an arm64 build cannot link -- and an iPhone not at all. The headers
+    # stay available.
+    add_library(xbox_d3d8 INTERFACE)
+    target_include_directories(xbox_d3d8 INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xbox_d3d8 INTERFACE platform)
+    return()
 else()
     add_library(xbox_d3d8 STATIC
         d3d8_gl.c
