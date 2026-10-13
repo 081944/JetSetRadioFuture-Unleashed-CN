@@ -23,7 +23,7 @@ you own.
 |---|---|
 | macOS 12 or later, Apple Silicon (M1 or later) | [JSRF-Unleashed-macOS-arm64.zip](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-macOS-arm64.zip) |
 | Linux, x86_64 (glibc 2.34 or later: Ubuntu 22.04, Debian 12, Fedora 36 and newer) | [JSRF-Unleashed-linux-x86_64.tar.gz](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-linux-x86_64.tar.gz) — less tested than the Mac build |
-| iPhone and iPad, iOS 15 or later (iPhone XS or newer recommended) | [JSRF-Unleashed-iOS.ipa](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-iOS.ipa) — **new and experimental**: tested in the iOS Simulator, not yet on a real device |
+| iPhone and iPad, iOS 15 or later (iPhone XS or newer recommended) | [JSRF-Unleashed-iOS.ipa](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-iOS.ipa) — **new and experimental**: plays on iPhone, far less played than the Mac build |
 | Windows | not started |
 
 Every version is on the [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases) page; what changed is in the [changelog](CHANGELOG.md).
@@ -48,29 +48,60 @@ run writes `last-run.log` into the game folder (with a few older ones in
 
 ### Installing on iPhone or iPad
 
-The `.ipa` is not signed by Apple (that needs a paid developer account and
-the App Store), so it is installed with a sideloading tool, which signs it
-with your own Apple ID on the way in: [AltStore](https://altstore.io),
-[SideStore](https://sidestore.io) or [Sideloadly](https://sideloadly.io).
-With a free Apple ID the install lasts seven days and is then refreshed from
-the tool.
+The app is not on the App Store, so it is installed with **AltStore**, which
+signs it with your own Apple ID. The steps below use a Mac (AltServer also
+runs on Windows: see [altstore.io](https://altstore.io)).
+[SideStore](https://sidestore.io) and [Sideloadly](https://sideloadly.io) work
+too, with the same source or the `.ipa` from the release.
 
-1. Install the app. With **AltStore** or **SideStore**, add this source
-   (*Sources › +*) and install JSRF Unleashed from it — new versions then
-   show up there as updates:
+**1. Install AltStore** (once)
+
+1. Download [AltServer for macOS](https://cdn.altstore.io/file/altstore/altserver.zip),
+   unzip it, move **AltServer** to Applications and open it. It lives in the
+   menu bar.
+2. Plug the iPhone into the Mac, unlock it, and tap **Trust** if it asks.
+3. In Finder, select the iPhone and tick **Show this iPhone when on Wi-Fi**,
+   so AltStore can refresh apps later without the cable.
+4. Click the AltServer icon in the menu bar › **Install AltStore** › your
+   iPhone, and sign in with your Apple ID. If it asks to install a Mail
+   plug-in, follow its instructions.
+5. On the iPhone: **Settings › General › VPN & Device Management** › your
+   Apple ID › **Trust**.
+6. **Settings › Privacy & Security › Developer Mode** (iOS 16 or later): turn
+   it on and let the phone restart.
+
+**2. Install JSRF Unleashed**
+
+7. Open AltStore › **Sources** › **+**, and paste:
 
    ```
    https://raw.githubusercontent.com/JuMatt/JetSetRadioFuture-Unleashed/main/altstore/source.json
    ```
 
-   Or download `JSRF-Unleashed-iOS.ipa` from the release and install it with
-   any of the three. Open the app once: it shows where the game goes.
-2. Copy the game into the app's folder. In the **Files** app it is *On My
-   iPhone › JSRF Unleashed*; from a Mac, Finder › your iPhone › *Files* ›
-   JSRF Unleashed. Copy either the extracted game folder (the one with
-   `default.xbe` in it) or the disc image (`.iso`) — the app unpacks an image
-   once, and offers to delete it afterwards.
-3. Back in the app, it starts.
+8. **Browse** › **JSRF Unleashed** › **FREE**. New versions show up there as
+   updates.
+
+**3. Add your game**
+
+9. Open JSRF Unleashed once. It creates its folder and shows where the game
+   goes.
+10. Copy the game into **On My iPhone › JSRF Unleashed**: this folder, and
+    nowhere else. Copy either the disc image (`.iso`) or the extracted game
+    folder (the one with `default.xbe` in it; see [Your game files](#your-game-files)):
+    - from the Mac: Finder › your iPhone › **Files** tab, and drag it onto
+      **JSRF Unleashed**;
+    - on the iPhone: in the **Files** app, from iCloud Drive, Google Drive or
+      wherever it is.
+11. Back in the app: for an `.iso`, tap **Unpack** (once, a minute or two; it
+    then offers to delete the image). Then the game starts.
+
+> **Free Apple ID:** the app stops opening after **7 days**. Refresh it in
+> AltStore › **My Apps** › **Refresh All**, with the Mac on the same Wi-Fi and
+> AltServer running. A free Apple ID also allows only 3 sideloaded apps at a
+> time, AltStore included.
+>
+> **In the EU**, use this AltStore (AltStore Classic), not AltStore PAL: PAL
+> only installs apps notarised by Apple.
 
 A controller is the way to play (any one iOS supports: Xbox, PlayStation,
 MFi, Backbone and the like). Without one, the app shows on-screen controls,
@@ -142,7 +173,7 @@ Playable, early, and not yet played from start to finish.
 | Music, sound effects, voices | works |
 | Widescreen 16:9 | works in game; the title screen stays 4:3 |
 | Linux build | boots, menus, starting a new game; far less played than the Mac build |
-| iPhone / iPad build | new: plays in the iOS Simulator; not yet tried on a real device |
+| iPhone / iPad build | new: plays on iPhone; far less played than the Mac build |
 | Later areas | little tested — expect bugs |
 | Known issues | an occasional "disc error" screen during a load |
 
