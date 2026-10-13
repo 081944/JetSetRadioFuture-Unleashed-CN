@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/banner.png" width="640" alt="Jet Set Radio Future Unleashed">
+</p>
+
 # JSRF Unleashed
 
 **Jet Set Radio Future, running natively on Mac, Linux, iPhone and iPad.** Not an emulator — the
@@ -249,4 +253,6 @@ xemu is LGPL-2.1-or-later. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
   [docs/xboxrecomp-toolkit.md](docs/xboxrecomp-toolkit.md).
 - [xemu](https://xemu.app) — the NV2A and MCPX APU hardware models, without
   which none of the graphics or audio would exist.
+- The title lettering in the banner is set in
+  [Nise JSRF](https://www.dafont.com/nisejsrf.font), a free font by Yoyo.
 - Smilebit and SEGA, who made the game.
