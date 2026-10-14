@@ -14,12 +14,13 @@ renderer as the Windows and Linux builds, in its OpenGL ES dialect).
 | `build_apk.sh` | builds it all with the SDK's own tools (no Gradle) |
 
 Building needs the Android SDK with an NDK, build-tools and a platform, a JDK
-17 or later, CMake, SDL 2.30's source (its Java side is part of the app) and
+17 or later, CMake, SDL 2.32's source (its Java side is part of the app; 2.30.0 does
+not build with a recent NDK) and
 the generated code (`port/recomp/gen`, see the top-level README):
 
 ```sh
 JAVA_HOME=/path/to/jdk launcher/android/build_apk.sh ~/Library/Android/sdk \
-    /path/to/SDL2-2.30.0 port/recomp/gen 0.4.0 out
+    /path/to/SDL2-2.32.10 port/recomp/gen 0.4.0 out
 ```
 
 The game goes in the app's folder, `Android/data/com.jumatt.jsrfunleashed/files/game`

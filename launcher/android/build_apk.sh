@@ -7,7 +7,8 @@
 #   launcher/android/build_apk.sh <android sdk> <SDL2 source> <generated code> <version> [out dir]
 #
 #   <android sdk>     with ndk/, build-tools/, platforms/ (the newest of each is used)
-#   <SDL2 source>     SDL 2.30's source tree: its CMake build, and its Java side
+#   <SDL2 source>     SDL 2's source tree (2.32.10; 2.30.0 does not build with NDK r28 and
+#                     later): its CMake build, and its Java side
 #                     (android-project/.../org/libsdl/app), which the app is built on
 #   <generated code>  port/recomp/gen, the game's code (see the README)
 #
