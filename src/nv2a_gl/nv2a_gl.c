@@ -1446,6 +1446,48 @@ static volatile int    g_vs_hz;         /* what SDL says the display runs at */
  * 45 ms / longer). */
 static struct { uint64_t shown, dropped, on[5]; double last; } g_ps;
 
+#if defined(_WIN32)
+/* Windows' compositor knows exactly when the display refreshed last and how
+ * often it does (DwmGetCompositionTimingInfo): a better reference than when a
+ * swap returned, which with one frame in flight need not wait for anything.
+ * Fetched from dwmapi.dll when there; Wine fills in the period but not the
+ * time, and then the swaps are what there is. */
+#include <dwmapi.h>
+typedef HRESULT (WINAPI *DwmTimingFn)(HWND, DWM_TIMING_INFO *);
+static DwmTimingFn g_dwm_timing;
+static double      g_qpc_s;          /* seconds per QueryPerformanceCounter tick */
+static double      g_qpc_off;        /* mono_now() - QPC time, should be 0 */
+
+static void dwm_open(void)
+{
+    LARGE_INTEGER f, c;
+    HMODULE m = LoadLibraryW(L"dwmapi.dll");
+    if (m) g_dwm_timing = (DwmTimingFn)(void (*)(void))GetProcAddress(m, "DwmGetCompositionTimingInfo");
+    if (QueryPerformanceFrequency(&f) && f.QuadPart > 0 && QueryPerformanceCounter(&c)) {
+        g_qpc_s = 1.0 / (double)f.QuadPart;
+        g_qpc_off = mono_now() - (double)c.QuadPart * g_qpc_s;
+    } else {
+        g_dwm_timing = NULL;
+    }
+}
+
+/* The compositor's last refresh (in mono_now() time) and its period. */
+static int dwm_vblank(double *last, double *period)
+{
+    DWM_TIMING_INFO ti;
+    double p;
+    if (!g_dwm_timing) return 0;
+    memset(&ti, 0, sizeof ti);
+    ti.cbSize = sizeof ti;
+    if (g_dwm_timing(NULL, &ti) != S_OK || !ti.qpcRefreshPeriod || !ti.qpcVBlank) return 0;
+    p = (double)ti.qpcRefreshPeriod * g_qpc_s;
+    if (p < 0.004 || p > 0.05) return 0;
+    *period = p;
+    *last = (double)ti.qpcVBlank * g_qpc_s + g_qpc_off;
+    return 1;
+}
+#endif
+
 static int ps_bucket(double dt)
 {
     double p = g_vs_period;
@@ -1539,6 +1581,16 @@ static int SDLCALL pres_main(void *arg)
         fprintf(stderr, "[WIN] no synchronised swap: %s\n", SDL_GetError());
     glGenFramebuffers(3, fbo);
     pres_calibrate();
+#if defined(_WIN32)
+    { double l = 0.0, p = 0.0;
+      if (dwm_vblank(&l, &p))
+          fprintf(stderr, "[WIN] the compositor refreshes at %.3f Hz: frames are lined up with it\n",
+                  1.0 / p); }
+#endif
+    /* What was handed over while that ran is not counted as replaced. */
+    SDL_LockMutex(g_gs_mu);
+    seen = g_gs_serial ? g_gs_serial - 1 : 0;
+    SDL_UnlockMutex(g_gs_mu);
     report = mono_now() + 10.0;
     for (;;) {
         int slot, w, h, wide, ww = 0, wh = 0, fw, fh, dw, dh;
@@ -1614,6 +1666,9 @@ static void pres_start(void)
 #endif
     if (!want) return;
     if (SDL_GetWindowDisplayMode(g_window, &m) == 0) g_vs_hz = m.refresh_rate;
+#if defined(_WIN32)
+    dwm_open();
+#endif
     g_gs_mu = SDL_CreateMutex();
     g_gs_cv = SDL_CreateCond();
     SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
@@ -1697,11 +1752,16 @@ static void sdl_hand_over(GLuint src_fbo, int sw, int sh)
  * and a refresh to line the frames up against. 0 when it cannot. */
 static double pres_lock(double base, double *ref, double *refresh)
 {
-    double p = g_vs_period, n;
-    if (g_presenter != 1 || p <= 0.0 || base <= 0.0) return 0.0;
+    double p = g_vs_period, last = g_vs_last, n;
+    if (g_presenter != 1 || base <= 0.0) return 0.0;
+#if defined(_WIN32)
+    { double dl, dp;
+      if (dwm_vblank(&dl, &dp)) { p = dp; last = dl; } }
+#endif
+    if (p <= 0.0) return 0.0;
     n = floor(base / p + 0.5);
     if (n < 1.0 || fabs(n * p - base) > base * 0.03) return 0.0;
-    *ref = g_vs_last;
+    *ref = last;
     *refresh = p;
     return n * p;
 }
