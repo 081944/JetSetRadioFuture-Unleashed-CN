@@ -261,7 +261,7 @@ static int psh_emit(const Nv2aPshState *ps, char *buf, int bufsize, int msl)
                    "};\n\n");
     } else {
         sb(&s,
-           "#version 330 core\n"
+           NV2A_GLSL_VERSION
            /* Set by the backend when RECOMP_GL_ZVIEW is on; see the epilogue
             * at the foot of this emitter for why depth has to travel out
             * through the colour buffer on this platform. */
@@ -703,7 +703,7 @@ int nv2a_psh_emit_solid(char *buf, int bufsize, int msl)
                "{\n    // nv2a body\n    return F.drawTint;\n}\n", NV2A_MSL_BUF_FU);
     } else {
         sb(&s,
-           "#version 330 core\n"
+           NV2A_GLSL_VERSION
            "in vec4 oD0; in vec4 oD1; in vec4 oT0; in vec4 oT1; in vec4 oT2; in vec4 oT3;\n"
            "in float oFogC;\n"
            "uniform sampler2D tex0; uniform int texEnable; uniform vec2 texScale;\n"

@@ -59,7 +59,14 @@
 #elif defined(NV2A_GL_USE_SDL)
 #  include <SDL2/SDL.h>
 #  include <sys/stat.h>
-#  if defined(__APPLE__)
+#  if defined(NV2A_GLES)
+     /* OpenGL ES 3.2: Android, and Linux (Mesa), where this path is tested.
+      * The core entry points are the library's own exports; extensions are
+      * not linked against, so no prototypes for them. */
+#    undef GL_GLEXT_PROTOTYPES
+#    include <GLES3/gl32.h>
+#    include <GLES2/gl2ext.h>
+#  elif defined(__APPLE__)
 #    include <OpenGL/gl3.h>
 #    include <OpenGL/gl3ext.h>
 #  elif defined(_WIN32)
@@ -1012,6 +1019,11 @@ static int gl_init(uint32_t w, uint32_t h)
         fprintf(stderr, "  [GL] SDL_Init failed: %s\n", SDL_GetError());
         return 0;
     }
+#if defined(NV2A_GLES)
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+#else
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
@@ -1021,6 +1033,7 @@ static int gl_init(uint32_t w, uint32_t h)
      * game fails to compile. */
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS,
                         SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+#endif
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
 
@@ -5200,9 +5213,16 @@ static void do_draw(void)
                   glDepthFunc(dfn[pass]);
 
                   r[pass] = 0;
+#if defined(NV2A_GLES)
+                  /* OpenGL ES only says whether any passed: 0 or 1 here. */
+                  glBeginQuery(GL_ANY_SAMPLES_PASSED, qo);
+                  glDrawArrays(gl_mode_of(mode), 0, (GLsizei)out_n);
+                  glEndQuery(GL_ANY_SAMPLES_PASSED);
+#else
                   glBeginQuery(GL_SAMPLES_PASSED, qo);
                   glDrawArrays(gl_mode_of(mode), 0, (GLsizei)out_n);
                   glEndQuery(GL_SAMPLES_PASSED);
+#endif
                   glGetQueryObjectuiv(qo, GL_QUERY_RESULT, &r[pass]);
               }
               glDeleteQueries(1, &qo);

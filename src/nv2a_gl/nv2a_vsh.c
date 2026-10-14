@@ -354,7 +354,7 @@ static void emit_ilu_expr(SB *sb, const Nv2aVshInsn *ins)
 }
 
 static const char *GLSL_PRELUDE =
-"#version 330 core\n"
+NV2A_GLSL_VERSION
 "// NV2A vertex program, translated.\n"
 "// OpenGL's clip volume puts z in [-w, w]; the console's, like D3D's, in\n"
 "// [0, w]. The epilogue converts.\n"

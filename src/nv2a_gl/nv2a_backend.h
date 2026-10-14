@@ -162,6 +162,20 @@ enum {
 /* The shading language a backend compiles. */
 enum { NV2A_LANG_GLSL = 0, NV2A_LANG_MSL = 1 };
 
+/* The first lines of every GLSL program: OpenGL 3.3 core, or OpenGL ES 3.2
+ * (NV2A_GLES: Android), which wants its version line and then a precision for
+ * floats and ints -- a fragment shader has no default for floats -- and for
+ * the sampler types that have none. Spliced defines go after the first line
+ * (nv2a_gl.c's splice_define), which is still the #version. */
+#if defined(NV2A_GLES)
+#  define NV2A_GLSL_VERSION "#version 320 es\n"                               \
+    "precision highp float;\nprecision highp int;\n"                        \
+    "precision highp sampler2D;\nprecision highp sampler3D;\n"              \
+    "precision highp samplerCube;\nprecision highp sampler2DShadow;\n"
+#else
+#  define NV2A_GLSL_VERSION "#version 330 core\n"
+#endif
+
 /*
  * Every uniform the generated shaders read, by name.
  *

@@ -16,7 +16,12 @@
 #include "nv2a_backend.h"
 
 #define GL_GLEXT_PROTOTYPES 1
-#if defined(NV2A_GL_USE_CGL) || (defined(NV2A_GL_USE_SDL) && defined(__APPLE__))
+#if defined(NV2A_GLES)
+   /* OpenGL ES 3.2 (Android; Linux/Mesa for testing): see nv2a_gl.c. */
+#  undef GL_GLEXT_PROTOTYPES
+#  include <GLES3/gl32.h>
+#  include <GLES2/gl2ext.h>
+#elif defined(NV2A_GL_USE_CGL) || (defined(NV2A_GL_USE_SDL) && defined(__APPLE__))
 #  include <OpenGL/gl3.h>
 #  include <OpenGL/gl3ext.h>
 #elif defined(_WIN32)
@@ -28,6 +33,30 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+
+#if defined(NV2A_GLES)
+#include <string.h>
+/* Whether the context has an extension (asked once per name by the caller). */
+static int gles_has_ext(const char *name)
+{
+    GLint n = 0, i;
+    glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+    for (i = 0; i < n; i++) {
+        const char *e = (const char *)glGetStringi(GL_EXTENSIONS, (GLuint)i);
+        if (e && !strcmp(e, name)) return 1;
+    }
+    return 0;
+}
+static int gles_has_depth_clamp(void)
+{
+    static int has = -1;
+    if (has < 0) {
+        has = gles_has_ext("GL_EXT_depth_clamp");
+        fprintf(stderr, "  [GL] GL_EXT_depth_clamp: %s\n", has ? "yes" : "no (draws are clipped)");
+    }
+    return has;
+}
+#endif
 #include <string.h>
 
 /* Texture units 0..3 are the combiner stages. Creating or reading a texture
@@ -151,15 +180,30 @@ static uint32_t glx_target_snapshot(uint32_t h)
     return g_copy_tex;
 }
 
+#if defined(NV2A_GLES)
+/* OpenGL ES reads back RGBA bytes and nothing else for certain: BGRA is
+ * made here, in place. */
+static void rgba_to_bgra(uint8_t *p, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++, p += 4) { uint8_t t = p[0]; p[0] = p[2]; p[2] = t; }
+}
+#endif
+
 static int glx_target_read(uint32_t h, uint32_t x, uint32_t y, uint32_t w,
                            uint32_t ht, int bgra, void *out)
 {
     if (!rt_ok(h) || !out) return 0;
     glBindFramebuffer(GL_READ_FRAMEBUFFER, g_rt[h - 1].fbo);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
+#if defined(NV2A_GLES)
+    glReadPixels((GLint)x, (GLint)y, (GLsizei)w, (GLsizei)ht, GL_RGBA, GL_UNSIGNED_BYTE, out);
+    if (bgra) rgba_to_bgra((uint8_t *)out, (size_t)w * ht);
+#else
     glReadPixels((GLint)x, (GLint)y, (GLsizei)w, (GLsizei)ht,
                  bgra ? GL_BGRA : GL_RGBA,
                  bgra ? GL_UNSIGNED_INT_8_8_8_8_REV : GL_UNSIGNED_BYTE, out);
+#endif
     if (rt_ok(g_cur_rt))
         glBindFramebuffer(GL_READ_FRAMEBUFFER, g_rt[g_cur_rt - 1].fbo);
     return 1;
@@ -167,6 +211,11 @@ static int glx_target_read(uint32_t h, uint32_t x, uint32_t y, uint32_t w,
 
 static int glx_target_read_depth(uint32_t h, uint32_t pw, uint32_t ph, float *out)
 {
+#if defined(NV2A_GLES)
+    /* OpenGL ES cannot read a depth buffer back (a debugging dump only). */
+    (void)h; (void)pw; (void)ph; (void)out;
+    return 0;
+#endif
     if (!rt_ok(h) || !out) return 0;
     glBindFramebuffer(GL_READ_FRAMEBUFFER, g_rt[h - 1].fbo);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
@@ -226,9 +275,27 @@ static int glx_tex_read(uint32_t t, uint32_t w, uint32_t h, void *bgra)
 {
     (void)w; (void)h;
     if (!t || !bgra) return 0;
+#if defined(NV2A_GLES)
+    /* No glGetTexImage in OpenGL ES: read it through a framebuffer of its
+     * own, then put the read framebuffer back. */
+    {
+        static GLuint fb;
+        GLint prev = 0;
+        if (!fb) glGenFramebuffers(1, &fb);
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fb);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t, 0);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, bgra);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev);
+        rgba_to_bgra((uint8_t *)bgra, (size_t)w * h);
+    }
+#else
     scratch_bind(t);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glGetTexImage(GL_TEXTURE_2D, 0, GL_BGRA, GL_UNSIGNED_BYTE, bgra);
+#endif
     return 1;
 }
 
@@ -461,7 +528,15 @@ static void glx_state(const Nv2aRenderState *rs)
       clamp = force >= 0 ? force
             : ((rs->zclamp & 0xF0u) || rs->w_buffer) ? 1 : 0;
       if (clamp != g_last_clamp) {
+#if defined(NV2A_GLES)
+          /* OpenGL ES has depth clamping only as GL_EXT_depth_clamp (same
+           * enum). Without it the draw is clipped as GL would anyway. */
+          if (gles_has_depth_clamp()) {
+              if (clamp) glEnable(GL_DEPTH_CLAMP_EXT); else glDisable(GL_DEPTH_CLAMP_EXT);
+          }
+#else
           if (clamp) glEnable(GL_DEPTH_CLAMP); else glDisable(GL_DEPTH_CLAMP);
+#endif
           g_last_clamp = clamp;
       } }
     { static uint32_t last_cm = 0xFFFFFFFFu;
@@ -676,7 +751,11 @@ static void glx_clear(unsigned mask, const float rgba[4], float depth,
         bits |= GL_COLOR_BUFFER_BIT;
     }
     if (mask & 2u) {
+#if defined(NV2A_GLES)
+        glClearDepthf(depth);
+#else
         glClearDepth((double)depth);
+#endif
         glDepthMask(GL_TRUE);
         g_last.depth_mask = -1;   /* the clear forced it; re-apply next draw */
         bits |= GL_DEPTH_BUFFER_BIT;
