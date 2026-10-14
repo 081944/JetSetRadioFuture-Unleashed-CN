@@ -153,7 +153,8 @@ OpenGL 3.3 drivers and an X11 or Wayland desktop; SDL2 is bundled. The
 and where settings, saves and logs are kept.
 
 On Linux the keyboard layout is the same as below; **F11** (or Alt+Return)
-toggles full screen and **F10** widescreen.
+toggles full screen, **F10** widescreen, and **F9** sets the resolution (1× to
+4×; the game restarts to apply it).
 
 ### Your game files
 

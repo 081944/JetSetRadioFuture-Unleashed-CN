@@ -17,13 +17,15 @@ page.
   and OpenGL renderer as the Linux build, controllers through SDL, the
   keyboard. Played under CrossOver on a Mac and under Wine on Linux (boot,
   title, loading a save, the garage); not yet on a Windows PC.
-- On Windows, **F9** sets the resolution — 1× to 4× the Xbox's 640×480, up to
-  2560×1920 — and restarts the game to apply it; **F10** switches widescreen
-  and **F11** full screen. The resolution and widescreen are remembered (on
-  Windows, widescreen was forgotten at every start). Linux builds made from
-  this source have F9 as well.
-- The Mac, Linux and iPhone downloads are 0.2.0's, unchanged (they call
-  themselves 0.2.0); AltStore keeps offering 0.2.0.
+- On Windows and Linux, **F9** sets the resolution — 1× to 4× the Xbox's
+  640×480, up to 2560×1920 — and restarts the game to apply it; **F10**
+  switches widescreen and **F11** full screen. The resolution and widescreen
+  are remembered (on Windows, widescreen was forgotten at every start).
+- **Linux**: rebuilt from the 0.3.0 tag for F9; nothing else changes for it.
+  (For the first hour after the release, the Linux download was still 0.2.0's
+  build.)
+- The Mac and iPhone downloads are 0.2.0's, unchanged (they call themselves
+  0.2.0); AltStore keeps offering 0.2.0.
 - Docs: saves are kept in the game folder, in `UDATA`, on every platform — not
   in Application Support (Mac), `~/.local/share` (Linux) or `Saves` (iPhone),
   as the README said.

@@ -14,7 +14,7 @@
 #   ./jsrf-unleashed --version        which version this is
 #
 # A .iso of your disc is unpacked once, if extract-xiso is installed.
-# In game: F11 (or Alt+Return) full screen, F10 widescreen 16:9.
+# In game: F11 (or Alt+Return) full screen, F10 widescreen 16:9, F9 resolution.
 #
 set -u
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
