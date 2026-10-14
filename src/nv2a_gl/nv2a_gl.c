@@ -1400,6 +1400,9 @@ static void sdl_choose_scale(void)
      * looked hung until Alt+F4 closed the box it could not see. So full
      * screen is left while it is up, and put back if nothing is chosen. */
     was_fs = (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0;
+#if defined(__ANDROID__)
+    was_fs = 0;     /* the app is always full screen, and the box shows over it */
+#endif
     if (was_fs) sdl_toggle_fullscreen();
     for (i = 0; i < 4; i++) {
         b[i].flags    = i + 1 == cur ? SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT : 0;
