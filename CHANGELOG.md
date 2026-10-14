@@ -10,6 +10,31 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.4.2 — 14 October 2026
+
+- **Windows: Xbox controllers work.** An Xbox pad was found and opened but
+  its input never arrived: SDL hands it to a hidden window, which belonged to
+  the game's own thread, and that thread never reads its messages. SDL now
+  keeps a thread of its own for it, which also finds pads plugged in later.
+  The log lists the input devices SDL sees (`[PAD]` lines in
+  `last-run.log`).
+- **Windows: a Video menu** at the top of the window, as on the Mac: the
+  resolution (1× to 4×), widescreen and full screen. It is hidden in full
+  screen; **F9**, **F10** and **F11** still work everywhere. F9 in full
+  screen no longer looks like a hang: its box was hidden behind the game
+  until Alt+F4 closed it, so the resolution never changed. Full screen is now
+  left while the box is up.
+- **A faster renderer** (in the Windows build; the Linux and Android ones get
+  it when they are next updated). Geometry that does not change stays on the
+  graphics card between frames instead of being converted and sent again
+  every frame (about 15 MB a frame in the busy scenes), and the game's
+  constants are sent only when they change: the renderer's own work in a
+  busy frame went from about 9 ms to under 2 on the test machine, which
+  leaves more of each sixtieth of a second to the game. Played under
+  CrossOver on a Mac.
+- The Android download is 0.4.0's, the Linux download 0.3.1's, and the Mac
+  and iPhone downloads are 0.2.0's, unchanged; AltStore keeps offering 0.2.0.
+
 ## 0.4.1 — 14 October 2026
 
 - **Windows: smoother frames.** Each frame now reaches the screen in step

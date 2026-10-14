@@ -63,6 +63,9 @@ Keyboard (by key position, so W A S D on QWERTY is Z Q S D on AZERTY):
                      640x480 (2x by default), up to 2560x1920; remembered.
                      The game restarts to apply it, so save first.
 
+The Video menu at the top of the window has the same three. It is hidden in
+full screen, where the keys still work.
+
 
 Where things are kept
 ---------------------

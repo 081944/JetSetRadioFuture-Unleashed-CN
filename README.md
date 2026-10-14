@@ -64,9 +64,11 @@ Each run writes `last-run.log` into the game folder (with a few older ones in
    unpack once into `%LOCALAPPDATA%\JSRF Unleashed`. It remembers the choice.
 
 It needs graphics drivers with OpenGL 3.3, which any GPU from the last ten
-years has. **F9** sets the resolution, from 1× to 4× the Xbox's 640×480
-(2× by default; the game restarts to apply it), **F10** switches widescreen
-16:9 and **F11** (or Alt+Enter) full screen; the first two are remembered.
+years has. The **Video** menu at the top of the window sets the resolution,
+from 1× to 4× the Xbox's 640×480 (2× by default; the game restarts to apply
+it), widescreen 16:9 and full screen; the first two are remembered. The same
+are on **F9**, **F10** and **F11** (or Alt+Enter), which also work in full
+screen, where the menu is hidden.
 Controllers work through SDL: Xbox, PlayStation, Switch Pro and many more.
 Saves are kept in the game folder, in `UDATA`, as on the Mac. The
 `README.txt` inside lists the options and where the settings and logs
