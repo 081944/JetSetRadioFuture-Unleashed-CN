@@ -1009,6 +1009,10 @@ static int gl_init(uint32_t w, uint32_t h)
 
 #elif defined(NV2A_GL_USE_SDL)
 
+#if !defined(NV2A_GLES)
+static void pres_start(void);        /* the presenter, below */
+#endif
+
 static int gl_init(uint32_t w, uint32_t h)
 {
     /* A real window, sized to the guest surface. The frame is still built in
@@ -1079,6 +1083,10 @@ static int gl_init(uint32_t w, uint32_t h)
      * thread that runs the GPU. RECOMP_VSYNC=1 asks for it anyway. */
     { const char *v = getenv("RECOMP_VSYNC");
       SDL_GL_SetSwapInterval(v && atoi(v) ? 1 : 0); }
+#if !defined(NV2A_GLES)
+    /* Or, on Windows, a presenter thread swaps in step with the display. */
+    pres_start();
+#endif
     if (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN_DESKTOP)
         SDL_ShowCursor(SDL_DISABLE);
     fprintf(stderr, "  [WIN] SDL window (%s video), %s\n", SDL_GetCurrentVideoDriver(),
@@ -1382,6 +1390,322 @@ static void sdl_present(GLuint src_fbo, int sw, int sh)
                   said, sw, sh, ww, wh, dw, dh);
       } }
 }
+
+/* ---- the presenter: frames reach the screen from a thread of their own ---
+ *
+ * Presenting straight from the GPU thread at the flip cannot wait for the
+ * display. That thread also answers the title's vblank interrupt while it
+ * paces the frame (frame_pace), and the title holds the guest lock until it
+ * does: blocked in a synchronised swap, every guest thread would wait with
+ * it. So the swap was never synchronised (interval 0) and a frame reached the
+ * screen whenever it was finished. On Windows, where the compositor shows the
+ * newest frame at each refresh, the game's own 60 Hz clock and the display's
+ * drift against each other, and every so often a frame is shown twice and the
+ * next not at all -- a stutter; in full screen, tearing as well.
+ *
+ * Now it goes as the Metal renderer does it on the Mac. The flip only hands
+ * the frame over: a copy on the GPU into one of three textures, and a fence.
+ * A presenter thread, with a context of its own that shares those textures,
+ * puts the newest one on screen with the swap synchronised to the display,
+ * for as long as that takes; nothing else waits on it. It also measures the
+ * display's refresh, and frame_pace then paces the game at that rate (or at a
+ * whole fraction of it, when that is within 3% of 60 Hz) and lands each frame
+ * half a refresh before the next one, so that each is shown exactly once.
+ *
+ * On by default on Windows. RECOMP_GL_PRESENTER=1 turns it on elsewhere
+ * (Linux, with GLX), 0 off -- the swap at the flip, as before. Not on
+ * Android: EGL lets a window surface be current on one thread only.
+ */
+#if !defined(NV2A_GLES)
+#define NV2A_SDL_PRESENTER 1
+
+typedef struct {
+    GLuint   tex, fbo;       /* the GL thread's: the copy, and a framebuffer on it */
+    int      w, h, wide;     /* the frame's size; a 16:9 scene (nv2a_wide_scene) */
+    unsigned gen;            /* changes when the texture is given new storage */
+    GLsync   fence;          /* signalled when the copy is done */
+} GlShown;
+static GlShown       g_gs[3];
+static SDL_mutex    *g_gs_mu;
+static SDL_cond     *g_gs_cv;
+static int           g_gs_new = -1;     /* the newest slot handed over */
+static int           g_gs_busy = -1;    /* the slot being put on screen */
+static uint64_t      g_gs_serial;       /* frames handed over so far */
+static SDL_GLContext g_pres_ctx;
+static volatile int  g_presenter;       /* 0 not used, 1 running, -1 failed */
+
+/* The display as the presenter measured it, for frame_pace: seconds per
+ * refresh (0: unknown, the swap does not wait for it), and when the last
+ * swap ended (mono_now). */
+static volatile double g_vs_period, g_vs_last;
+static volatile int    g_vs_hz;         /* what SDL says the display runs at */
+
+/* How it went: frames shown, frames replaced before they could be, and how
+ * long each stayed on screen, in refreshes (1, 2, 3, 4 or more; or, with no
+ * refresh to count in, under 14 ms / about 1/60 s / up to 30 ms / up to
+ * 45 ms / longer). */
+static struct { uint64_t shown, dropped, on[5]; double last; } g_ps;
+
+static int ps_bucket(double dt)
+{
+    double p = g_vs_period;
+    if (p > 0.0) {
+        int n = (int)(dt / p + 0.5);
+        return n <= 1 ? 0 : n >= 5 ? 4 : n - 1;
+    }
+    return dt < 0.014 ? 0 : dt < 0.0195 ? 1 : dt < 0.030 ? 2 : dt < 0.045 ? 3 : 4;
+}
+
+static void ps_line(const char *what, const uint64_t *on, uint64_t shown, uint64_t dropped)
+{
+    if (g_vs_period > 0.0)
+        fprintf(stderr, "[PRESENT] %s: %llu frames shown, %llu replaced before they could be; "
+                "on screen for 1 refresh %llu, 2 %llu, 3 %llu, 4 %llu, more %llu "
+                "(display %.2f Hz)\n", what,
+                (unsigned long long)shown, (unsigned long long)dropped,
+                (unsigned long long)on[0], (unsigned long long)on[1], (unsigned long long)on[2],
+                (unsigned long long)on[3], (unsigned long long)on[4], 1.0 / g_vs_period);
+    else
+        fprintf(stderr, "[PRESENT] %s: %llu frames shown, %llu replaced before they could be; "
+                "on screen under 14 ms %llu, a 60th of a second %llu, 19-30 ms %llu, "
+                "30-45 ms %llu, longer %llu (the swap does not wait for the display)\n", what,
+                (unsigned long long)shown, (unsigned long long)dropped,
+                (unsigned long long)on[0], (unsigned long long)on[1], (unsigned long long)on[2],
+                (unsigned long long)on[3], (unsigned long long)on[4]);
+}
+
+static void pres_clear(void)
+{
+    int ww = 0, wh = 0;
+    SDL_GL_GetDrawableSize(g_window, &ww, &wh);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glViewport(0, 0, ww > 0 ? ww : 1, wh > 0 ? wh : 1);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+}
+
+/* How long a synchronised swap takes, with nothing else going on: the
+ * display's refresh -- or next to nothing, when the driver does not wait
+ * (vsync turned off in its control panel, a remote desktop, a VM). */
+static void pres_calibrate(void)
+{
+    enum { N = 40, SKIP = 8 };
+    double t[N], iv[N], sum = 0.0, med;
+    int i, j, n = 0, kept = 0;
+    for (i = 0; i < N; i++) {
+        pres_clear();
+        SDL_GL_SwapWindow(g_window);
+        glFinish();
+        t[i] = mono_now();
+    }
+    for (i = SKIP + 1; i < N; i++) iv[n++] = t[i] - t[i - 1];
+    for (i = 1; i < n; i++)                         /* sort, for the median */
+        for (j = i; j > 0 && iv[j - 1] > iv[j]; j--) { double x = iv[j]; iv[j] = iv[j - 1]; iv[j - 1] = x; }
+    med = iv[n / 2];
+    for (i = 0; i < n; i++)
+        if (iv[i] > med * 0.9 && iv[i] < med * 1.1) { sum += iv[i]; kept++; }
+    if (med >= 0.004 && med <= 0.05 && kept >= n * 3 / 4) {
+        g_vs_period = sum / kept;
+        fprintf(stderr, "[WIN] display: %.3f Hz, measured over %d swaps (%d Hz reported)\n",
+                1.0 / g_vs_period, kept, g_vs_hz);
+    } else {
+        g_vs_period = 0.0;
+        fprintf(stderr, "[WIN] the swap does not wait for the display (a swap takes %.2f ms; "
+                "%d Hz reported): frames are paced by the game's clock\n", med * 1000.0, g_vs_hz);
+    }
+    g_vs_last = mono_now();
+}
+
+static int SDLCALL pres_main(void *arg)
+{
+    GLuint fbo[3] = { 0, 0, 0 };
+    uint64_t seen = 0, shown0 = 0, dropped0 = 0, on0[5] = { 0, 0, 0, 0, 0 };
+    double report = 0.0;
+    int told = 0;
+    (void)arg;
+    if (SDL_GL_MakeCurrent(g_window, g_pres_ctx) != 0) {
+        fprintf(stderr, "[WIN] the presenter has no context (%s): frames are shown at the flip\n",
+                SDL_GetError());
+        g_presenter = -1;
+        return 0;
+    }
+    /* No epoxy_handle_external_wglMakeCurrent here: it switches libepoxy to
+     * per-thread function tables, which then exist only on the threads that
+     * called it -- the GPU thread died on its next shader. Both contexts have
+     * the window's pixel format and the same driver, so the entry points
+     * libepoxy has already fetched are good for both. */
+    SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH);
+    if (SDL_GL_SetSwapInterval(1) != 0)
+        fprintf(stderr, "[WIN] no synchronised swap: %s\n", SDL_GetError());
+    glGenFramebuffers(3, fbo);
+    pres_calibrate();
+    report = mono_now() + 10.0;
+    for (;;) {
+        int slot, w, h, wide, ww = 0, wh = 0, fw, fh, dw, dh;
+        GLuint tex;
+        GLsync fence;
+        uint64_t serial;
+        double t;
+        SDL_LockMutex(g_gs_mu);
+        while (g_gs_serial == seen) SDL_CondWait(g_gs_cv, g_gs_mu);
+        slot = g_gs_new;
+        serial = g_gs_serial;
+        g_gs_busy = slot;
+        tex = g_gs[slot].tex; w = g_gs[slot].w; h = g_gs[slot].h; wide = g_gs[slot].wide;
+        fence = g_gs[slot].fence;
+        SDL_UnlockMutex(g_gs_mu);
+        if (serial - seen > 1) g_ps.dropped += serial - seen - 1;
+        seen = serial;
+
+        if (fence) glWaitSync(fence, 0, GL_TIMEOUT_IGNORED);
+        /* Attached afresh each time: what one context did to a shared texture
+         * is only promised to the other once it binds it again. */
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo[slot]);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+        SDL_GL_GetDrawableSize(g_window, &ww, &wh);
+        pres_clear();
+        if (ww > 0 && wh > 0 && w > 0 && h > 0) {
+            fw = w; fh = h;
+            if (wide) { fw = 16; fh = 9; }
+            dw = ww; dh = wh;
+            if ((long)ww * fh > (long)wh * fw) dw = (int)((long)wh * fw / fh);
+            else                               dh = (int)((long)ww * fh / fw);
+            glBlitFramebuffer(0, 0, w, h,
+                              (ww - dw) / 2, (wh - dh) / 2, (ww - dw) / 2 + dw, (wh - dh) / 2 + dh,
+                              GL_COLOR_BUFFER_BIT, GL_LINEAR);
+            if (told < 3) {
+                told++;
+                fprintf(stderr, "[WIN] presented #%d: %dx%d frame into %dx%d (%dx%d), from the "
+                        "presenter\n", told, w, h, ww, wh, dw, dh);
+            }
+        }
+        SDL_GL_SwapWindow(g_window);
+        glFinish();                     /* the swap done: when the display took it */
+        t = mono_now();
+        SDL_LockMutex(g_gs_mu);
+        g_gs_busy = -1;
+        SDL_UnlockMutex(g_gs_mu);
+
+        if (g_ps.last > 0.0) g_ps.on[ps_bucket(t - g_ps.last)]++;
+        g_ps.last = t;
+        g_ps.shown++;
+        g_vs_last = t;
+        if (t >= report) {
+            uint64_t on[5];
+            int i;
+            for (i = 0; i < 5; i++) { on[i] = g_ps.on[i] - on0[i]; on0[i] = g_ps.on[i]; }
+            ps_line("the last 10 s", on, g_ps.shown - shown0, g_ps.dropped - dropped0);
+            shown0 = g_ps.shown; dropped0 = g_ps.dropped;
+            report = t + 10.0;
+        }
+    }
+    return 0;
+}
+
+/* On the GL thread, with its context current, once the window is open. */
+static void pres_start(void)
+{
+    const char *e = getenv("RECOMP_GL_PRESENTER");
+    SDL_DisplayMode m;
+#if defined(_WIN32)
+    int want = !(e && e[0] == '0');
+#else
+    int want = e && e[0] == '1';
+#endif
+    if (!want) return;
+    if (SDL_GetWindowDisplayMode(g_window, &m) == 0) g_vs_hz = m.refresh_rate;
+    g_gs_mu = SDL_CreateMutex();
+    g_gs_cv = SDL_CreateCond();
+    SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+    g_pres_ctx = SDL_GL_CreateContext(g_window);         /* current on this thread for now */
+    SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
+    SDL_GL_MakeCurrent(g_window, g_sdl_ctx);
+    if (!g_gs_mu || !g_gs_cv || !g_pres_ctx) {
+        fprintf(stderr, "[WIN] no presenter (%s): frames are shown at the flip\n", SDL_GetError());
+        g_presenter = -1;
+        return;
+    }
+    g_presenter = 1;
+    if (!SDL_CreateThread(pres_main, "nv2a-present", NULL)) {
+        fprintf(stderr, "[WIN] no presenter thread (%s): frames are shown at the flip\n",
+                SDL_GetError());
+        g_presenter = -1;
+        return;
+    }
+    fprintf(stderr, "[WIN] frames are put on screen by a presenter thread, in step with the display\n");
+}
+
+/* The flip's half: copy the finished frame into a free slot and say so. */
+static void sdl_hand_over(GLuint src_fbo, int sw, int sh)
+{
+    GLint rfb = 0, dfb = 0;
+    GLboolean sc = glIsEnabled(GL_SCISSOR_TEST), cm[4];
+    GlShown *s;
+    int slot = 0, i;
+    if (sw <= 0 || sh <= 0) return;
+    SDL_LockMutex(g_gs_mu);
+    for (i = 0; i < 3; i++)
+        if (i != g_gs_new && i != g_gs_busy) { slot = i; break; }
+    SDL_UnlockMutex(g_gs_mu);
+    s = &g_gs[slot];
+    glGetBooleanv(GL_COLOR_WRITEMASK, cm);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &rfb);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dfb);
+    if (!s->tex || s->w != sw || s->h != sh) {
+        GLint act = 0, prev = 0;
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &act);
+        glActiveTexture(GL_TEXTURE7);           /* a unit no shader samples */
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev);
+        if (!s->tex) glGenTextures(1, &s->tex);
+        glBindTexture(GL_TEXTURE_2D, s->tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, sw, sh, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_2D, (GLuint)prev);
+        glActiveTexture((GLenum)act);
+        if (!s->fbo) glGenFramebuffers(1, &s->fbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s->fbo);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s->tex, 0);
+        s->w = sw;
+        s->h = sh;
+        s->gen++;
+    }
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, src_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s->fbo);
+    glBlitFramebuffer(0, 0, sw, sh, 0, 0, sw, sh, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    if (s->fence) glDeleteSync(s->fence);
+    s->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();                                  /* the copy and the fence on their way */
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)rfb);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)dfb);
+    if (sc) glEnable(GL_SCISSOR_TEST);
+    glColorMask(cm[0], cm[1], cm[2], cm[3]);
+    SDL_LockMutex(g_gs_mu);
+    s->wide = nv2a_wide_scene();
+    g_gs_new = slot;
+    g_gs_serial++;
+    SDL_CondSignal(g_gs_cv);
+    SDL_UnlockMutex(g_gs_mu);
+}
+
+/* For frame_pace: the period to pace the game at when the display can set
+ * it -- a whole number of its refreshes within 3% of the game's own period --
+ * and a refresh to line the frames up against. 0 when it cannot. */
+static double pres_lock(double base, double *ref, double *refresh)
+{
+    double p = g_vs_period, n;
+    if (g_presenter != 1 || p <= 0.0 || base <= 0.0) return 0.0;
+    n = floor(base / p + 0.5);
+    if (n < 1.0 || fabs(n * p - base) > base * 0.03) return 0.0;
+    *ref = g_vs_last;
+    *refresh = p;
+    return n * p;
+}
+#endif /* !NV2A_GLES */
 
 static void sdl_pump(void)
 {
@@ -7288,7 +7612,29 @@ static void frame_pace(void)
              */
             now = mono_now();
             if (deadline == 0.0 || deadline < now - 1.0) deadline = now;
+#if defined(NV2A_SDL_PRESENTER)
+            {
+                /* In step with the display, when the presenter has measured
+                 * one that runs at the game's rate or a whole multiple of it
+                 * (pres_lock): its period, and each frame handed over half a
+                 * refresh before the one that will show it -- as far as can
+                 * be from either, so that each is shown exactly once. Eased
+                 * towards, a fifth of the way each frame. */
+                double ref = 0.0, refresh = 0.0, lp = pres_lock(period, &ref, &refresh);
+                if (lp > 0.0) {
+                    deadline += lp;
+                    if (ref > 0.0 && now - ref < 0.25) {
+                        double ph = fmod(deadline - ref, refresh);
+                        if (ph < 0.0) ph += refresh;
+                        deadline -= (ph - 0.5 * refresh) * 0.2;
+                    }
+                } else {
+                    deadline += period;
+                }
+            }
+#else
             deadline += period;
+#endif
             g_pace_st.frames++;
             if (now > deadline) {
                 double l = (now - deadline) * 1000.0;
@@ -7433,6 +7779,10 @@ static void present(int is_frame)
         }
 #elif defined(NV2A_GL_USE_SDL)
         if (g_window) {
+#if defined(NV2A_SDL_PRESENTER)
+            if (g_presenter == 1) sdl_hand_over(nv2a_gfx_gl_fbo(prt), (int)pw, (int)ph);
+            else
+#endif
             sdl_present(nv2a_gfx_gl_fbo(prt), (int)pw, (int)ph);
             sdl_pump();
         }
@@ -8592,6 +8942,9 @@ unsigned long nv2a_gl_progress(void) { return (unsigned long)S.flips; }
 void nv2a_gl_report(void)
 {
     if (!nv2a_gl_enabled()) return;
+#if defined(NV2A_SDL_PRESENTER)
+    if (g_presenter == 1) ps_line("the whole run", g_ps.on, g_ps.shown, g_ps.dropped);
+#endif
     if (g_pace_st.frames) {
         uint64_t n = g_pace_st.iv[0] + g_pace_st.iv[1] + g_pace_st.iv[2]
                    + g_pace_st.iv[3] + g_pace_st.iv[4];
