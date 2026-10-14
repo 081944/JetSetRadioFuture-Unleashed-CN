@@ -1,13 +1,31 @@
 # Changelog
 
 Releases are tagged `vX.Y.Z` and built from that tag: the Mac app, the Windows
-and Linux builds and the iPhone app say which version they are (Finder › Get
-Info, `JSRF Unleashed.exe --version` on Windows, `./jsrf-unleashed --version`
-on Linux, the ⚙ button on iPhone), and so does the first line of every log. A
+and Linux builds and the iPhone and Android apps say which version they are
+(Finder › Get Info, `JSRF Unleashed.exe --version` on Windows,
+`./jsrf-unleashed --version` on Linux, the ⚙ button on iPhone and Android),
+and so does the first line of every log. A
 download with nothing new for its platform is carried over unchanged and keeps
 its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
+
+## 0.4.0 — 14 October 2026
+
+- **Android** (new): `JSRF-Unleashed-android-arm64.apk`, for
+  Android 10 and later on 64-bit phones and tablets with OpenGL ES 3.0. Its
+  first screen unpacks your disc image (`.iso`) into the app, or takes the
+  extracted game folder copied over USB. Controllers through SDL, on-screen
+  controls as on iPhone (a stick, the pad's buttons, Start and Back at the
+  top), a keyboard; Android's Back is the Xbox Back button. The ⚙ button has
+  widescreen, the on-screen controls and the resolution. The renderer is the
+  Windows and Linux one, in OpenGL ES. Played in the Android emulator
+  (unpacking a disc image, boot, title, attract demo, the controls and the
+  settings); not yet on a phone.
+- The Windows download is 0.3.0's, the Linux download 0.3.1's, and the Mac
+  and iPhone downloads are 0.2.0's, unchanged; AltStore keeps offering 0.2.0.
+- Building: `launcher/android/` has the app and `build_apk.sh`, which builds
+  it with the Android SDK's own tools (the NDK, aapt2, d8; no Gradle).
 
 ## 0.3.1 — 14 October 2026
 

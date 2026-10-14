@@ -4,7 +4,7 @@
 
 # JSRF Unleashed
 
-**Jet Set Radio Future, running natively on Mac, Windows, Linux, iPhone and iPad.** Not an emulator — the
+**Jet Set Radio Future, running natively on Mac, Windows, Linux, Android, iPhone and iPad.** Not an emulator — the
 game's own code, statically recompiled into C and built as a native
 application.
 
@@ -29,6 +29,7 @@ you own.
 | Linux, x86_64 (glibc 2.34 or later: Ubuntu 22.04, Debian 12, Fedora 36 and newer) | [JSRF-Unleashed-linux-x86_64.tar.gz](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-linux-x86_64.tar.gz) — less tested than the Mac build |
 | iPhone and iPad, iOS 15 or later (iPhone XS or newer recommended) | [JSRF-Unleashed-iOS.ipa](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-iOS.ipa) — less tested on iPads |
 | Windows 10 or 11, 64-bit | [JSRF-Unleashed-windows-x86_64.zip](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-windows-x86_64.zip) — tested under Wine |
+| Android 10 or later, 64-bit, OpenGL ES 3.0 | [JSRF-Unleashed-android-arm64.apk](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-android-arm64.apk) — tested in the Android emulator |
 
 Every version is on the [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases) page; what changed is in the [changelog](CHANGELOG.md).
 
@@ -142,6 +143,35 @@ is in `Logs`.
 The game's memory map needs 4 GB of address space, which recent iPhones give
 an app. If an older device does not, the app says so when it starts.
 
+### Installing on Android
+
+1. Download **JSRF-Unleashed-android-arm64.apk** on the phone and open it.
+   It is not on Google Play, so Android asks you to allow installing apps
+   from your browser (or file manager): allow it, then **Install**.
+2. Open **JSRF Unleashed**. It shows where the game goes, and two ways to put
+   it there (see [Your game files](#your-game-files)):
+   - **Choose the disc image (.iso)**: pick your image, wherever it is; the
+     app unpacks it once into its own folder (about 3 GB of free space);
+   - or copy the extracted game folder (the one with `default.xbe` and `Media`
+     in it) from a computer over USB, named `game`, into
+     `Android/data/com.jumatt.jsrfunleashed/files/`, then tap
+     **I copied the folder: start**.
+3. The game starts, and from then on it starts straight away.
+
+A controller is the way to play: Xbox, PlayStation, Switch Pro and others,
+over Bluetooth or USB. Without one, the app shows on-screen controls, as on
+iPhone, with Start and Back at the top; Android's Back is the Xbox Back
+button. The ⚙ button has widescreen, the on-screen controls and the
+resolution (used from the next start). Saves are kept in the game folder (in
+`UDATA`), so **uninstalling the app deletes them** with the game: copy `UDATA`
+somewhere first. Each run's log is
+`Android/data/com.jumatt.jsrfunleashed/files/Logs/last-run.log`.
+
+It needs Android 10 or later on a 64-bit phone or tablet with OpenGL ES 3.0
+(any from the last several years). So far it has been run in the Android
+emulator only — unpacking a disc image, boot, title, attract demo, the
+on-screen controls — not on a phone yet: reports are welcome.
+
 ### Installing on Linux
 
 Extract the archive anywhere and run `./jsrf-unleashed`. The first time, it
@@ -166,7 +196,8 @@ you want the folder with `default.xbe`, `Media/` and the rest.
 ## Playing
 
 **Controller:** any pad macOS recognises — Xbox, DualSense, DualShock 4 and
-others, over Bluetooth or USB. On Windows and Linux, any pad SDL knows.
+others, over Bluetooth or USB. On Windows, Linux and Android, any pad SDL
+knows.
 
 **Keyboard.** Keys go by position, so `W A S D` on a QWERTY keyboard is
 `Z Q S D` on an AZERTY one:
@@ -206,6 +237,7 @@ Playable, early, and not yet played from start to finish.
 | Linux build | boots, menus, starting a new game; far less played than the Mac build |
 | Windows build | tested under Wine |
 | iPhone / iPad build | plays on iPhone; less tested on iPads |
+| Android build | boots to the title and the attract demo in the Android emulator; not yet tried on a phone |
 | Later areas | little tested — expect bugs |
 | Known issues | an occasional "disc error" screen during a load |
 
@@ -254,7 +286,10 @@ and the toolchain file
 [`launcher/windows/package.sh`](launcher/windows/package.sh) packages it and
 records the rest (SDL2, libepoxy). For iPhone and iPad, see
 [docs/ios.md](docs/ios.md) (Xcode's iOS SDK, the same CMake project,
-[`launcher/ios/package_ios.sh`](launcher/ios/package_ios.sh) for the `.ipa`).
+[`launcher/ios/package_ios.sh`](launcher/ios/package_ios.sh) for the `.ipa`); for
+Android, [launcher/android/README.md](launcher/android/README.md) (the NDK, SDL
+2.32's source, [`launcher/android/build_apk.sh`](launcher/android/build_apk.sh)
+for the `.apk`, no Gradle).
 How the Mac and iPhone renderer works is in
 [docs/metal-backend.md](docs/metal-backend.md). The version comes from the git
 tag the tree is at.
