@@ -127,6 +127,11 @@ too, with the same source or the `.ipa` from the release.
 11. Back in the app: for an `.iso`, tap **Unpack** (once, a minute or two; it
     then offers to delete the image). Then the game starts.
 
+> **Updates:** when a new version is out, AltStore shows it in **My Apps**:
+> tap **Update** (with AltServer reachable, as for a refresh). It installs
+> over the app and keeps the game and your saves; deleting the app first
+> deletes them.
+>
 > **Free Apple ID:** the app stops opening after **7 days**. Refresh it in
 > AltStore › **My Apps** › **Refresh All**, with the Mac on the same Wi-Fi and
 > AltServer running. A free Apple ID also allows only 3 sideloaded apps at a
@@ -137,8 +142,10 @@ too, with the same source or the `.ipa` from the release.
 
 A controller is the way to play (any one iOS supports: Xbox, PlayStation,
 MFi, Backbone and the like). Without one, the app shows on-screen controls,
-with Start and Back at the top. The ⚙ button has widescreen, the on-screen
-controls and the resolution. Saves are kept inside the game's folder (in
+with Start and Back at the top. The ⚙ button has the picture (**16:9**, the
+default; **Fill the screen**, the game widened to the whole of an iPhone's
+screen; or the console's **4:3**), the on-screen controls and the resolution.
+Saves are kept inside the game's folder (in
 `UDATA`), so deleting or replacing that folder deletes them too; each run's log
 is in `Logs`.
 
@@ -235,7 +242,7 @@ Playable, early, and not yet played from start to finish.
 | New Game through the tutorial, the DJ K scene and Dogenzaka Hill | works — the part played and tested most |
 | Skating, grinding, tricks, graffiti, the pause map | works |
 | Music, sound effects, voices | works |
-| Widescreen 16:9 | works in game; the title screen stays 4:3 |
+| Widescreen 16:9 (and the whole screen, on iPhone) | works in game; the title screen stays 4:3 |
 | Linux build | boots, menus, starting a new game; far less played than the Mac build |
 | Windows build | tested under Wine |
 | iPhone / iPad build | plays on iPhone; less tested on iPads |

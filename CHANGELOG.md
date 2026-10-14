@@ -10,6 +10,30 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.4.4 — 15 October 2026
+
+- **iPhone: the picture can fill the screen.** At 16:9 the game has black
+  bars at both ends of a 19.5:9 iPhone. **⚙ › Picture › Fill the screen**
+  widens the view to the screen's own shape, so the city reaches both edges,
+  while the menus and the HUD keep their shape in the middle. **16:9** stays
+  the default, and the console's **4:3** is the third choice; the title
+  screen stays 4:3 in all three. An iPad's screen is narrower than 16:9, so
+  there Fill the screen is 16:9. Run in the iOS Simulator (an iPhone 16 Pro:
+  a new game, the first scenes).
+- The picture is a new setting, so if you had switched widescreen off, the
+  app starts at 16:9 once after the update: pick 4:3 in **⚙ › Picture** to
+  have it back.
+- **iPhone: a stability fix the other versions already had.** A repair for
+  registers some of the game's translated functions fail to preserve, whose
+  absence can crash a long session, was never switched on in the iPhone app:
+  its settings were set too late for the part of the engine that reads them.
+  It is on from the start now (the first line of `Logs/last-run.log` says
+  so).
+- The iPhone app is updated through AltStore and SideStore: it shows up in
+  **My Apps** as an update, and keeps the game and your saves.
+- The Windows download is 0.4.2's, the Android download 0.4.3's, the Linux
+  download 0.3.1's and the Mac download 0.2.0's, unchanged.
+
 ## 0.4.3 — 14 October 2026
 
 - **Android: the faster renderer** from 0.4.2. Geometry that does not change
