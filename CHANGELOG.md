@@ -10,6 +10,17 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.4.3 — 14 October 2026
+
+- **Android: the faster renderer** from 0.4.2. Geometry that does not change
+  stays on the graphics chip between frames instead of being converted and
+  sent again every frame, and the game's constants are sent only when they
+  change. On a phone, where moving memory costs the most, that was most of
+  the renderer's own work in the busy scenes. Played in the Android emulator;
+  not yet on a phone.
+- The Windows download is 0.4.2's, the Linux download 0.3.1's, and the Mac
+  and iPhone downloads are 0.2.0's, unchanged; AltStore keeps offering 0.2.0.
+
 ## 0.4.2 — 14 October 2026
 
 - **Windows: Xbox controllers work.** An Xbox pad was found and opened but
