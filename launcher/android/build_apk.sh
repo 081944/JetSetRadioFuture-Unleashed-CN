@@ -113,7 +113,9 @@ if [ ! -f "$KS" ]; then
             -dname "CN=JSRF Unleashed (test)" -storepass:file "$PASS" -keypass:file "$PASS" > /dev/null 2>&1
 fi
 APK="$OUT/JSRF-Unleashed-android-arm64.apk"
-"$BT/apksigner" sign --ks "$KS" --ks-key-alias jsrf --ks-pass "file:$PASS" --key-pass "file:$PASS" \
-    --out "$APK" "$W/aligned.apk"
+# The key's password is the keystore's (a PKCS12 keystore has only the one);
+# naming the same file for --key-pass as well would read its second line.
+"$BT/apksigner" sign --ks "$KS" --ks-key-alias jsrf --ks-pass "file:$PASS" \
+    --out "$APK" "$W/aligned.apk" < /dev/null
 "$BT/apksigner" verify --print-certs "$APK" | sed -n '1,2p'
 echo "packaged: $APK ($(wc -c < "$APK" | tr -d ' ') bytes)"
