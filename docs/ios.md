@@ -15,7 +15,8 @@ to generate.
 | launcher | `launcher/JSRFLauncher.swift` asks for the game folder, sets the environment, `exec`s the engine | `jsrf_ios.m` again: one process, so it finds the game, sets the same environment and runs `host_main` on a thread of its own |
 | the game | any folder, or an `.iso` unpacked by extract-xiso | the app's Documents folder; an `.iso` is unpacked by `port/ios/xiso.c` |
 | input | controllers, the keyboard | controllers, on-screen controls (a stick under the left thumb, the pad's buttons under the right, Start and Back at the top), a hardware keyboard |
-| saves, logs | `~/Library/Application Support/JSRF Unleashed/save`, `last-run.log` beside the game | `Saves/` and `Logs/` in Documents |
+| saves | in the game folder, under `UDATA` (the game's own save files, where an Xbox keeps them) | the same: in the game's folder in Documents, under `UDATA` |
+| cache, logs | `~/Library/Application Support/JSRF Unleashed/save` (`JSRF_SAVE_DIR`: the cache and the disk images), `last-run.log` beside the game | `Saves/` (the same role) and `Logs/` in Documents |
 | signature | ad hoc, Gatekeeper's Open Anyway | ad hoc, re-signed by the sideloading tool |
 
 Documents is what the Files app shows as *On My iPhone > JSRF Unleashed*

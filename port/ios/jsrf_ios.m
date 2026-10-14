@@ -772,7 +772,7 @@ static void draw_circle(CGPoint c, CGFloat r, CGFloat fill, CGFloat line)
              "2. Put it in this app's folder: in the Files app, On My %@ > JSRF Unleashed. From a Mac: "
              "Finder > your %@ > Files > JSRF Unleashed. From Windows: the Apple Devices app.\n"
              "3. Come back here.\n\n"
-             "Saves are kept in the Saves folder beside it, and each run's log in Logs.",
+             "Saves are kept inside the game's folder (in UDATA), and each run's log in Logs.",
             device, device];
     }
 }

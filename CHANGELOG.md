@@ -1,11 +1,34 @@
 # Changelog
 
-Releases are tagged `vX.Y.Z` and built from that tag: the Mac app, the Linux
-build and the iPhone app say which version they are (Finder › Get Info,
-`./jsrf-unleashed --version` on Linux, the ⚙ button on iPhone), and so does
-the first line of every log. Downloads are on the
+Releases are tagged `vX.Y.Z` and built from that tag: the Mac app, the Windows
+and Linux builds and the iPhone app say which version they are (Finder › Get
+Info, `JSRF Unleashed.exe --version` on Windows, `./jsrf-unleashed --version`
+on Linux, the ⚙ button on iPhone), and so does the first line of every log. A
+download with nothing new for its platform is carried over unchanged and keeps
+its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
+
+## 0.3.0 — 14 October 2026
+
+- **Windows** (new, experimental): `JSRF-Unleashed-windows-x86_64.zip`, for
+  Windows 10 and 11, 64-bit. Unzip it and run `JSRF Unleashed.exe`: it asks
+  for the game folder, or a disc image, which it unpacks once. The same engine
+  and OpenGL renderer as the Linux build, controllers through SDL, the
+  keyboard. Played under CrossOver on a Mac and under Wine on Linux (boot,
+  title, loading a save, the garage); not yet on a Windows PC.
+- On Windows, **F9** sets the resolution — 1× to 4× the Xbox's 640×480, up to
+  2560×1920 — and restarts the game to apply it; **F10** switches widescreen
+  and **F11** full screen. The resolution and widescreen are remembered (on
+  Windows, widescreen was forgotten at every start). Linux builds made from
+  this source have F9 as well.
+- The Mac, Linux and iPhone downloads are 0.2.0's, unchanged (they call
+  themselves 0.2.0); AltStore keeps offering 0.2.0.
+- Docs: saves are kept in the game folder, in `UDATA`, on every platform — not
+  in Application Support (Mac), `~/.local/share` (Linux) or `Saves` (iPhone),
+  as the README said.
+- Building: `launcher/windows/` has the Windows launcher, its packaging, and
+  the toolchain file for cross-compiling with llvm-mingw.
 
 ## 0.2.0 — 12 October 2026
 

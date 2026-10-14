@@ -8,7 +8,8 @@ You need your own copy of the game -- the USA release. This package is the
 engine only: no game files, no textures, no music, no video.
 
 The Windows build is new and experimental: it is the same engine as the Mac
-and Linux builds, but far less played. Bug reports are very welcome.
+and Linux builds, but far less played -- so far under CrossOver and Wine,
+not yet on a Windows PC. Bug reports are very welcome.
 
 
 What you need
@@ -35,7 +36,8 @@ that costs money every year). Click "More info", then "Run anyway".
 You can also drop a game folder or a .iso onto "JSRF Unleashed.exe", or use
 it from a command prompt:
 
-  "JSRF Unleashed.exe" --scale N     internal resolution, 1 to 4 (default 2); remembered
+  "JSRF Unleashed.exe" --scale N     internal resolution, 1 to 4 (default 2; F9
+                                     in game does the same); remembered
   "JSRF Unleashed.exe" --fullscreen  starts full screen
   "JSRF Unleashed.exe" --choose      asks where the game is again
   "JSRF Unleashed.exe" --version     which version this is
@@ -57,7 +59,10 @@ Keyboard (by key position, so W A S D on QWERTY is Z Q S D on AZERTY):
 
   F11 or Alt+Enter   full screen
   F10                widescreen 16:9 (a wider view, not a stretch; the HUD
-                     keeps its shape, the title screen stays 4:3)
+                     keeps its shape, the title screen stays 4:3); remembered
+  F9                 resolution: the game is drawn at 1x to 4x the Xbox's
+                     640x480 (2x by default), up to 2560x1920; remembered.
+                     The game restarts to apply it, so save first.
 
 
 Where things are kept

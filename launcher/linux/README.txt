@@ -55,13 +55,18 @@ Keyboard (by key position, so W A S D on QWERTY is Z Q S D on AZERTY):
 
   F11 or Alt+Return   full screen
   F10                 widescreen 16:9 (a wider view, not a stretch; the HUD
-                      keeps its shape, the title screen stays 4:3)
+                      keeps its shape, the title screen stays 4:3); remembered
+  F9                  resolution: the game is drawn at 1x to 4x the Xbox's
+                      640x480 (2x by default), up to 2560x1920; remembered.
+                      The game restarts to apply it, so save first.
 
 
 Where things are kept
 ---------------------
+  Saves     in the game folder, under UDATA (where an Xbox keeps them): copy
+            UDATA somewhere to back your progress up
   Settings  ~/.config/jsrf-unleashed/settings
-  Saves     ~/.local/share/jsrf-unleashed/save
+  Cache     ~/.local/share/jsrf-unleashed/save
   Logs      ~/.local/state/jsrf-unleashed/last-run.log (and logs/)
 
 Found a bug? Open an issue on GitHub with last-run.log and what you were doing.

@@ -4,7 +4,7 @@
 
 # JSRF Unleashed
 
-**Jet Set Radio Future, running natively on Mac, Linux, iPhone and iPad.** Not an emulator — the
+**Jet Set Radio Future, running natively on Mac, Windows, Linux, iPhone and iPad.** Not an emulator — the
 game's own code, statically recompiled into C and built as a native
 application.
 
@@ -28,7 +28,7 @@ you own.
 | macOS 12 or later, Apple Silicon (M1 or later) | [JSRF-Unleashed-macOS-arm64.zip](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-macOS-arm64.zip) |
 | Linux, x86_64 (glibc 2.34 or later: Ubuntu 22.04, Debian 12, Fedora 36 and newer) | [JSRF-Unleashed-linux-x86_64.tar.gz](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-linux-x86_64.tar.gz) — less tested than the Mac build |
 | iPhone and iPad, iOS 15 or later (iPhone XS or newer recommended) | [JSRF-Unleashed-iOS.ipa](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-iOS.ipa) — **new and experimental**: plays on iPhone, far less played than the Mac build |
-| Windows | not started |
+| Windows 10 or 11, 64-bit | [JSRF-Unleashed-windows-x86_64.zip](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-windows-x86_64.zip) — **new and experimental**: played under CrossOver and Wine, not yet on a Windows PC |
 
 Every version is on the [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases) page; what changed is in the [changelog](CHANGELOG.md).
 
@@ -46,9 +46,34 @@ Every version is on the [Releases](https://github.com/JuMatt/JetSetRadioFuture-U
    [extract-xiso](https://github.com/XboxDev/extract-xiso) is installed
    (`brew install extract-xiso`). It remembers the choice.
 
-Saves are kept in `~/Library/Application Support/JSRF Unleashed/save`. Each
-run writes `last-run.log` into the game folder (with a few older ones in
+Saves are kept in the game folder, in `UDATA` (where an Xbox keeps them), so
+copy that folder to back them up, and keep it if you replace the game files.
+Each run writes `last-run.log` into the game folder (with a few older ones in
 `logs/`) — attach it when you report a bug.
+
+### Installing on Windows
+
+1. Unzip the archive anywhere, and keep the `engine` folder beside
+   **JSRF Unleashed.exe**.
+2. Run **JSRF Unleashed.exe**. It is not signed (that costs money every
+   year), so the first time Windows may say it protected your PC: click
+   **More info**, then **Run anyway**.
+3. It asks where your game is: pick the folder that contains `default.xbe`,
+   or the folder with your disc image (`.iso`) in it, which it offers to
+   unpack once into `%LOCALAPPDATA%\JSRF Unleashed`. It remembers the choice.
+
+It needs graphics drivers with OpenGL 3.3, which any GPU from the last ten
+years has. **F9** sets the resolution, from 1× to 4× the Xbox's 640×480
+(2× by default; the game restarts to apply it), **F10** switches widescreen
+16:9 and **F11** (or Alt+Enter) full screen; the first two are remembered.
+Controllers work through SDL: Xbox, PlayStation, Switch Pro and many more.
+Saves are kept in the game folder, in `UDATA`, as on the Mac. The
+`README.txt` inside lists the options and where the settings and logs
+(`last-run.log`) are kept.
+
+On a Mac, the Windows build also runs in [CrossOver](https://www.codeweavers.com/crossover)
+(a Windows 10 64-bit bottle, then **Run Command…** on JSRF Unleashed.exe),
+but the Mac build is the better choice there.
 
 ### Installing on iPhone or iPad
 
@@ -110,8 +135,9 @@ too, with the same source or the `.ipa` from the release.
 A controller is the way to play (any one iOS supports: Xbox, PlayStation,
 MFi, Backbone and the like). Without one, the app shows on-screen controls,
 with Start and Back at the top. The ⚙ button has widescreen, the on-screen
-controls and the resolution. Saves are kept in `Saves`, and each run's log in
-`Logs`, in the same folder.
+controls and the resolution. Saves are kept inside the game's folder (in
+`UDATA`), so deleting or replacing that folder deletes them too; each run's log
+is in `Logs`.
 
 The game's memory map needs 4 GB of address space, which recent iPhones give
 an app. If an older device does not, the app says so when it starts.
@@ -139,7 +165,7 @@ you want the folder with `default.xbe`, `Media/` and the rest.
 ## Playing
 
 **Controller:** any pad macOS recognises — Xbox, DualSense, DualShock 4 and
-others, over Bluetooth or USB. On Linux, any pad SDL knows.
+others, over Bluetooth or USB. On Windows and Linux, any pad SDL knows.
 
 **Keyboard.** Keys go by position, so `W A S D` on a QWERTY keyboard is
 `Z Q S D` on an AZERTY one:
@@ -177,6 +203,7 @@ Playable, early, and not yet played from start to finish.
 | Music, sound effects, voices | works |
 | Widescreen 16:9 | works in game; the title screen stays 4:3 |
 | Linux build | boots, menus, starting a new game; far less played than the Mac build |
+| Windows build | new: plays under CrossOver and Wine (title, loading a save, the garage); not yet tried on a Windows PC |
 | iPhone / iPad build | new: plays on iPhone; far less played than the Mac build |
 | Later areas | little tested — expect bugs |
 | Known issues | an occasional "disc error" screen during a load |
@@ -219,7 +246,12 @@ launcher/package_mac.sh build/jsrf_recomp             # macOS: the app, zipped
 ```
 
 On Linux, [`launcher/linux/package.sh`](launcher/linux/package.sh) packages the
-build and records how the release one is made. For iPhone and iPad, see
+build and records how the release one is made. The Windows build is
+cross-compiled on Linux with [llvm-mingw](https://github.com/mstorsjo/llvm-mingw)
+and the toolchain file
+[`launcher/windows/llvm-mingw.cmake`](launcher/windows/llvm-mingw.cmake);
+[`launcher/windows/package.sh`](launcher/windows/package.sh) packages it and
+records the rest (SDL2, libepoxy). For iPhone and iPad, see
 [docs/ios.md](docs/ios.md) (Xcode's iOS SDK, the same CMake project,
 [`launcher/ios/package_ios.sh`](launcher/ios/package_ios.sh) for the `.ipa`).
 How the Mac and iPhone renderer works is in
