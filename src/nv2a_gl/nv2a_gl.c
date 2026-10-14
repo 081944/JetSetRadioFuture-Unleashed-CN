@@ -1020,8 +1020,10 @@ static int gl_init(uint32_t w, uint32_t h)
         return 0;
     }
 #if defined(NV2A_GLES)
+    /* OpenGL ES 3.0 is all the renderer uses; a driver gives the newest 3.x
+     * it has, and the shaders follow what that is (nv2a_gfx_gl.c). */
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
 #else
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);

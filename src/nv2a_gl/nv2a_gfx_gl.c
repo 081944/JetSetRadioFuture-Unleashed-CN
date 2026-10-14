@@ -309,10 +309,43 @@ static struct {
 } *g_prog;
 static uint32_t g_cur_prog;      /* handle in use, 0 none */
 
+#if defined(NV2A_GLES)
+/* The shading language the context takes: 300, 310 or 320 (ES 3.0 to 3.2).
+ * The emitters write "#version 320 es" (NV2A_GLSL_VERSION) and use nothing
+ * newer than ES 3.0 does, so an older context -- the Android emulator on a
+ * Mac offers 3.0 -- gets the same source under its own version line.
+ * RECOMP_GLSL_ES=300|310|320 overrides it, to test that on a newer one. */
+static int gles_glsl(void)
+{
+    static int v;
+    if (!v) {
+        const char *e = getenv("RECOMP_GLSL_ES");
+        GLint maj = 3, mnr = 0;
+        glGetIntegerv(GL_MAJOR_VERSION, &maj);
+        glGetIntegerv(GL_MINOR_VERSION, &mnr);
+        v = (maj > 3 || (maj == 3 && mnr >= 2)) ? 320 : (maj == 3 && mnr == 1) ? 310 : 300;
+        if (e && (atoi(e) == 300 || atoi(e) == 310 || atoi(e) == 320)) v = atoi(e);
+        fprintf(stderr, "  [GL] OpenGL ES %d.%d: shaders as GLSL ES %d\n", (int)maj, (int)mnr, v);
+    }
+    return v;
+}
+#endif
+
 static GLuint compile(GLenum stage, const char *src, const char *what)
 {
     GLuint s = glCreateShader(stage);
     GLint ok = 0;
+#if defined(NV2A_GLES)
+    char *own = NULL;
+    if (gles_glsl() != 320 && !strncmp(src, "#version 320 es", 15)) {
+        size_t n = strlen(src);
+        if ((own = (char *)malloc(n + 1)) != NULL) {
+            memcpy(own, src, n + 1);
+            own[10] = gles_glsl() == 310 ? '1' : '0';     /* "#version 3?0 es" */
+            src = own;
+        }
+    }
+#endif
     glShaderSource(s, 1, &src, NULL);
     glCompileShader(s);
     glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
@@ -324,8 +357,14 @@ static GLuint compile(GLenum stage, const char *src, const char *what)
         if (getenv("RECOMP_GL_DUMP_SHADER"))
             fprintf(stderr, "----- source -----\n%s\n------------------\n", src);
         glDeleteShader(s);
+#if defined(NV2A_GLES)
+        free(own);
+#endif
         return 0;
     }
+#if defined(NV2A_GLES)
+    free(own);
+#endif
     return s;
 }
 
