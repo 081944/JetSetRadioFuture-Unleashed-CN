@@ -3,9 +3,12 @@ package com.jumatt.jsrfunleashed;
 import android.app.Activity;
 import android.content.Intent;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
+import android.util.Log;
 import android.view.View;
+import android.view.WindowInsets;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
@@ -50,7 +53,13 @@ public class SetupActivity extends Activity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
-        if (isGame(gameDir())) {
+        File g = gameDir();
+        boolean found = isGame(g);
+        Log.i("JSRF", "game folder " + g + ": " + (found ? "the game is there"
+              : "no game (folder " + (g.isDirectory() ? "exists" : "missing")
+                + ", default.xbe " + (new File(g, "default.xbe").isFile() ? "yes" : "no")
+                + ", Media " + (new File(g, "Media").isDirectory() ? "yes" : "no") + ")"));
+        if (found) {
             startGame();
             return;
         }
@@ -120,6 +129,19 @@ public class SetupActivity extends Activity {
 
         ScrollView scroll = new ScrollView(this);
         scroll.addView(col);
+        /* Android 15 and later draw an app under the status and navigation
+         * bars: keep the text out from under them (and the camera's notch). */
+        scroll.setOnApplyWindowInsetsListener((v, in) -> {
+            if (Build.VERSION.SDK_INT >= 30) {
+                android.graphics.Insets b = in.getInsets(WindowInsets.Type.systemBars()
+                                                         | WindowInsets.Type.displayCutout());
+                v.setPadding(b.left, b.top, b.right, b.bottom);
+            } else {
+                v.setPadding(in.getSystemWindowInsetLeft(), in.getSystemWindowInsetTop(),
+                             in.getSystemWindowInsetRight(), in.getSystemWindowInsetBottom());
+            }
+            return in;
+        });
         setContentView(scroll);
     }
 
