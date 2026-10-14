@@ -9,6 +9,13 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.3.1 — 14 October 2026
+
+- Linux: the F9 resolution window's text is no longer cut off at the right
+  edge (SDL's own dialog on X11 does not wrap long lines).
+- The Windows download is 0.3.0's, and the Mac and iPhone downloads are
+  0.2.0's, unchanged.
+
 ## 0.3.0 — 14 October 2026
 
 - **Windows** (new, experimental): `JSRF-Unleashed-windows-x86_64.zip`, for

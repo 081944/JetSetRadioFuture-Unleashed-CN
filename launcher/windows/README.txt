@@ -7,9 +7,8 @@ https://github.com/JuMatt/JetSetRadioFuture-Unleashed
 You need your own copy of the game -- the USA release. This package is the
 engine only: no game files, no textures, no music, no video.
 
-The Windows build is new and experimental: it is the same engine as the Mac
-and Linux builds, but far less played -- so far under CrossOver and Wine,
-not yet on a Windows PC. Bug reports are very welcome.
+The Windows build is the same engine as the Mac and Linux builds, tested
+under Wine. Bug reports are very welcome.
 
 
 What you need
