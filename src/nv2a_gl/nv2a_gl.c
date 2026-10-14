@@ -1272,11 +1272,14 @@ static void sdl_choose_scale(void)
     b[4].flags    = SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT;
     b[4].buttonid = 0;
     b[4].text     = "Cancel";
+    /* Short lines: SDL's own X11 message box does not wrap, and cut the
+     * first line off at its width. */
     snprintf(msg, sizeof msg,
-             "The game is drawn at a multiple of the Xbox's 640x480, then fitted "
-             "to the window. Higher is sharper and asks more of the graphics "
-             "card. Now: %dx (%dx%d).\n\n"
-             "Changing it restarts the game: anything since your last save is lost.",
+             "The game is drawn at a multiple of the Xbox's 640x480,\n"
+             "then fitted to the window. Higher is sharper and asks\n"
+             "more of the graphics card. Now: %dx (%dx%d).\n\n"
+             "Changing it restarts the game: anything since\n"
+             "your last save is lost.",
              cur, 640 * cur, 480 * cur);
     memset(&box, 0, sizeof box);
     box.flags      = SDL_MESSAGEBOX_INFORMATION | SDL_MESSAGEBOX_BUTTONS_LEFT_TO_RIGHT;
