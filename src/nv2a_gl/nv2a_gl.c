@@ -1152,7 +1152,13 @@ static void sdl_cfg_set(const char *key, int val)
     }
     if (!done) fprintf(out, "%s=%d\n", key, val);
     fclose(out);
-    rename(tmp, path);
+    /* On Windows rename() will not replace a file that exists -- and the
+     * launcher has always written this one -- so a choice made here was
+     * never kept and settings.tmp stayed behind. */
+    if (rename(tmp, path) != 0) {
+        remove(path);
+        rename(tmp, path);
+    }
 }
 
 /* nv2a_widescreen() asks this when RECOMP_WIDESCREEN is not set. */
@@ -1166,7 +1172,7 @@ int nv_window_pref_widescreen(void) { return sdl_cfg_get("widescreen", 0) != 0; 
  *   R          Black                    F  White
  *   Return     Start                    Esc  Back
  *   C / V      left / right stick click
- * F11 or Alt+Return: full screen. F10: widescreen. */
+ * F11 or Alt+Return: full screen. F10: widescreen. F9: resolution. */
 static volatile unsigned short g_sdl_kb_buttons;
 static volatile unsigned char  g_sdl_kb_analog[8];
 
@@ -1242,6 +1248,56 @@ static void sdl_toggle_widescreen(void)
     fprintf(stderr, "[WIN] widescreen %s\n", on ? "on (16:9)" : "off (4:3)");
 }
 
+/* F9: the internal resolution, 1x to 4x the Xbox's 640x480 -- what the Mac's
+ * Video menu and the iPhone's settings offer. The renderer sizes its targets
+ * once, at start-up, so a new one means starting again: after asking, the
+ * choice is stored under the launchers' own "scale" key (they pass it on as
+ * RECOMP_GL_SCALE), put in the environment and the engine relaunches itself
+ * (port/main.c), as the Mac's does. */
+static void sdl_choose_scale(void)
+{
+    extern void recomp_restart_self(void) __attribute__((weak));
+    static const char *const names[4] = {
+        "1x  640x480", "2x  1280x960", "3x  1920x1440", "4x  2560x1920" };
+    SDL_MessageBoxButtonData b[5];
+    SDL_MessageBoxData box;
+    char msg[512], val[4];
+    int cur = (int)gl_scale(), pick = -1, i;
+    if (!recomp_restart_self) return;
+    for (i = 0; i < 4; i++) {
+        b[i].flags    = i + 1 == cur ? SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT : 0;
+        b[i].buttonid = i + 1;
+        b[i].text     = names[i];
+    }
+    b[4].flags    = SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT;
+    b[4].buttonid = 0;
+    b[4].text     = "Cancel";
+    snprintf(msg, sizeof msg,
+             "The game is drawn at a multiple of the Xbox's 640x480, then fitted "
+             "to the window. Higher is sharper and asks more of the graphics "
+             "card. Now: %dx (%dx%d).\n\n"
+             "Changing it restarts the game: anything since your last save is lost.",
+             cur, 640 * cur, 480 * cur);
+    memset(&box, 0, sizeof box);
+    box.flags      = SDL_MESSAGEBOX_INFORMATION | SDL_MESSAGEBOX_BUTTONS_LEFT_TO_RIGHT;
+    box.window     = g_window;
+    box.title      = "Resolution";
+    box.message    = msg;
+    box.numbuttons = 5;
+    box.buttons    = b;
+    if (SDL_ShowMessageBox(&box, &pick) != 0 || pick < 1 || pick > 4 || pick == cur)
+        return;
+    sdl_cfg_set("scale", pick);
+    snprintf(val, sizeof val, "%d", pick);
+#if defined(_WIN32)
+    _putenv_s("RECOMP_GL_SCALE", val);
+#else
+    setenv("RECOMP_GL_SCALE", val, 1);
+#endif
+    fprintf(stderr, "[WIN] resolution %dx chosen; restarting\n", pick);
+    recomp_restart_self();      /* does not return when it works */
+}
+
 /* The frame, fitted into the window between black bars: a widened scene at
  * 16:9 (the 640x480 surface holds a 16:9 view squeezed), anything else at its
  * own shape. One blit; every piece of GL state the renderer caches is put
@@ -1307,6 +1363,7 @@ static void sdl_pump(void)
                     break;
                 }
                 if (k == SDL_SCANCODE_F10) { sdl_toggle_widescreen(); break; }
+                if (k == SDL_SCANCODE_F9)  { sdl_choose_scale(); break; }
             }
             sdl_key(ev.key.keysym.scancode, 1);
             break;
