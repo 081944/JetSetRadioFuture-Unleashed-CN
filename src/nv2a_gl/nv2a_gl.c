@@ -453,9 +453,12 @@ static struct {
  */
 typedef struct {
     double tex, verts, vbo, unif, draw, state;
+    double whole_draw;      /* all of do_draw, the above included */
+    double present, pace;   /* at the flip: showing the frame, waiting for its time */
     unsigned n_draws, n_const_upload, n_prog_switch, n_tex_upload, n_tex_lookup;
     unsigned long vbo_bytes, unif_vec4;
 } GlProfile;
+static void vc_report(const char *when);
 static GlProfile g_prof;
 static int g_prof_on = -1;
 
@@ -504,6 +507,9 @@ static void prof_report(void)
         d.unif  = g_prof.unif  - prev.unif;
         d.draw  = g_prof.draw  - prev.draw;
         d.state = g_prof.state - prev.state;
+        d.whole_draw = g_prof.whole_draw - prev.whole_draw;
+        d.present = g_prof.present - prev.present;
+        d.pace    = g_prof.pace    - prev.pace;
         fprintf(stderr,
             "[GLPROF] %.0f draws/s | tex %4.1f%%  verts %4.1f%%  vbo %4.1f%%  "
             "uniforms %4.1f%%  glDraw %4.1f%%  state %4.1f%%  (rest %4.1f%%)\n",
@@ -511,6 +517,21 @@ static void prof_report(void)
             100 * d.tex / dt, 100 * d.verts / dt, 100 * d.vbo / dt,
             100 * d.unif / dt, 100 * d.draw / dt, 100 * d.state / dt,
             100 * (dt - d.tex - d.verts - d.vbo - d.unif - d.draw - d.state) / dt);
+        /* Where the rest goes: the draws' own work outside the calls above
+         * (finding the program, the uniforms by name, the bookkeeping), and
+         * the flip -- showing the frame, and waiting for its moment. */
+        fprintf(stderr,
+            "[GLPROF]   draws in all %4.1f%% (%.1f us each, %.1f us outside the above) | "
+            "present %4.1f%%  pacing %4.1f%%\n",
+            100 * d.whole_draw / dt,
+            (g_prof.n_draws - prev.n_draws)
+                ? 1e6 * d.whole_draw / (g_prof.n_draws - prev.n_draws) : 0.0,
+            (g_prof.n_draws - prev.n_draws)
+                ? 1e6 * (d.whole_draw - d.tex - d.verts - d.vbo - d.unif - d.draw - d.state)
+                  / (g_prof.n_draws - prev.n_draws) : 0.0,
+            100 * d.present / dt, 100 * d.pace / dt);
+        { static double last_vc;
+          if (now - last_vc >= 10.0) { last_vc = now; vc_report(" (so far)"); } }
         /* Per second, not per frame -- which is what it used to say, and the
          * numbers were read as per-frame for long enough to be worth the
          * correction: six thousand program switches in a frame is an
@@ -691,6 +712,7 @@ static struct {
     uint16_t inputs;
     uint8_t  uses_a0;   /* indexes the constant file through the address register */
     uint8_t  a0_input;  /* the v register the index comes from, 0xFF if unknown */
+    uint32_t csync;     /* constants stamped before this it already has; 0 none */
     char    *dis;       /* disassembly, kept only when a dump is armed */
 } g_pcache[PROG_CACHE];
 /*
@@ -722,6 +744,29 @@ static uint32_t gl_scale(void)
 
 static uint32_t g_cur_prog;
 static int      g_cur_slot = -1;
+
+/* Bumped by every write to the vertex program pool, so that a draw whose
+ * program is the one the last draw looked up skips decoding and hashing it
+ * (program_for_current). */
+static uint32_t g_vsh_gen = 1;
+
+/*
+ * When each constant last changed, by a clock that ticks once per upload
+ * that follows a change (see the upload in do_draw). A program is sent the
+ * constants stamped at or after the tick it was last brought up to date at,
+ * rather than all 192 whenever any one changed or the program did: this
+ * title sends its matrices around nearly every draw and switches programs
+ * twenty times a frame, and re-sending the whole file each time was three
+ * hundred 3 KB uploads a frame -- most of it values the program already had.
+ */
+static uint32_t g_cstamp[NV2A_VSH_NUM_CONSTS];
+static uint32_t g_cclock = 1;    /* the stamp a change gets now */
+static uint32_t g_clast;         /* the newest stamp given out */
+static void const_changed(uint32_t i)
+{
+    g_cstamp[i] = g_cclock;
+    g_clast = g_cclock;
+}
 
 /* Uniforms, by name (nv2a_backend.h), for the program in use. `uses` is
  * whether the program at a cache slot reads one at all: work for one it does
@@ -2138,6 +2183,22 @@ static int sticky_attrs(void)
     return on;
 }
 
+/* The combiner state's half of the program key, hashed again only when it
+ * changed: comparing it costs a few nanoseconds, hashing it a byte at a time
+ * a few hundred. */
+static uint32_t psh_hash(void)
+{
+    static Nv2aPshState last;
+    static uint32_t h;
+    static int valid;
+    if (!valid || memcmp(&last, &S.psh, sizeof last)) {
+        memcpy(&last, &S.psh, sizeof last);
+        h = fnv(&S.psh, sizeof S.psh);
+        valid = 1;
+    }
+    return h;
+}
+
 /* Which inputs a fixed-function batch actually has.
  *
  * The emitted shader declares only the arrays the batch supplies; an
@@ -2217,7 +2278,7 @@ static int ff_program_for_current(void)
      * interchangeable. */
     hash = 0xF1EDF1EDu;   /* a namespace of its own */
     hash = hash * 16777619u + fnv(&f, sizeof f);
-    hash = hash * 16777619u + fnv(&S.psh, sizeof S.psh);
+    hash = hash * 16777619u + psh_hash();
     { int hit = pcache_find(hash);
       if (hit >= 0) return hit; }
     slot = pcache_alloc(hash);
@@ -2306,22 +2367,39 @@ static int program_for_current(void)
     }
 
     start = S.prog_start < NV2A_VSH_MAX_INSNS ? S.prog_start : 0;
-    len = nv2a_vsh_decode(S.prog + start * 4,
-                          (int)(NV2A_VSH_MAX_INSNS - start), &vp);
-    if (len <= 0) { S.skipped_no_prog++; return -1; }
-    /* No write to oPos means every vertex lands on the origin. That is not a
-     * program the title expects to draw with -- it is the state before one has
-     * been uploaded -- and compiling it wastes a slot and a shader. */
-    if (!(vp.outputs_written & 1u)) { S.skipped_no_prog++; return -1; }
+    /* Decoding the program and hashing it was most of a draw's own cost here
+     * (a hundred instructions, and two kilobytes hashed a byte at a time),
+     * for a program that is nearly always the one the last draw used. The
+     * pool's write counter and the start address say whether it is; the
+     * decode is redone only if this turns out to be a program the cache has
+     * never seen. */
+    { static uint32_t m_gen, m_start, m_hash; static int m_len, m_ok;
+      int decoded = 0;
+      if (m_gen != g_vsh_gen || m_start != start) {
+          len = nv2a_vsh_decode(S.prog + start * 4,
+                                (int)(NV2A_VSH_MAX_INSNS - start), &vp);
+          m_gen = g_vsh_gen; m_start = start; m_len = len;
+          /* No write to oPos means every vertex lands on the origin. That is
+           * not a program the title expects to draw with -- it is the state
+           * before one has been uploaded -- and compiling it wastes a slot
+           * and a shader. */
+          m_ok = len > 0 && (vp.outputs_written & 1u);
+          m_hash = m_ok ? fnv(S.prog + start * 4, (size_t)len * 16) : 0;
+          decoded = 1;
+      }
+      if (!m_ok) { S.skipped_no_prog++; return -1; }
+      len = m_len;
 
-    psh_sync_textures();
-    /* One key for both halves: a title reuses a vertex program with several
-     * combiner setups and vice versa, and caching on either alone hands back
-     * a shader that is half right. */
-    hash = fnv(S.prog + start * 4, (size_t)len * 16);
-    hash = hash * 16777619u + fnv(&S.psh, sizeof S.psh);
-    { int hit = pcache_find(hash);
-      if (hit >= 0) return hit; }
+      psh_sync_textures();
+      /* One key for both halves: a title reuses a vertex program with
+       * several combiner setups and vice versa, and caching on either alone
+       * hands back a shader that is half right. */
+      hash = m_hash * 16777619u + psh_hash();
+      { int hit = pcache_find(hash);
+        if (hit >= 0) return hit; }
+      if (!decoded)
+          len = nv2a_vsh_decode(S.prog + start * 4,
+                                (int)(NV2A_VSH_MAX_INSNS - start), &vp); }
     slot = pcache_alloc(hash);
 
     vsrc = (char *)malloc(96 * 1024);
@@ -2426,6 +2504,7 @@ static int program_for_current(void)
     g_pcache[slot].hash   = hash;
     g_pcache[slot].last_draw = S.draws;
     g_pcache[slot].prog   = prog;
+    g_pcache[slot].csync  = 0;     /* a new program has no constants yet */
     g_pcache[slot].inputs = vp.inputs_read;
     /* Which input feeds the address register.
      *
@@ -3372,7 +3451,549 @@ static float g_wide_shift;   /* this draw's framed-3D move, title pixels, ditto 
 static Nv2aRenderState g_draw_rs;   /* the state this draw was given */
 static float g_wide_ext[4];  /* its x and y extent, for the draw log */
 
+/* One attribute array a draw reads, resolved once per draw: see do_draw. */
+typedef struct {
+    const uint8_t *base;
+    uint32_t stride;
+    uint8_t  type, size, idx;
+} VtxLive;
+
+/* One vertex, from the console's formats into four floats an attribute. */
+static void vtx_convert(const VtxLive *live, int nlive, uint32_t src_i, float *dst)
+{
+    int j;
+    for (j = 0; j < nlive; j++) {
+        const uint8_t *p = live[j].base + (size_t)src_i * live[j].stride;
+        float *o = dst + j * 4;
+        uint32_t c, sz = live[j].size;
+        o[0] = o[1] = o[2] = 0.0f; o[3] = 1.0f;
+        switch (live[j].type) {
+        case 0:   /* D3DCOLOR: one dword, B,G,R,A in memory order */
+            o[0] = p[2] * (1.0f / 255.0f); o[1] = p[1] * (1.0f / 255.0f);
+            o[2] = p[0] * (1.0f / 255.0f); o[3] = p[3] * (1.0f / 255.0f);
+            break;
+        case 1:   /* signed short, normalised */
+            for (c = 0; c < sz; c++)
+                o[c] = ((const int16_t *)p)[c] * (1.0f / 32767.0f);
+            break;
+        case 2:   /* float */
+            for (c = 0; c < sz; c++) o[c] = ((const float *)p)[c];
+            break;
+        case 4:   /* unsigned byte, normalised, RGBA order */
+            for (c = 0; c < sz; c++) o[c] = p[c] * (1.0f / 255.0f);
+            break;
+        case 5:   /* signed short, not normalised */
+            for (c = 0; c < sz; c++) o[c] = (float)((const int16_t *)p)[c];
+            break;
+        case 6: { /* packed 11/11/10, signed and normalised */
+            uint32_t v = *(const uint32_t *)p;
+            o[0] = ((int32_t)(v << 21) >> 21) * (1.0f / 1023.0f);
+            o[1] = ((int32_t)(v << 10) >> 21) * (1.0f / 1023.0f);
+            o[2] = ((int32_t)(v)       >> 22) * (1.0f / 511.0f);
+            break;
+        }
+        default: break;
+        }
+    }
+}
+
+/* The bytes of one vertex that vtx_convert reads for an attribute. */
+static uint32_t vtx_bytes(const VtxLive *l)
+{
+    switch (l->type) {
+    case 0: case 6: return 4;
+    case 1: case 5: return 2u * l->size;
+    case 2:         return 4u * l->size;
+    case 4:         return l->size;
+    default:        return 0;
+    }
+}
+
+/*
+ * ── geometry kept between frames ─────────────────────────────────────────
+ *
+ * Every draw used to convert each vertex it drew from the console's formats
+ * into floats -- once per index, so a vertex shared by six triangles was
+ * converted six times -- and hand the driver a fresh buffer of them: fifteen
+ * megabytes a frame in the attract sequence's busy scenes, converted and
+ * copied again sixty times a second, though nearly all of it is the city,
+ * which never changes. On the cloud test machine that was nine milliseconds
+ * of every frame's sixteen.
+ *
+ * So a draw that indexes its arrays converts the vertices it names once
+ * each -- the range from its lowest index to its highest -- and draws them
+ * through an index list; and what it converted is kept, so the next frame's
+ * draw of the same thing converts and copies nothing. "The same thing" is
+ * the same arrays at the same addresses, laid out the same way, over the same
+ * range, with the same index list; and it is still the same if the bytes it
+ * was converted from still hash as they did. The hash is the price -- one
+ * pass over the source bytes, a fraction of what converting them cost -- and
+ * it is what makes this safe: geometry the title rewrites (its dynamic
+ * buffers, the particles) no longer matches, is converted again, and its
+ * buffer refilled.
+ *
+ * A draw seen once and never again (a particle burst at an address it will
+ * not use twice) is not worth a buffer of its own: a draw is kept the second
+ * time it is seen, and until then goes through one shared buffer. Small
+ * draws, inline vertices, and the 2D draws the widescreen squeeze measures
+ * take the old path, as does every draw while a debugging switch is on:
+ * those read the converted vertices back, and a kept draw has none.
+ *
+ * RECOMP_GL_VCACHE=0 turns it off; RECOMP_GL_VCACHE_MB sets how much it may
+ * keep (128 MB, 64 on OpenGL ES), the least recently drawn going first.
+ */
+#define VC_MAX     8192        /* entries, at most */
+#define VC_NHASH   16384       /* buckets: a power of two */
+#define VC_NSEEN   8192        /* the second-sighting filter: a power of two */
+#define VC_MIN_N   32          /* fewer vertices drawn: not worth a lookup */
+
+typedef struct {
+    uint64_t key, content;
+    uint32_t vb, bytes, last_frame;
+    int32_t  next;             /* in its bucket */
+    int32_t  newer, older;     /* in drawing order */
+    uint8_t  used;
+    uint8_t *shadow;           /* RECOMP_GL_VCACHE_VERIFY: what it holds */
+} VcEntry;
+
+static VcEntry  *g_vc;
+static int32_t   g_vc_bucket[VC_NHASH];
+static int32_t   g_vc_newest = -1, g_vc_oldest = -1, g_vc_free = -1;
+static int       g_vc_n;
+static uint64_t  g_vc_seen[VC_NSEEN];
+static uint64_t  g_vc_held, g_vc_budget;
+static uint32_t  g_vc_stream;         /* the shared buffer */
+static uint8_t  *g_vc_buf;            /* converted vertices, then indices */
+static size_t    g_vc_buf_cap;
+static int       g_vc_on = -1;
+static struct {
+    unsigned long hit, changed, kept, stream, old_path, evicted;
+    unsigned long long hashed, converted, uploaded;
+} g_vc_st;
+
+static uint64_t vc_rotl(uint64_t x, int r) { return (x << r) | (x >> (64 - r)); }
+
+/* A 64-bit hash of n bytes, four lanes wide (xxHash64's round): a few GB/s,
+ * which is what makes checking the source of every kept draw affordable. */
+static uint64_t vc_hash(const void *data, size_t n, uint64_t seed)
+{
+    const uint64_t P1 = 0x9E3779B185EBCA87ull, P2 = 0xC2B2AE3D27D4EB4Full,
+                   P3 = 0x165667B19E3779F9ull;
+    const uint8_t *p = (const uint8_t *)data;
+    uint64_t a = seed + P1 + P2, b = seed + P2, c = seed, d = seed - P1, h, w;
+    size_t len = n;
+    while (n >= 32) {
+        uint64_t w0, w1, w2, w3;
+        memcpy(&w0, p, 8); memcpy(&w1, p + 8, 8);
+        memcpy(&w2, p + 16, 8); memcpy(&w3, p + 24, 8);
+        a = vc_rotl(a + w0 * P2, 31) * P1;
+        b = vc_rotl(b + w1 * P2, 31) * P1;
+        c = vc_rotl(c + w2 * P2, 31) * P1;
+        d = vc_rotl(d + w3 * P2, 31) * P1;
+        p += 32; n -= 32;
+    }
+    h = vc_rotl(a, 1) + vc_rotl(b, 7) + vc_rotl(c, 12) + vc_rotl(d, 18) + (uint64_t)len;
+    while (n >= 8) {
+        memcpy(&w, p, 8);
+        h ^= vc_rotl(w * P2, 31) * P1;
+        h = vc_rotl(h, 27) * P1 + P3;
+        p += 8; n -= 8;
+    }
+    while (n) { h ^= (uint64_t)(*p++) * P3; h = vc_rotl(h, 11) * P1; n--; }
+    h ^= h >> 33; h *= P2; h ^= h >> 29; h *= P3; h ^= h >> 32;
+    return h;
+}
+
+static uint64_t vc_mix(uint64_t h, uint64_t v)
+{
+    h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    return h * 0xC2B2AE3D27D4EB4Full;
+}
+
+/* The debugging switches that read a draw's converted vertices back. All
+ * of them are RECOMP_GL_*; these are the RECOMP_GL_* that are not. */
+#if defined(_WIN32)
+#  define VC_ENVIRON _environ
+#elif defined(__APPLE__)
+#  include <crt_externs.h>
+#  define VC_ENVIRON (*_NSGetEnviron())
+#else
+extern char **environ;
+#  define VC_ENVIRON environ
+#endif
+static const char *vc_debug_switch(void)
+{
+    static const char *const fine[] = {
+        "SCALE", "READBACK", "CURTAIN", "PRESENTER", "PROFILE", "VCACHE",
+        "VCACHE_MB", "VCACHE_VERIFY", "CONST_PART", "ANISO", "MIPMAP", "DEPTHCLAMP",
+        "TEXHASH_FULL", "CONTIG_ALL", "HEAP_FIRST", "STICKY_ATTRS",
+        /* the frame dumps: taken at the flip, from the picture */
+        "DUMP_FB", "DUMP_AFTER", "DUMP_EVERY", "DUMP_3D", "DUMP_TRIS",
+        "DUMP_CHARS", "DUMP_DEPTH", NULL
+    };
+    static char name[64];
+    char **e;
+    for (e = VC_ENVIRON; e && *e; e++) {
+        const char *s = *e, *eq;
+        size_t n;
+        int k, ok = 0;
+        if (strncmp(s, "RECOMP_GL_", 10)) continue;
+        eq = strchr(s, '=');
+        n = eq ? (size_t)(eq - s) : strlen(s);
+        for (k = 0; fine[k]; k++)
+            if (strlen(fine[k]) == n - 10 && !strncmp(s + 10, fine[k], n - 10)) { ok = 1; break; }
+        if (ok) continue;
+        snprintf(name, sizeof name, "%.*s", (int)n, s);
+        return name;
+    }
+    return NULL;
+}
+
+static int vc_on(void)
+{
+    const char *v, *mb, *why = NULL;
+    int i;
+    if (g_vc_on >= 0) return g_vc_on;
+    v = getenv("RECOMP_GL_VCACHE");
+    mb = getenv("RECOMP_GL_VCACHE_MB");
+    g_vc_on = (v ? atoi(v) != 0 : 1)
+           && G->vbuf_new && G->vbuf_free && G->vbuf_fill && G->vbuf_bind && G->draw_indexed;
+    if (g_vc_on && !v && (why = vc_debug_switch()) != NULL) g_vc_on = 0;
+#if defined(NV2A_GLES)
+    g_vc_budget = (uint64_t)(mb && atoi(mb) > 0 ? atoi(mb) : 64) << 20;
+#else
+    g_vc_budget = (uint64_t)(mb && atoi(mb) > 0 ? atoi(mb) : 128) << 20;
+#endif
+    if (g_vc_on) {
+        g_vc = (VcEntry *)calloc(VC_MAX, sizeof *g_vc);
+        g_vc_stream = g_vc ? G->vbuf_new(1) : 0;
+        if (!g_vc || !g_vc_stream) { free(g_vc); g_vc = NULL; g_vc_on = 0; }
+    }
+    if (g_vc_on) {
+        for (i = 0; i < VC_NHASH; i++) g_vc_bucket[i] = -1;
+        for (i = 0; i < VC_MAX; i++) g_vc[i].next = i + 1 < VC_MAX ? i + 1 : -1;
+        g_vc_free = 0;
+    }
+    if (g_vc_on)
+        fprintf(stderr, "  [GL] vertex cache: on, up to %u MB\n",
+                (unsigned)(g_vc_budget >> 20));
+    else if (why)
+        fprintf(stderr, "  [GL] vertex cache: off while %s is set (it reads "
+                "converted vertices back)\n", why);
+    else
+        fprintf(stderr, "  [GL] vertex cache: off\n");
+    return g_vc_on;
+}
+
+static int32_t vc_find(uint64_t key)
+{
+    int32_t e = g_vc_bucket[key & (VC_NHASH - 1)];
+    while (e >= 0 && g_vc[e].key != key) e = g_vc[e].next;
+    return e;
+}
+
+static void vc_unlink(int32_t e)
+{
+    if (g_vc[e].newer >= 0) g_vc[g_vc[e].newer].older = g_vc[e].older;
+    else g_vc_newest = g_vc[e].older;
+    if (g_vc[e].older >= 0) g_vc[g_vc[e].older].newer = g_vc[e].newer;
+    else g_vc_oldest = g_vc[e].newer;
+}
+
+static void vc_link_newest(int32_t e)
+{
+    g_vc[e].newer = -1;
+    g_vc[e].older = g_vc_newest;
+    if (g_vc_newest >= 0) g_vc[g_vc_newest].newer = e;
+    g_vc_newest = e;
+    if (g_vc_oldest < 0) g_vc_oldest = e;
+}
+
+static void vc_touch(int32_t e)
+{
+    if (g_vc_newest != e) { vc_unlink(e); vc_link_newest(e); }
+    g_vc[e].last_frame = S.frames;
+}
+
+/*
+ * RECOMP_GL_VCACHE_VERIFY=1: check every draw the cache serves against the
+ * old path -- the vertices converted again from the title's memory, one per
+ * index, as they always were -- and say so if any differs. A kept draw's
+ * contents are shadowed in memory for it. A test of the cache's idea of
+ * "the same draw", not something to play with.
+ */
+static int vc_verify_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("RECOMP_GL_VCACHE_VERIFY"); v = (e && atoi(e)) ? 1 : 0; }
+    return v;
+}
+
+static void vc_verify(const VtxLive *live, int nlive, uint32_t stride_floats,
+                      uint32_t fan, uint32_t out_n, const uint8_t *data,
+                      uint32_t vbytes, int seq, int idx32, const char *what)
+{
+    static unsigned long checked, bad;
+    static const uint32_t q1[6] = { 0, 1, 2, 2, 3, 0 }, q2[6] = { 0, 1, 3, 3, 2, 0 };
+    float want[NUM_ATTRS * 4];
+    const float *verts = (const float *)data;
+    const uint8_t *ib = data + vbytes;
+    uint32_t k;
+    if (!nlive) return;
+    checked++;
+    for (k = 0; k < out_n; k++) {
+        uint32_t src_i = fan == 1 ? S.idx[(k / 6) * 4 + q1[k % 6]]
+                       : fan == 2 ? S.idx[(k / 6) * 2 + q2[k % 6]] : S.idx[k];
+        uint32_t at = seq ? k : idx32 ? ((const uint32_t *)ib)[k] : ((const uint16_t *)ib)[k];
+        vtx_convert(live, nlive, src_i, want);
+        if (memcmp(want, verts + (size_t)at * stride_floats, (size_t)nlive * 16)) {
+            if (bad++ < 20)
+                fprintf(stderr, "[VCVERIFY] %s: draw %u, vertex %u of %u (index %u) "
+                        "is not what the title's memory holds now\n",
+                        what, S.draws, k, out_n, src_i);
+            break;
+        }
+    }
+    if (checked % 50000 == 0)
+        fprintf(stderr, "[VCVERIFY] %lu draws checked, %lu differed\n", checked, bad);
+}
+
+/* GL keeps a deleted buffer's storage until the draws already queued from it
+ * are done, so this is safe at any point in a frame. */
+static void vc_evict(int32_t e)
+{
+    int32_t *pp = &g_vc_bucket[g_vc[e].key & (VC_NHASH - 1)];
+    while (*pp >= 0 && *pp != e) pp = &g_vc[*pp].next;
+    if (*pp == e) *pp = g_vc[e].next;
+    vc_unlink(e);
+    G->vbuf_free(g_vc[e].vb);
+    free(g_vc[e].shadow);
+    g_vc[e].shadow = NULL;
+    g_vc_held -= g_vc[e].bytes;
+    g_vc[e].used = 0;
+    g_vc[e].next = g_vc_free;
+    g_vc_free = e;
+    g_vc_n--;
+    g_vc_st.evicted++;
+}
+
+static int32_t vc_insert(uint64_t key, uint64_t content, uint32_t bytes)
+{
+    int32_t e;
+    uint32_t vb;
+    while (g_vc_oldest >= 0 && (g_vc_n >= VC_MAX || g_vc_held + bytes > g_vc_budget))
+        vc_evict(g_vc_oldest);
+    if (g_vc_free < 0 || bytes > g_vc_budget) return -1;
+    vb = G->vbuf_new(0);
+    if (!vb) return -1;
+    e = g_vc_free;
+    g_vc_free = g_vc[e].next;
+    g_vc[e].key = key;
+    g_vc[e].content = content;
+    g_vc[e].vb = vb;
+    g_vc[e].bytes = bytes;
+    g_vc[e].used = 1;
+    g_vc[e].next = g_vc_bucket[key & (VC_NHASH - 1)];
+    g_vc_bucket[key & (VC_NHASH - 1)] = e;
+    vc_link_newest(e);
+    g_vc[e].last_frame = S.frames;
+    g_vc_n++;
+    g_vc_held += bytes;
+    return e;
+}
+
+/* The hash of what a draw's vertices are made from: for each array, the
+ * bytes from its lowest vertex to its highest. Attributes interleaved in one
+ * array (the same stride, spans that meet) are hashed as one span. */
+static uint64_t vc_content(const VtxLive *live, int nlive, uint32_t lo, uint32_t hi)
+{
+    struct { const uint8_t *from, *to; uint32_t stride; } sp[NUM_ATTRS];
+    int ns = 0, j, s;
+    uint64_t h = 0x3C6EF372FE94F82Bull;
+    for (j = 0; j < nlive; j++) {
+        uint32_t sz = vtx_bytes(&live[j]);
+        const uint8_t *from, *to;
+        if (!sz) continue;
+        from = live[j].base + (size_t)lo * live[j].stride;
+        to   = live[j].base + (size_t)hi * live[j].stride + sz;
+        for (s = 0; s < ns; s++)
+            if (sp[s].stride == live[j].stride && from <= sp[s].to && to >= sp[s].from)
+                break;
+        if (s < ns) {
+            if (from < sp[s].from) sp[s].from = from;
+            if (to > sp[s].to) sp[s].to = to;
+        } else {
+            sp[ns].from = from; sp[ns].to = to; sp[ns].stride = live[j].stride;
+            ns++;
+        }
+    }
+    for (s = 0; s < ns; s++) {
+        h = vc_hash(sp[s].from, (size_t)(sp[s].to - sp[s].from), h);
+        g_vc_st.hashed += (unsigned long long)(sp[s].to - sp[s].from);
+    }
+    return h;
+}
+
+/* The index list of a draw over its own range: the batch's indices less its
+ * lowest, quads turned into two triangles each as the old path did. */
+static void vc_indices(uint32_t fan, uint32_t out_n, uint32_t lo, int idx32, void *dst)
+{
+    static const uint8_t q1[6] = { 0, 1, 2, 2, 3, 0 }, q2[6] = { 0, 1, 3, 3, 2, 0 };
+    const uint32_t *ix = S.idx;
+    uint16_t *d16 = (uint16_t *)dst;
+    uint32_t *d32 = (uint32_t *)dst;
+    uint32_t k, b, j;
+    if (!fan) {
+        if (idx32) for (k = 0; k < out_n; k++) d32[k] = ix[k] - lo;
+        else       for (k = 0; k < out_n; k++) d16[k] = (uint16_t)(ix[k] - lo);
+        return;
+    }
+    for (k = 0, b = 0; k < out_n; k += 6, b += (fan == 1 ? 4u : 2u)) {
+        const uint8_t *q = fan == 1 ? q1 : q2;
+        for (j = 0; j < 6; j++) {
+            uint32_t v = ix[b + q[j]] - lo;
+            if (idx32) d32[k + j] = v; else d16[k + j] = (uint16_t)v;
+        }
+    }
+}
+
+/*
+ * The kept buffer a draw goes through -- its own, found or made, or the
+ * shared one -- or 0 for the old path. *idx32 says what size its indices are
+ * and *seq that it has none: its vertices are drawn in order.
+ */
+static uint32_t vc_prepare(const VtxLive *live, int nlive, uint32_t stride_floats,
+                           uint32_t n, uint32_t fan, uint32_t out_n,
+                           int *idx32, int *seq_out)
+{
+    const uint32_t *ix = S.idx;
+    uint32_t lo = ix[0], hi = ix[0], first = ix[0], k, nuniq, vbytes, ibytes, vb;
+    uint64_t key, content;
+    int seq = (fan == 0), i32;
+    int32_t e;
+    size_t need;
+
+    for (k = 1; k < n; k++) {
+        uint32_t v = ix[k];
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+        seq &= (v == first + k);
+    }
+    nuniq = hi - lo + 1;
+    /* Indices scattered over a far larger range than they draw: converting
+     * the range would cost more than converting what is drawn. */
+    if (nuniq > 2u * out_n + 64u) return 0;
+    i32 = nuniq > 65536u;
+
+    /* What the draw is... */
+    key = 0x6A09E667F3BCC909ull;
+    key = vc_mix(key, stride_floats | ((uint64_t)fan << 32) | ((uint64_t)nlive << 40));
+    for (k = 0; k < (uint32_t)nlive; k++) {
+        key = vc_mix(key, (uint64_t)(uintptr_t)live[k].base);
+        key = vc_mix(key, live[k].stride | ((uint64_t)live[k].type << 32)
+                        | ((uint64_t)live[k].size << 40) | ((uint64_t)live[k].idx << 48));
+    }
+    key = vc_mix(key, lo | ((uint64_t)nuniq << 32));
+    key = vc_mix(key, n);
+    if (!seq) {
+        key = vc_mix(key, vc_hash(ix, (size_t)n * 4, key));
+        g_vc_st.hashed += (unsigned long long)n * 4;
+    }
+    /* ...and whether what it is made of is still what it was. */
+    content = vc_content(live, nlive, lo, hi);
+
+    e = vc_find(key);
+    vbytes = nuniq * stride_floats * (uint32_t)sizeof(float);
+    ibytes = seq ? 0 : out_n * (i32 ? 4u : 2u);
+    if (e >= 0 && g_vc[e].content == content) {
+        vc_touch(e);
+        g_vc_st.hit++;
+        if (g_vc[e].shadow)
+            vc_verify(live, nlive, stride_floats, fan, out_n, g_vc[e].shadow,
+                      vbytes, seq, i32, "found");
+        *idx32 = i32; *seq_out = seq;
+        return g_vc[e].vb;
+    }
+
+    need = (size_t)vbytes + ibytes;
+    if (g_vc_buf_cap < need) {
+        free(g_vc_buf);
+        g_vc_buf_cap = need + 65536;
+        g_vc_buf = (uint8_t *)malloc(g_vc_buf_cap);
+        if (!g_vc_buf) { g_vc_buf_cap = 0; return 0; }
+    }
+    for (k = 0; k < nuniq; k++)
+        vtx_convert(live, nlive, lo + k, (float *)g_vc_buf + (size_t)k * stride_floats);
+    g_vc_st.converted += nuniq;
+
+    if (e >= 0) {
+        /* Rewritten since it was kept: the same buffer, new vertices. */
+        vb = g_vc[e].vb;
+        g_vc[e].content = content;
+        vc_touch(e);
+        g_vc_st.changed++;
+        { PROF_T0(); G->vbuf_fill(vb, (const float *)g_vc_buf, vbytes, NULL, 0); PROF_ADD(vbo); }
+        g_vc_st.uploaded += vbytes;
+        g_prof.vbo_bytes += vbytes;
+        if (g_vc[e].shadow) {
+            memcpy(g_vc[e].shadow, g_vc_buf, vbytes);
+            vc_verify(live, nlive, stride_floats, fan, out_n, g_vc[e].shadow,
+                      vbytes, seq, i32, "rewritten");
+        }
+        *idx32 = i32; *seq_out = seq;
+        return vb;
+    }
+    if (!seq) vc_indices(fan, out_n, lo, i32, g_vc_buf + vbytes);
+    if (vc_verify_on())
+        vc_verify(live, nlive, stride_floats, fan, out_n, g_vc_buf, vbytes, seq, i32, "new");
+    { uint32_t slot = (uint32_t)(key >> 20) & (VC_NSEEN - 1);
+      if (g_vc_seen[slot] == key
+          && (e = vc_insert(key, content, vbytes + ibytes)) >= 0) {
+          vb = g_vc[e].vb;
+          g_vc_st.kept++;
+          if (vc_verify_on() && (g_vc[e].shadow = (uint8_t *)malloc(need)) != NULL)
+              memcpy(g_vc[e].shadow, g_vc_buf, need);
+      } else {
+          g_vc_seen[slot] = key;
+          vb = g_vc_stream;
+          g_vc_st.stream++;
+      } }
+    { PROF_T0();
+      G->vbuf_fill(vb, (const float *)g_vc_buf, vbytes,
+                   seq ? NULL : g_vc_buf + vbytes, ibytes);
+      PROF_ADD(vbo); }
+    g_vc_st.uploaded += (unsigned long long)vbytes + ibytes;
+    g_prof.vbo_bytes += (unsigned long)vbytes + ibytes;
+    *idx32 = i32; *seq_out = seq;
+    return vb;
+}
+
+static void vc_report(const char *when)
+{
+    if (!g_vc) return;
+    fprintf(stderr, "  [GL] vertex cache%s: %d kept (%llu KB); draws %lu found, "
+            "%lu found rewritten, %lu newly kept, %lu one-off, %lu the old way; "
+            "%lu let go; %llu K vertices converted, %llu KB hashed, %llu KB sent\n",
+            when, g_vc_n, (unsigned long long)(g_vc_held >> 10),
+            g_vc_st.hit, g_vc_st.changed, g_vc_st.kept, g_vc_st.stream,
+            g_vc_st.old_path, g_vc_st.evicted,
+            g_vc_st.converted / 1000, g_vc_st.hashed >> 10, g_vc_st.uploaded >> 10);
+}
+
+static void do_draw_body(void);
+/* A draw, timed whole for the profile (it has a great many ways out). */
 static void do_draw(void)
+{
+    if (PROF_ON()) {
+        double t0 = prof_now();
+        do_draw_body();
+        g_prof.whole_draw += prof_now() - t0;
+    } else {
+        do_draw_body();
+    }
+}
+
+static void do_draw_body(void)
 {
     static float *vbuf;
     static uint32_t vbuf_cap;
@@ -3382,11 +4003,14 @@ static void do_draw(void)
     int inl = (S.inline_count != 0);
     uint32_t stride_floats = NUM_ATTRS * 4;
     /* The vertex layout this draw actually needs. See where it is built. */
-    struct { const uint8_t *base; uint32_t stride; uint8_t type, size, idx; }
-            live[NUM_ATTRS];
+    VtxLive  live[NUM_ATTRS];
     int      nlive = 0;
     int      attr_at[NUM_ATTRS];      /* float offset in the vertex, or -1 */
     uint32_t const_mask = 0;          /* read, but supplied as a constant */
+    /* The kept buffer it is drawn from (the vertex cache), or 0: the old
+     * path, vbuf. */
+    uint32_t vc_vb = 0;
+    int      vc_i32 = 0, vc_seq = 0, wide2d = 0;
 
     if (!g_ready || !S.prim) return;
     surface_sync();
@@ -3690,62 +4314,40 @@ static void do_draw(void)
           fflush(stderr);
       } }
 
-    if (vbuf_cap < out_n * stride_floats) {
-        vbuf_cap = out_n * stride_floats + 4096;
-        free(vbuf);
-        vbuf = (float *)malloc(vbuf_cap * sizeof(float));
-        if (!vbuf) { vbuf_cap = 0; return; }
-    }
+    /* The 2D draws the widescreen squeeze measures (below): it reads their
+     * converted positions back, so they take the old path. */
+    wide2d = nv2a_wide_scene() && S.xf_mode != NV2A_XF_MODE_FIXED
+          && g_pcache[slot].inputs == 0x1F9B && attr_at[0] >= 0
+          && S.clip_w == 640 && S.clip_h == 480;
 
-    { PROF_T0();
-    for (k = 0; k < out_n; k++) {
-        uint32_t src_i;
-        float *dst = &vbuf[k * stride_floats];
-        int j;
-        if (fan_expand == 1) {
-            static const uint32_t q[6] = { 0, 1, 2, 2, 3, 0 };
-            src_i = S.idx[(k / 6) * 4 + q[k % 6]];
-        } else if (fan_expand == 2) {
-            static const uint32_t q[6] = { 0, 1, 3, 3, 2, 0 };
-            src_i = S.idx[(k / 6) * 2 + q[k % 6]];
-        } else {
-            src_i = S.idx[k];
+    { double vbo0 = g_prof.vbo;   /* vc_prepare's uploads count as vbo */
+      PROF_T0();
+    if (!inl && out_n >= VC_MIN_N && !wide2d && vc_on())
+        vc_vb = vc_prepare(live, nlive, stride_floats, n, fan_expand, out_n,
+                           &vc_i32, &vc_seq);
+    if (!vc_vb) {
+        if (g_vc) g_vc_st.old_path++;
+        if (vbuf_cap < out_n * stride_floats) {
+            vbuf_cap = out_n * stride_floats + 4096;
+            free(vbuf);
+            vbuf = (float *)malloc(vbuf_cap * sizeof(float));
+            if (!vbuf) { vbuf_cap = 0; return; }
         }
-        for (j = 0; j < nlive; j++) {
-            const uint8_t *p = live[j].base + (size_t)src_i * live[j].stride;
-            float *o = dst + j * 4;
-            uint32_t c, sz = live[j].size;
-            o[0] = o[1] = o[2] = 0.0f; o[3] = 1.0f;
-            switch (live[j].type) {
-            case 0:   /* D3DCOLOR: one dword, B,G,R,A in memory order */
-                o[0] = p[2] * (1.0f / 255.0f); o[1] = p[1] * (1.0f / 255.0f);
-                o[2] = p[0] * (1.0f / 255.0f); o[3] = p[3] * (1.0f / 255.0f);
-                break;
-            case 1:   /* signed short, normalised */
-                for (c = 0; c < sz; c++)
-                    o[c] = ((const int16_t *)p)[c] * (1.0f / 32767.0f);
-                break;
-            case 2:   /* float */
-                for (c = 0; c < sz; c++) o[c] = ((const float *)p)[c];
-                break;
-            case 4:   /* unsigned byte, normalised, RGBA order */
-                for (c = 0; c < sz; c++) o[c] = p[c] * (1.0f / 255.0f);
-                break;
-            case 5:   /* signed short, not normalised */
-                for (c = 0; c < sz; c++) o[c] = (float)((const int16_t *)p)[c];
-                break;
-            case 6: { /* packed 11/11/10, signed and normalised */
-                uint32_t v = *(const uint32_t *)p;
-                o[0] = ((int32_t)(v << 21) >> 21) * (1.0f / 1023.0f);
-                o[1] = ((int32_t)(v << 10) >> 21) * (1.0f / 1023.0f);
-                o[2] = ((int32_t)(v)       >> 22) * (1.0f / 511.0f);
-                break;
+        for (k = 0; k < out_n; k++) {
+            uint32_t src_i;
+            if (fan_expand == 1) {
+                static const uint32_t q[6] = { 0, 1, 2, 2, 3, 0 };
+                src_i = S.idx[(k / 6) * 4 + q[k % 6]];
+            } else if (fan_expand == 2) {
+                static const uint32_t q[6] = { 0, 1, 3, 3, 2, 0 };
+                src_i = S.idx[(k / 6) * 2 + q[k % 6]];
+            } else {
+                src_i = S.idx[k];
             }
-            default: break;
-            }
+            vtx_convert(live, nlive, src_i, &vbuf[k * stride_floats]);
         }
     }
-    PROF_ADD(verts); }
+    if (PROF_ON()) g_prof.verts += prof_now() - _t0 - (g_prof.vbo - vbo0); }
 
     /* The program behind a slot, and the constants it reads, printed once.
      *
@@ -3942,10 +4544,15 @@ static void do_draw(void)
     /* The vertices, where each attribute sits in them, and the value of
      * each one the program reads that has no array (see the device). */
     { PROF_T0();
-      G->vertices(vbuf, out_n, stride_floats, attr_at, const_mask,
-                  (const float (*)[4])S.const_attr);
-      PROF_ADD(vbo);
-      g_prof.vbo_bytes += (unsigned long)out_n * stride_floats * sizeof(float); }
+      if (vc_vb) {
+          G->vbuf_bind(vc_vb, stride_floats, attr_at, const_mask,
+                       (const float (*)[4])S.const_attr);
+      } else {
+          G->vertices(vbuf, out_n, stride_floats, attr_at, const_mask,
+                      (const float (*)[4])S.const_attr);
+          g_prof.vbo_bytes += (unsigned long)out_n * stride_floats * sizeof(float);
+      }
+      PROF_ADD(vbo); }
 
     if (g_cur_slot != slot) {
         g_prof.n_prog_switch++;
@@ -4260,13 +4867,60 @@ static void do_draw(void)
         if (uses(slot, NV2A_U_FFTEXMAT))
             G->uniform_f(NV2A_U_FFTEXMAT, &S.u.ff_texmat[0][0], 16);
     }
-    if (S.consts_dirty) {
+    if (!G->uniform_f_part) {
+        if (S.consts_dirty) {
+            PROF_T0();
+            G->uniform_f(NV2A_U_C, &S.u.c[0][0], NV2A_VSH_NUM_CONSTS);
+            S.consts_dirty = 0;
+            PROF_ADD(unif);
+            g_prof.n_const_upload++;
+            g_prof.unif_vec4 += NV2A_VSH_NUM_CONSTS;
+        }
+    } else if (uses(slot, NV2A_U_C)) {
+        /* What changed since this program last had the constants (see
+         * g_cstamp), in runs; a gap of a few unchanged ones inside a run is
+         * sent along rather than split around. */
+        uint32_t from = g_pcache[slot].csync;
         PROF_T0();
-        G->uniform_f(NV2A_U_C, &S.u.c[0][0], NV2A_VSH_NUM_CONSTS);
+        if (from && g_clast >= from) {
+            int i = 0, ok = 1;
+            while (ok && i < NV2A_VSH_NUM_CONSTS) {
+                int j, g;
+                if (g_cstamp[i] < from) { i++; continue; }
+                j = i + 1;
+                for (;;) {
+                    while (j < NV2A_VSH_NUM_CONSTS && g_cstamp[j] >= from) j++;
+                    for (g = j; g < NV2A_VSH_NUM_CONSTS && g < j + 4 && g_cstamp[g] < from; g++) ;
+                    if (g < NV2A_VSH_NUM_CONSTS && g < j + 4) { j = g; continue; }
+                    break;
+                }
+                ok = G->uniform_f_part(NV2A_U_C, i, &S.u.c[i][0], j - i);
+                g_prof.n_const_upload++;
+                g_prof.unif_vec4 += (unsigned long)(j - i);
+                i = j;
+            }
+            if (!ok) from = 0;
+        }
+        if (!from) {
+            G->uniform_f(NV2A_U_C, &S.u.c[0][0], NV2A_VSH_NUM_CONSTS);
+            g_prof.n_const_upload++;
+            g_prof.unif_vec4 += NV2A_VSH_NUM_CONSTS;
+        }
+        /* Up to date now. A change since the clock last ticked moves it on,
+         * so that the next change is told apart from what was just sent. */
+        if (g_clast == g_cclock) {
+            if (++g_cclock == 0xFFFFFFF0u) {
+                /* Four billion uploads in: start the clock again, and every
+                 * program from nothing. */
+                int k;
+                memset(g_cstamp, 0, sizeof g_cstamp);
+                for (k = 0; k < PROG_CACHE; k++) g_pcache[k].csync = 0;
+                g_cclock = 1; g_clast = 0;
+            }
+        }
+        g_pcache[slot].csync = g_cclock;
         S.consts_dirty = 0;
         PROF_ADD(unif);
-        g_prof.n_const_upload++;
-        g_prof.unif_vec4 += NV2A_VSH_NUM_CONSTS;
     }
     /* Widescreen's 2D squeeze (see nv2a_widescreen): ndc.x is
      * (x - vpOff.x) / vpScale.x, so 4/3 more scale is 3/4 the width. */
@@ -4866,10 +5520,14 @@ static void do_draw(void)
             for (q3 = 0; q3 < len2; q3++)
                 if (vp2.insns[q3].rel_addr) { base3 = vp2.insns[q3].const_index; break; }
             if (base3 >= 0) {
+                /* The draw's first vertex, converted here: a draw from the
+                 * vertex cache has no converted copy in vbuf to read. */
+                float v03[NUM_ATTRS * 4];
+                vtx_convert(live, nlive, S.idx[0], v03);
                 memset(vin3, 0, sizeof vin3);
                 for (k3 = 0; k3 < NUM_ATTRS; k3++) {
                     if (attr_at[k3] >= 0)
-                        memcpy(vin3[k3], &vbuf[(size_t)attr_at[k3]], 16);
+                        memcpy(vin3[k3], &v03[attr_at[k3]], 16);
                     else memcpy(vin3[k3], S.const_attr[k3], 16);
                 }
                 na3 = nv2a_vsh_interp_a0(&vp2, vin3, S.u.c, a0s3, 8);
@@ -4886,7 +5544,7 @@ static void do_draw(void)
                          * both sides and diff them. Everything that decides
                          * whether a fragment survives goes on the line. */
                         { float dif3[4] = {0,0,0,0};
-                          if (attr_at[3] >= 0) memcpy(dif3, &vbuf[(size_t)attr_at[3]], 16);
+                          if (attr_at[3] >= 0) memcpy(dif3, &v03[attr_at[3]], 16);
                           else memcpy(dif3, S.const_attr[3], 16);
                         fprintf(stderr, "  [MOVERPOS] slot %4d verts %4u A0=%d "
                                 "c[%d] -> world (%.1f %.1f %.1f) | diffuse "
@@ -5749,7 +6407,12 @@ static void do_draw(void)
             goto xray_done;
         } }
     }
-    if (!curtain_skip && !g_surf_lost) { PROF_T0(); G->draw(mode, out_n); PROF_ADD(draw); }
+    if (!curtain_skip && !g_surf_lost) {
+        PROF_T0();
+        if (vc_vb && !vc_seq) G->draw_indexed(mode, out_n, vc_i32);
+        else                  G->draw(mode, out_n);
+        PROF_ADD(draw);
+    }
     xray_done: ;
     /*
      * RECOMP_GL_DARKHUNT=<n>: which draw makes the frame dark.
@@ -7236,10 +7899,16 @@ static void do_draw(void)
                     S.ff_imv[2][0], S.ff_imv[2][1], S.ff_imv[2][2]);
     }
 
-    /* Record what this draw was, for the order dump. */
+    /* Record what this draw was, for the order dump. The extent only while
+     * a dump can print it: it was a pass over every vertex of every draw.
+     * A draw from the vertex cache has no converted vertices to pass over,
+     * and is listed without one. */
     {
         uint32_t k = g_ring_n % DRAW_RING, v;
         float mnx = 1e30f, mxx = -1e30f, mny = 1e30f, mxy = -1e30f;
+        static int want = -1;
+        if (want < 0) want = getenv("RECOMP_GL_DUMP_FB") ? 1 : 0;
+        if (want && !vc_vb)
         for (v = 0; v < out_n; v++) {
             float x = vbuf[(size_t)v * stride_floats + 0];
             float y = vbuf[(size_t)v * stride_floats + 1];
@@ -7802,7 +8471,7 @@ static void present(int is_frame)
         }
     }
 
-    if (is_frame) frame_pace();
+    if (is_frame) { PROF_T0(); frame_pace(); PROF_ADD(pace); }
 
     /* Put the finished frame on screen: the surface the title has set up
      * when it flips, which is what the window showed while surfaces were
@@ -7810,6 +8479,7 @@ static void present(int is_frame)
      * each frame into). Surfaces are bound when used now, and the last one
      * used at the flip is the off-screen frame instead. */
     if (is_frame) {
+        PROF_T0();
         uint32_t prt = g_cur_rt;
         uint32_t pw = g_fbo_pw ? g_fbo_pw : g_fbo_w;
         uint32_t ph = g_fbo_ph ? g_fbo_ph : g_fbo_h;
@@ -7857,6 +8527,7 @@ static void present(int is_frame)
             exit(0);
         }
 #endif
+        PROF_ADD(present);
     }
 
     va = resolve(S.color_offset);
@@ -8206,8 +8877,10 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
      * multiplies every position by zero, which draws nothing at all and looks
      * like the whole renderer being broken. */
     if (method >= M_SET_TRANSFORM_PROGRAM && method <= M_SET_TRANSFORM_PROGRAM + 0x7C) {
-        if (S.prog_load < NV2A_VSH_MAX_INSNS)
+        if (S.prog_load < NV2A_VSH_MAX_INSNS) {
             S.prog[S.prog_load * 4 + S.prog_sub] = param;
+            g_vsh_gen++;
+        }
         if (++S.prog_sub == 4) { S.prog_sub = 0; S.prog_load++; S.prog_dirty = 1; }
         return;
     }
@@ -8261,8 +8934,11 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
                   fflush(stderr);
               }
           } }
-        if (S.const_load < NV2A_VSH_NUM_CONSTS)
+        if (S.const_load < NV2A_VSH_NUM_CONSTS
+            && memcmp(&S.u.c[S.const_load][S.const_sub], &param, 4) != 0) {
             memcpy(&S.u.c[S.const_load][S.const_sub], &param, 4);
+            const_changed(S.const_load);
+        }
         if (++S.const_sub == 4) { S.const_sub = 0; S.const_load++; }
         S.consts_dirty = 1;
         S.consts_since_geom = 1;
@@ -8529,6 +9205,7 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
          * costs more than the draw does. */
         if (memcmp(&S.u.c[NV2A_XFCTX_VPOFF][sub], &param, 4) != 0) {
             memcpy(&S.u.c[NV2A_XFCTX_VPOFF][sub], &param, 4);
+            const_changed(NV2A_XFCTX_VPOFF);
             S.consts_dirty = 1;
         }
         return;
@@ -8551,6 +9228,7 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
         memcpy(&S.u.vp_scale[sub], &param, 4);
         if (memcmp(&S.u.c[NV2A_XFCTX_VPSCL][sub], &param, 4) != 0) {
             memcpy(&S.u.c[NV2A_XFCTX_VPSCL][sub], &param, 4);
+            const_changed(NV2A_XFCTX_VPSCL);
             S.consts_dirty = 1;
         }
         return;
@@ -9002,6 +9680,7 @@ unsigned long nv2a_gl_progress(void) { return (unsigned long)S.flips; }
 void nv2a_gl_report(void)
 {
     if (!nv2a_gl_enabled()) return;
+    vc_report("");
 #if defined(NV2A_SDL_PRESENTER)
     if (g_presenter == 1) ps_line("the whole run", g_ps.on, g_ps.shown, g_ps.dropped);
 #endif

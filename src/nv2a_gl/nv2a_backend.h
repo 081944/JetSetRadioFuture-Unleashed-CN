@@ -335,6 +335,35 @@ typedef struct Nv2aGfx {
     void     (*present)(uint32_t rt, uint32_t pw, uint32_t ph);
 
     void     (*report)(void);
+
+    /*
+     * Everything below is optional: a backend that leaves it NULL gets every
+     * draw through vertices() and draw() and every constant upload whole, as
+     * before. (Metal does.)
+     *
+     * Geometry kept between draws. The front half decides what is kept, for
+     * how long, and whether it is still what the title's memory holds (the
+     * vertex cache in nv2a_gl.c); a backend only holds the buffers. A kept
+     * buffer is vertices laid out as vertices() takes them and, for an
+     * indexed draw, a list of 16- or 32-bit indices into them.
+     */
+    /* `stream`: refilled for nearly every draw (the one-off geometry). */
+    uint32_t (*vbuf_new)(int stream);
+    void     (*vbuf_free)(uint32_t vb);
+    /* Replace what it holds: the vertices if `v`, the indices if `idx`. */
+    void     (*vbuf_fill)(uint32_t vb, const float *v, uint32_t vbytes,
+                          const void *idx, uint32_t ibytes);
+    /* vertices(), for the draws that follow, from a kept buffer. */
+    void     (*vbuf_bind)(uint32_t vb, uint32_t stride_floats, const int attr_at[16],
+                          uint32_t const_mask, const float const_attr[16][4]);
+    /* `count` of the bound kept buffer's indices, 32-bit ones if `idx32`. */
+    void     (*draw_indexed)(int prim, uint32_t count, int idx32);
+
+    /* uniform_f() for elements first .. first+n-1 of an array uniform of
+     * the program in use; elements past the end of the program's array are
+     * skipped. 0 if the backend cannot address part of this one, and the
+     * front half uploads the whole array instead. */
+    int      (*uniform_f_part)(int id, int first, const float *v, int n);
 } Nv2aGfx;
 
 /* The implementations. Each returns NULL where it cannot run (no Metal

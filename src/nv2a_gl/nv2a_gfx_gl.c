@@ -309,6 +309,11 @@ static int glx_tex_read(uint32_t t, uint32_t w, uint32_t h, void *bgra)
 static struct {
     GLuint prog;
     GLint  loc[NV2A_U_COUNT];
+    /* How many elements of c[] the program kept (a compiler trims an array
+     * read only at fixed indices to the highest one read), if element k sits
+     * at location loc + k; 0 if not known to, and then it is only ever
+     * uploaded whole. */
+    GLint  csize;
     int    used;
 } *g_prog;
 static uint32_t g_cur_prog;      /* handle in use, 0 none */
@@ -410,6 +415,32 @@ static uint32_t glx_prog_new(const char *vsrc, const char *fsrc, const char *wha
      * zero, so there is exactly one list: nv2a_uniform_desc. */
     for (id = 0; id < NV2A_U_COUNT; id++)
         g_prog[i].loc[id] = glGetUniformLocation(prog, nv2a_uniform_desc[id].name);
+    /* Part of c[] at a time (uniform_f_part) only where the locations are
+     * known to run on from c[0]: every driver lays an array out that way,
+     * but the specification promises it only for explicit locations, so it
+     * is checked at both ends rather than assumed. */
+    g_prog[i].csize = 0;
+    if (g_prog[i].loc[NV2A_U_C] >= 0) {
+        char nm[48];
+        const GLchar *names[1];
+        GLuint ui = GL_INVALID_INDEX;
+        GLint sz = 0, l0 = g_prog[i].loc[NV2A_U_C];
+        snprintf(nm, sizeof nm, "%s[0]", nv2a_uniform_desc[NV2A_U_C].name);
+        names[0] = nm;
+        glGetUniformIndices(prog, 1, names, &ui);
+        if (ui != GL_INVALID_INDEX)
+            glGetActiveUniformsiv(prog, 1, &ui, GL_UNIFORM_SIZE, &sz);
+        if (sz > 0) {
+            int ok = 1;
+            if (sz > 1) {
+                snprintf(nm, sizeof nm, "%s[1]", nv2a_uniform_desc[NV2A_U_C].name);
+                ok = glGetUniformLocation(prog, nm) == l0 + 1;
+                snprintf(nm, sizeof nm, "%s[%d]", nv2a_uniform_desc[NV2A_U_C].name, (int)sz - 1);
+                ok = ok && glGetUniformLocation(prog, nm) == l0 + sz - 1;
+            }
+            if (ok) g_prog[i].csize = sz;
+        }
+    }
     return (uint32_t)i + 1;
 }
 
@@ -460,6 +491,26 @@ static void glx_uniform_i(int id, int v)
     if (loc >= 0) glUniform1i(loc, v);
 }
 
+/* Part of c[]: the constants that changed since this program last had them,
+ * rather than all 192 every time any one did. */
+static int glx_uniform_f_part(int id, int first, const float *v, int n)
+{
+    static int off = -1;
+    GLint loc, size;
+    /* RECOMP_GL_CONST_PART=0: always the whole file, as before. */
+    if (off < 0) { const char *e = getenv("RECOMP_GL_CONST_PART"); off = (e && e[0] == '0') ? 1 : 0; }
+    if (off) return 0;
+    if (!prog_ok(g_cur_prog) || id != NV2A_U_C || first < 0 || n < 0) return 0;
+    loc = g_prog[g_cur_prog - 1].loc[id];
+    if (loc < 0) return 1;                  /* not read at all */
+    size = g_prog[g_cur_prog - 1].csize;
+    if (size <= 0) return 0;
+    if (first >= size) return 1;            /* past what the program reads */
+    if (first + n > size) n = size - first;
+    if (n > 0) glUniform4fv(loc + first, n, v);
+    return 1;
+}
+
 static void glx_texture(int unit, uint32_t tex)
 {
     glActiveTexture((GLenum)(GL_TEXTURE0 + unit));
@@ -477,7 +528,10 @@ static void glx_texture(int unit, uint32_t tex)
  * toggles, per draw, all identical to the last one. Remembering what was set
  * turns that into a handful of calls. */
 static struct {
-    uint32_t layout;        /* which arrays are enabled, and where each sits */
+    uint32_t layout;        /* g_vao's arrays: which are enabled, where each sits */
+    int      layout_valid;
+    uint32_t draw_layout;   /* the last draw's, whichever vertex array it used */
+    int      draw_valid;
     uint32_t const_mask;    /* attributes currently set as constants */
     float    const_attr[16][4];   /* and the values they were set to */
     int      depth_test, depth_func, depth_mask;
@@ -705,47 +759,53 @@ static void glx_state(const Nv2aRenderState *rs)
 
 /* ---- vertices and draws -------------------------------------------------- */
 
-static void glx_vertices(const float *v, uint32_t nverts, uint32_t stride_floats,
-                         const int attr_at[16], uint32_t const_mask,
-                         const float const_attr[16][4])
+/* The layout of a vertex: the stride and where each array-fed attribute
+ * sits. The offsets and stride are a property of the layout, not of the
+ * buffer, so a vertex array's pointers are re-specified only when it
+ * changes. */
+static uint32_t layout_of(uint32_t stride_floats, const int attr_at[16])
 {
-    uint32_t layout_key, i;
-
-    glBindVertexArray(g_vao);
-    glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
-    glBufferData(GL_ARRAY_BUFFER,
-                 (GLsizeiptr)nverts * stride_floats * sizeof(float),
-                 v, GL_STREAM_DRAW);
-    /* The buffer is re-created every draw, so the pointers have to be re-
-     * specified only when the layout changes -- the offsets and stride are a
-     * property of the layout, not of the buffer. The layout is the set of
-     * attributes that came from arrays and where each one sits, plus which
-     * are constants: the same program drawn twice with a different attribute
-     * supplied as a constant is a different layout. */
-    layout_key = stride_floats * 2654435761u;
+    uint32_t k = stride_floats * 2654435761u, i;
     for (i = 0; i < 16; i++)
-        layout_key = layout_key * 17u + (uint32_t)(attr_at[i] + 1);
-    layout_key = layout_key * 65599u + const_mask;
-    if (!g_last.valid || g_last.layout != layout_key) {
-        for (i = 0; i < 16; i++) {
-            if (attr_at[i] >= 0) {
-                glEnableVertexAttribArray(i);
-                glVertexAttribPointer(i, 4, GL_FLOAT, GL_FALSE,
-                    (GLsizei)(stride_floats * sizeof(float)),
-                    (const void *)(uintptr_t)((uint32_t)attr_at[i] * sizeof(float)));
-            } else {
-                glDisableVertexAttribArray(i);
-            }
+        k = k * 17u + (uint32_t)(attr_at[i] + 1);
+    return k;
+}
+
+/* The bound vertex array's attribute arrays, from the buffer bound to
+ * GL_ARRAY_BUFFER. */
+static void set_pointers(uint32_t stride_floats, const int attr_at[16])
+{
+    uint32_t i;
+    for (i = 0; i < 16; i++) {
+        if (attr_at[i] >= 0) {
+            glEnableVertexAttribArray(i);
+            glVertexAttribPointer(i, 4, GL_FLOAT, GL_FALSE,
+                (GLsizei)(stride_floats * sizeof(float)),
+                (const void *)(uintptr_t)((uint32_t)attr_at[i] * sizeof(float)));
+        } else {
+            glDisableVertexAttribArray(i);
         }
-        g_last.layout = layout_key;
-        g_last.valid = 1;
+    }
+}
+
+/* An attribute the program reads with no array behind it is one value for
+ * the whole draw. GL has a per-attribute constant for exactly this, so it
+ * costs one call rather than four floats in every vertex. Values are
+ * compared per attribute: the sticky attributes move with every draw, and
+ * comparing the whole table re-sent every constant. A draw laid out
+ * differently from the last -- which arrays there are, and which attributes
+ * are constants: the same program drawn twice with a different attribute
+ * supplied as a constant is a different layout -- sends them all, because an
+ * attribute read from an array leaves its constant undefined in older GL. */
+static void set_consts(uint32_t draw_layout, uint32_t const_mask,
+                       const float const_attr[16][4])
+{
+    uint32_t i;
+    if (!g_last.draw_valid || g_last.draw_layout != draw_layout) {
+        g_last.draw_layout = draw_layout;
+        g_last.draw_valid = 1;
         g_last.const_mask = ~const_mask;   /* force the constants below */
     }
-    /* An attribute the program reads with no array behind it is one value
-     * for the whole draw. GL has a per-attribute constant for exactly this,
-     * so it costs one call rather than four floats in every vertex. Values
-     * are compared per attribute: the sticky attributes move with every
-     * draw, and comparing the whole table re-sent every constant. */
     if (const_mask) {
         int all = (g_last.const_mask != const_mask);
         for (i = 0; i < 16; i++)
@@ -758,6 +818,125 @@ static void glx_vertices(const float *v, uint32_t nverts, uint32_t stride_floats
         g_last.const_mask = const_mask;
     }
 }
+
+static void glx_vertices(const float *v, uint32_t nverts, uint32_t stride_floats,
+                         const int attr_at[16], uint32_t const_mask,
+                         const float const_attr[16][4])
+{
+    uint32_t layout;
+
+    glBindVertexArray(g_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+    glBufferData(GL_ARRAY_BUFFER,
+                 (GLsizeiptr)nverts * stride_floats * sizeof(float),
+                 v, GL_STREAM_DRAW);
+    /* The buffer is re-created every draw; the pointers into it only change
+     * with the layout. */
+    layout = layout_of(stride_floats, attr_at);
+    if (!g_last.layout_valid || g_last.layout != layout) {
+        set_pointers(stride_floats, attr_at);
+        g_last.layout = layout;
+        g_last.layout_valid = 1;
+    }
+    set_consts(layout * 65599u + const_mask, const_mask, const_attr);
+}
+
+/* ---- kept vertex buffers ------------------------------------------------- *
+ *
+ * The vertex cache's buffers (nv2a_gl.c decides what goes in them and when
+ * they are stale). Each has a vertex array of its own, so a draw from one
+ * that is still laid out as last time is a bind and a draw: its pointers and
+ * its index buffer are vertex-array state and stay put. They are filled
+ * through GL_COPY_WRITE_BUFFER, which no vertex array records, so filling one
+ * never disturbs the vertex array a draw is about to use.
+ */
+#define MAX_VBUFS 16384
+static struct {
+    GLuint   vao, vbo, ibo;
+    uint32_t layout;
+    uint8_t  used, laid_out, stream;
+} *g_vb;
+static uint32_t *g_vb_free, g_vb_nfree, g_vb_top;
+
+static int vb_ok(uint32_t h) { return g_vb && h && h <= g_vb_top && g_vb[h - 1].used; }
+
+static uint32_t glx_vbuf_new(int stream)
+{
+    uint32_t i;
+    if (!g_vb) {
+        g_vb = calloc(MAX_VBUFS, sizeof *g_vb);
+        g_vb_free = calloc(MAX_VBUFS, sizeof *g_vb_free);
+        if (!g_vb || !g_vb_free) { free(g_vb); free(g_vb_free); g_vb = NULL; g_vb_free = NULL; return 0; }
+    }
+    if (g_vb_nfree) i = g_vb_free[--g_vb_nfree];
+    else if (g_vb_top < MAX_VBUFS) i = g_vb_top++;
+    else return 0;
+    memset(&g_vb[i], 0, sizeof g_vb[i]);
+    glGenVertexArrays(1, &g_vb[i].vao);
+    glGenBuffers(1, &g_vb[i].vbo);
+    if (!g_vb[i].vao || !g_vb[i].vbo) {
+        if (g_vb[i].vao) glDeleteVertexArrays(1, &g_vb[i].vao);
+        if (g_vb[i].vbo) glDeleteBuffers(1, &g_vb[i].vbo);
+        g_vb_free[g_vb_nfree++] = i;
+        return 0;
+    }
+    g_vb[i].used = 1;
+    g_vb[i].stream = (uint8_t)(stream ? 1 : 0);
+    return i + 1;
+}
+
+static void glx_vbuf_free(uint32_t h)
+{
+    if (!vb_ok(h)) return;
+    glDeleteVertexArrays(1, &g_vb[h - 1].vao);
+    glDeleteBuffers(1, &g_vb[h - 1].vbo);
+    if (g_vb[h - 1].ibo) glDeleteBuffers(1, &g_vb[h - 1].ibo);
+    memset(&g_vb[h - 1], 0, sizeof g_vb[0]);
+    g_vb_free[g_vb_nfree++] = h - 1;
+}
+
+static void glx_vbuf_fill(uint32_t h, const float *v, uint32_t vbytes,
+                          const void *idx, uint32_t ibytes)
+{
+    if (!vb_ok(h)) return;
+    /* The stream buffer is refilled for nearly every draw; the rest hold
+     * what a level draws every frame. */
+    if (v) {
+        glBindBuffer(GL_COPY_WRITE_BUFFER, g_vb[h - 1].vbo);
+        glBufferData(GL_COPY_WRITE_BUFFER, (GLsizeiptr)vbytes, v,
+                     g_vb[h - 1].stream ? GL_STREAM_DRAW : GL_STATIC_DRAW);
+    }
+    if (idx) {
+        if (!g_vb[h - 1].ibo) {
+            glGenBuffers(1, &g_vb[h - 1].ibo);
+            /* The index buffer is vertex-array state: attached once. */
+            glBindVertexArray(g_vb[h - 1].vao);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_vb[h - 1].ibo);
+        }
+        glBindBuffer(GL_COPY_WRITE_BUFFER, g_vb[h - 1].ibo);
+        glBufferData(GL_COPY_WRITE_BUFFER, (GLsizeiptr)ibytes, idx,
+                     g_vb[h - 1].stream ? GL_STREAM_DRAW : GL_STATIC_DRAW);
+    }
+    glBindBuffer(GL_COPY_WRITE_BUFFER, 0);
+}
+
+static void glx_vbuf_bind(uint32_t h, uint32_t stride_floats, const int attr_at[16],
+                          uint32_t const_mask, const float const_attr[16][4])
+{
+    uint32_t layout;
+    if (!vb_ok(h)) return;
+    layout = layout_of(stride_floats, attr_at);
+    glBindVertexArray(g_vb[h - 1].vao);
+    if (!g_vb[h - 1].laid_out || g_vb[h - 1].layout != layout) {
+        glBindBuffer(GL_ARRAY_BUFFER, g_vb[h - 1].vbo);
+        set_pointers(stride_floats, attr_at);
+        g_vb[h - 1].laid_out = 1;
+        g_vb[h - 1].layout = layout;
+    }
+    set_consts(layout * 65599u + const_mask, const_mask, const_attr);
+}
+
+static void glx_draw_indexed(int prim, uint32_t count, int idx32);
 
 static GLenum gl_prim_of(int p)
 {
@@ -775,6 +954,12 @@ static GLenum gl_prim_of(int p)
 static void glx_draw(int prim, uint32_t count)
 {
     glDrawArrays(gl_prim_of(prim), 0, (GLsizei)count);
+}
+
+static void glx_draw_indexed(int prim, uint32_t count, int idx32)
+{
+    glDrawElements(gl_prim_of(prim), (GLsizei)count,
+                   idx32 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT, (const void *)0);
 }
 
 /* ---- clears -------------------------------------------------------------- */
@@ -871,6 +1056,8 @@ static const Nv2aGfx g_gl = {
     glx_uniform_f, glx_uniform_i,
     glx_texture, glx_state, glx_state_invalidate,
     glx_vertices, glx_draw, glx_clear, glx_present, glx_report,
+    glx_vbuf_new, glx_vbuf_free, glx_vbuf_fill, glx_vbuf_bind, glx_draw_indexed,
+    glx_uniform_f_part,
 };
 
 const Nv2aGfx *nv2a_gfx_gl(void) { return &g_gl; }
