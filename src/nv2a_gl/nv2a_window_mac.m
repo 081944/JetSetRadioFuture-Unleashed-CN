@@ -158,13 +158,14 @@ static void nv_window_colour_space(void)
         static int lw = 640, lh = 480;
         int fw, fh, dw = vw, dh = vh;
         extern int nv2a_wide_scene(void);
+        extern float nv2a_wide_aspect(void);
         if (pw > 0 && ph > 0) { lw = pw; lh = ph; }
         fw = lw; fh = lh;
         /* Widescreen: the frame holds a 16:9 view squeezed into 4:3
          * (nv2a_widescreen in nv2a_gl.c) -- shown at 16:9 it is the right
          * shape again. A scene the game kept 4:3 (the title) keeps its
          * shape too, between black bars. */
-        if (nv2a_wide_scene()) { fw = 16; fh = 9; }
+        if (nv2a_wide_scene()) { fw = (int)(nv2a_wide_aspect() * 900.0f + 0.5f); fh = 900; }
         if ((long)vw * fh > (long)vh * fw) dw = (int)((long)vh * fw / fh);
         else                               dh = (int)((long)vw * fh / fw);
         glViewport((vw - dw) / 2, (vh - dh) / 2, dw, dh);

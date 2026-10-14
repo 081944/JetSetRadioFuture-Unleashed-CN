@@ -148,21 +148,45 @@ int nv_window_pref_scale(void)
     }
 }
 
-/* 16:9 unless turned off: every iPhone is wider than that. */
-int nv_window_pref_widescreen(void);
-int nv_window_pref_widescreen(void)
+/* The picture: 0 the console's 4:3, 1 16:9 (the default), 2 Fill the screen
+ * (every iPhone since the X is about 19.5:9, where 16:9 leaves black bars at
+ * both ends). Kept as "picture" since 0.4.4; the "widescreen" switch before
+ * it is not read, so a player who had turned it off starts at 16:9, once. */
+static int picture_pref(void)
 {
     @autoreleasepool {
         NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-        return [d objectForKey:@"widescreen"] ? ([d boolForKey:@"widescreen"] ? 1 : 0) : 1;
+        NSInteger v = [d objectForKey:@"picture"] ? [d integerForKey:@"picture"] : 1;
+        return v >= 0 && v <= 2 ? (int)v : 1;
     }
 }
+
+/* nv2a_widescreen() asks this when RECOMP_WIDESCREEN is not set. */
+int nv_window_pref_widescreen(void);
+int nv_window_pref_widescreen(void) { return picture_pref() != 0; }
 
 int nv_window_pref_metal(void);
 int nv_window_pref_metal(void) { return 1; }
 
 extern int  nv2a_widescreen(void);
 extern void nv2a_set_widescreen(int on);
+extern void nv2a_set_wide_aspect(float aspect);
+
+static int fill_pref(void) { return picture_pref() == 2; }
+
+static NSString *const k_picture[3] = { @"4:3", @"16:9", @"Fill the screen" };
+static int picture_mode(void) { return !nv2a_widescreen() ? 0 : fill_pref() ? 2 : 1; }
+
+/* The shape a widened scene is drawn and shown at: the view's own when
+ * filling it (the renderer keeps it between 16:9 and 2.4:1, so on an iPad,
+ * narrower than 16:9, it is 16:9), else 16:9. */
+static void apply_wide_shape(CGSize view)
+{
+    double w = view.width, h = view.height, a;
+    if (w <= 0 || h <= 0) return;
+    a = w > h ? w / h : h / w;              /* landscape, whichever way up */
+    nv2a_set_wide_aspect(fill_pref() ? (float)a : 16.0f / 9.0f);
+}
 extern void xa2_resume(void);
 
 /* ---- where things are --------------------------------------------------- */
@@ -342,6 +366,7 @@ static int start_engine(NSString *game)
         fprintf(stderr, "[WIN] drawable %.0fx%.0f\n", sz.width, sz.height);
         fflush(stderr);
     }
+    apply_wide_shape(self.bounds.size);
     if (scr) g_refresh_hz = (int)scr.maximumFramesPerSecond;
 }
 @end
@@ -906,12 +931,10 @@ static BOOL touch_pref(void)
     UIAlertController *a = [UIAlertController alertControllerWithTitle:
                                [NSString stringWithFormat:@"JSRF Unleashed %@", ver]
                                message:nil preferredStyle:UIAlertControllerStyleAlert];
-    int wide = nv2a_widescreen();
     [self releaseKeys];
-    [a addAction:[UIAlertAction actionWithTitle:wide ? @"Widescreen: on" : @"Widescreen: off"
-        style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { (void)x;
-            nv2a_set_widescreen(!wide);
-            [d setBool:!wide forKey:@"widescreen"]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Picture: %@",
+                                                 k_picture[picture_mode()]]
+        style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { (void)x; [self pickPicture]; }]];
     [a addAction:[UIAlertAction actionWithTitle:touch_pref() ? @"On-screen controls: shown" : @"On-screen controls: hidden"
         style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { (void)x;
             [d setBool:!touch_pref() forKey:@"touchControls"];
@@ -929,6 +952,26 @@ static BOOL touch_pref(void)
               "A keyboard: WASD (by position) moves, arrows the camera, Space jump, E spray, "
               "Return Start, Esc Back."]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+/* The picture's shape: the console's 4:3, 16:9, or the whole screen. */
+- (void)pickPicture
+{
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Picture"
+        message:@"Wider shows more of the city to the sides; menus and the HUD keep their shape."
+        preferredStyle:UIAlertControllerStyleAlert];
+    int cur = picture_mode();
+    for (int m = 0; m < 3; m++)
+        [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@%@", k_picture[m],
+                                                     m == cur ? @"  ✓" : @""]
+            style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { (void)x;
+                [[NSUserDefaults standardUserDefaults] setInteger:m forKey:@"picture"];
+                nv2a_set_widescreen(m != 0);
+                apply_wide_shape(self.view.bounds.size);
+                fprintf(stderr, "[IOS] picture: %s\n", m == 0 ? "4:3" : m == 1 ? "16:9" : "fill the screen");
+                fflush(stderr); }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
 }
 
@@ -1089,6 +1132,22 @@ static const char *const k_env[][2] = {
     { "RECOMP_WINDOW", "1" }, { "RECOMP_BACKEND", "metal" },
 };
 
+/* Set when the app is loaded, before the runtime's own constructors: some
+ * of them read these -- RECOMP_ABI_RESTORE, the repair of the registers a
+ * lifted function fails to preserve, is read by one -- and on the Mac the
+ * launcher has set them before the engine starts. Set in main, as they were,
+ * that one came too late and the iPhone ran without the repair. Darwin runs
+ * initialisers in link order, and the app's own files are linked before the
+ * runtime's libraries; nv_ios_main checks anyway. Anything already set (a
+ * test run's SIMCTL_CHILD_*) wins. */
+__attribute__((constructor(101))) static void ios_env(void)
+{
+    size_t i;
+    for (i = 0; i < sizeof k_env / sizeof k_env[0]; i++)
+        setenv(k_env[i][0], k_env[i][1], 0);
+}
+extern int g_recomp_abi_restore, g_recomp_abi_check;
+
 /* Logs/last-run.log, the one before it kept as previous-run.log. Both
  * streams append: two writers each at their own offset would write over
  * each other. */
@@ -1118,6 +1177,13 @@ int nv_ios_main(int argc, char **argv, int (*host)(void))
         open_log();
         for (i = 0; i < sizeof k_env / sizeof k_env[0]; i++)
             setenv(k_env[i][0], k_env[i][1], 0);
+        /* In case a runtime constructor ran before ios_env after all: the
+         * repair is only consulted once the game runs, which is later. */
+        if (getenv("RECOMP_ABI_RESTORE") && !g_recomp_abi_restore) {
+            g_recomp_abi_restore = 1;
+            g_recomp_abi_check = 1;
+            fprintf(stderr, "[IOS] ABI repair switched on in main (a constructor ran first)\n");
+        }
         /* The renderer reads its resolution from the environment (main.c
          * does this on the Mac, before the window opens). */
         if (!getenv("RECOMP_GL_SCALE")) {
@@ -1126,10 +1192,12 @@ int nv_ios_main(int argc, char **argv, int (*host)(void))
             setenv("RECOMP_GL_SCALE", b, 1);
         }
         chdir(docs_dir().fileSystemRepresentation);
-        fprintf(stderr, "[IOS] JSRF Unleashed %s, iOS %s, %s\n",
+        fprintf(stderr, "[IOS] JSRF Unleashed %s, iOS %s, %s; ABI repair %s; picture %s\n",
                 [[NSBundle mainBundle].infoDictionary[@"CFBundleShortVersionString"] UTF8String] ?: "?",
                 UIDevice.currentDevice.systemVersion.UTF8String,
-                UIDevice.currentDevice.model.UTF8String);
+                UIDevice.currentDevice.model.UTF8String,
+                g_recomp_abi_restore ? "on" : "OFF",
+                k_picture[picture_mode()].UTF8String);
         fflush(stderr);
         return UIApplicationMain(argc, argv, nil, NSStringFromClass([NvAppDelegate class]));
     }

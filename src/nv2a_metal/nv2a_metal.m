@@ -75,6 +75,7 @@ int   nv_window_refresh_hz(void) __attribute__((weak));
 __attribute__((weak)) void nv_window_wait_visible(void);
 __attribute__((weak)) void nv_window_wait_visible(void) { }
 int   nv2a_wide_scene(void);
+float nv2a_wide_aspect(void);
 
 #define MTL_FRAMES_IN_FLIGHT 3
 #define MTL_ARENA_CHUNK      (8u << 20)
@@ -1329,7 +1330,8 @@ static void mtl_clear(unsigned mask, const float rgba[4], float depth,
 typedef struct {
     id<MTLTexture> tex;      /* a copy of a finished frame */
     uint32_t       w, h;     /* its size, in pixels */
-    int            wide;     /* to be shown at 16:9 (nv2a_wide_scene at its flip) */
+    int            wide;     /* to be shown wide (nv2a_wide_scene at its flip)... */
+    double         aspect;   /* ...at this shape: 16:9, or the screen's own */
 } MtlShown;
 static MtlShown        g_shown[3];
 static pthread_mutex_t g_shown_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -1419,11 +1421,11 @@ static void present_one(CAMetalLayer *layer, uint64_t *seen)
         double vw = (double)dt.width, vh = (double)dt.height, fw, fh, dw = vw, dh = vh;
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
         id<MTLRenderCommandEncoder> e;
-        /* The frame keeps its shape, between black bars; the 16:9 scene the
-         * widescreen mode draws (squeezed into 4:3) shown at 16:9 -- as the
-         * OpenGL view does it. */
+        /* The frame keeps its shape, between black bars; the wide scene the
+         * widescreen mode draws (squeezed into 4:3) shown at its own shape --
+         * 16:9 as the OpenGL view does it, or the iPhone's whole screen. */
         fw = s->w; fh = s->h;
-        if (s->wide) { fw = 16.0; fh = 9.0; }
+        if (s->wide) { fw = s->aspect > 1.0 ? s->aspect : 16.0 / 9.0; fh = 1.0; }
         if (vw * fh > vh * fw) dw = vh * fw / fh; else dh = vw * fh / fw;
         rp.colorAttachments[0].texture = dt;
         rp.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -1555,6 +1557,7 @@ static void mtl_present(uint32_t h, uint32_t pw, uint32_t ph)
             g_shown[slot].w = rt->pw;
             g_shown[slot].h = rt->ph;
             g_shown[slot].wide = nv2a_wide_scene();
+            g_shown[slot].aspect = (double)nv2a_wide_aspect();
             give = slot;
         }
     } else if (nv_window_metal_layer && nv_window_metal_layer()) {

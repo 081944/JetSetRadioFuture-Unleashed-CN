@@ -3554,13 +3554,16 @@ void sub_0003FEC0(void)
  *         title sets explicitly.
  *
  * Widescreen (nv2a_widescreen(): RECOMP_WIDESCREEN, or Video > Widescreen)
- * keeps the vertical field of view and widens the horizontal one to 16:9:
- * m00 = 0.75 (= (4/3) / (16/9)) for every perspective projection, and the
- * side planes' slope x 4/3 so the title culls against what is now on screen.
- * The 640x480 frame then holds a 16:9 view squeezed, and the window shows it
- * at 16:9; the renderer squeezes the 2D overlays (nv2a_gl.c) so they keep
+ * keeps the vertical field of view and widens the horizontal one to 16:9 --
+ * or to the screen's own shape where the platform asks for it (the iPhone's
+ * "Fill the screen", nv2a_set_wide_aspect): m00 = s = (4/3) / that shape
+ * (0.75 at 16:9) for every perspective projection, and the side planes'
+ * slope / s so the title culls against what is now on screen. The 640x480
+ * frame then holds the wide view squeezed, and the window shows it at its
+ * shape; the renderer squeezes the 2D overlays (nv2a_gl.c) so they keep
  * their shape. JSRF_WIDE_LOG=1 logs the projections the title sets. */
 extern int nv2a_widescreen(void);
+extern float nv2a_wide_squeeze(void);
 static int wide_log(void)
 {
     static int on = -1;
@@ -3590,13 +3593,16 @@ void sub_00153EC0(void)
     }
     s_cam_dev = g_ecx;
     s_wide_applied = nv2a_wide_scene();
-    float want = wide_proj() ? 0.75f : 1.0f;
-    if ((*m00 == 1.0f || *m00 == 0.75f) && *m00 != want) {
+    float want = wide_proj() ? nv2a_wide_squeeze() : 1.0f;
+    /* Only over what was there: the title's 1.0, or what this last put. */
+    static float put = 0.75f;
+    if ((*m00 == 1.0f || *m00 == put) && *m00 != want) {
         if (wide_log())
             fprintf(stderr, "[WIDE] t=%.1f camera projection m00 %.2f -> %.2f\n",
                     pad_now(), *m00, want);
         *m00 = want;
     }
+    if (want != 1.0f) put = want;
     sub_00153EC0_gen();
 }
 
@@ -3607,14 +3613,14 @@ void sub_00153A90(void)
     if (wide_proj()) {
         float *f = (float *)((uint8_t *)g_xbox_mem_offset + 0x264E78u);
         /* f[2] = sec at 0x264E80, f[3] = -tan, f[4] = sec, f[5] = +tan */
-        float t = f[5] * (4.0f / 3.0f);
+        float t = f[5] * (1.0f / nv2a_wide_squeeze());   /* x 4/3 at 16:9 */
         float sec = sqrtf(1.0f + t * t);
         f[2] = sec; f[3] = -t; f[4] = sec; f[5] = t;
         { static float said;
           if (wide_log() && t != said) {
               said = t;
               fprintf(stderr, "[WIDE] t=%.1f culling: side slope %.4f (camera tan %.4f), radius factor %.4f\n",
-                      pad_now(), t, t * 0.75f, sec);
+                      pad_now(), t, t * nv2a_wide_squeeze(), sec);
           } }
     }
 }
@@ -3641,7 +3647,7 @@ void sub_00154420(void)
              * the renderer. */
             if (p[11] != 0.0f && p[15] == 0.0f) {
                 mf = p;
-                for (i = 0; i < 4; i++) { keep[i] = p[i * 4]; p[i * 4] *= 0.75f; }
+                for (i = 0; i < 4; i++) { keep[i] = p[i * 4]; p[i * 4] *= nv2a_wide_squeeze(); }
             }
             if (wide_log()) {
                 static int n;

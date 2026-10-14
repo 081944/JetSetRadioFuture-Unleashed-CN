@@ -1161,6 +1161,7 @@ static int gl_init(uint32_t w, uint32_t h)
 int  nv2a_widescreen(void);
 void nv2a_set_widescreen(int on);
 int  nv2a_wide_scene(void);
+float nv2a_wide_aspect(void);
 
 /* $XDG_CONFIG_HOME/jsrf-unleashed/settings (or JSRF_SETTINGS_FILE): lines of
  * key=value, shared with the launcher script, which keeps game_dir and
@@ -1547,7 +1548,7 @@ static void sdl_present(GLuint src_fbo, int sw, int sh)
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dfb);
     SDL_GL_GetDrawableSize(g_window, &ww, &wh);
     if (ww <= 0 || wh <= 0) return;
-    if (nv2a_wide_scene()) { fw = 16; fh = 9; }
+    if (nv2a_wide_scene()) { fw = (int)(nv2a_wide_aspect() * 900.0f + 0.5f); fh = 900; }   /* 16:9 = 1600:900 */
     dw = ww; dh = wh;
     if ((long)ww * fh > (long)wh * fw) dw = (int)((long)wh * fw / fh);
     else                               dh = (int)((long)ww * fh / fw);
@@ -1803,7 +1804,7 @@ static int SDLCALL pres_main(void *arg)
         pres_clear();
         if (ww > 0 && wh > 0 && w > 0 && h > 0) {
             fw = w; fh = h;
-            if (wide) { fw = 16; fh = 9; }
+            if (wide) { fw = (int)(nv2a_wide_aspect() * 900.0f + 0.5f); fh = 900; }
             dw = ww; dh = wh;
             if ((long)ww * fh > (long)wh * fw) dw = (int)((long)wh * fw / fh);
             else                               dh = (int)((long)ww * fh / fw);
@@ -3574,6 +3575,7 @@ static void surface_sync(void)
  * display -- is left to fill the screen. RECOMP_WIDESCREEN=1/0 overrides the
  * window's Video > Widescreen choice. */
 static int g_wide = -1;
+void nv2a_set_wide_aspect(float a);
 int nv2a_widescreen(void)
 {
     if (g_wide < 0) {
@@ -3582,6 +3584,10 @@ int nv2a_widescreen(void)
         if (v && *v) g_wide = atoi(v) != 0;
         else g_wide = (getenv("RECOMP_WINDOW") && nv_window_pref_widescreen)
                     ? (nv_window_pref_widescreen() != 0) : 0;
+        /* RECOMP_WIDE_ASPECT=<width/height>, e.g. 2.17: widen to that shape
+         * instead of 16:9 (the iPhone sets its screen's itself). */
+        if ((v = getenv("RECOMP_WIDE_ASPECT")) != NULL && atof(v) > 0.0)
+            nv2a_set_wide_aspect((float)atof(v));
     }
     return g_wide;
 }
@@ -3595,6 +3601,29 @@ void nv2a_set_widescreen(int on) { g_wide = on ? 1 : 0; }
 static volatile int g_wide_scene = 1;
 void nv2a_set_wide_scene(int on) { g_wide_scene = on ? 1 : 0; }
 int nv2a_wide_scene(void) { return nv2a_widescreen() && g_wide_scene; }
+/* The shape a widened scene is shown at, width over height: 16:9 unless a
+ * platform asks for its screen's own (the iPhone's "Fill the screen", about
+ * 19.5:9). The camera and its culling (recomp_manual.c), the 2D squeeze and
+ * the framed-3D move below and the presenter all follow it, through s, how
+ * much the 640x480 frame squeezes the wider view: (4/3) / aspect, 0.75 at
+ * 16:9 -- exactly, so that the 16:9 picture is what it always was. Kept
+ * between 16:9 and 2.4:1. */
+static volatile float g_wide_aspect = 16.0f / 9.0f, g_wide_s = 0.75f;
+void  nv2a_set_wide_aspect(float a);
+float nv2a_wide_aspect(void);
+float nv2a_wide_squeeze(void);
+void nv2a_set_wide_aspect(float a)
+{
+    if (!(a >= 16.0f / 9.0f)) a = 16.0f / 9.0f;     /* NaN too */
+    if (a > 2.4f) a = 2.4f;
+    if (a == g_wide_aspect) return;
+    g_wide_s = (a == 16.0f / 9.0f) ? 0.75f : 4.0f / (3.0f * a);
+    g_wide_aspect = a;
+    fprintf(stderr, "[WIN] widescreen shape %.3f:1 (the 4:3 frame squeezes it by %.3f)\n",
+            (double)a, (double)g_wide_s);
+}
+float nv2a_wide_aspect(void) { return g_wide_aspect; }
+float nv2a_wide_squeeze(void) { return g_wide_s; }
 static int g_wide_squeeze;   /* this draw's 2D squeeze, set in do_draw */
 static float g_wide_shift;   /* this draw's framed-3D move, title pixels, ditto */
 static Nv2aRenderState g_draw_rs;   /* the state this draw was given */
@@ -4687,7 +4716,7 @@ static void do_draw_body(void)
         uint32_t y0 =  S.wclip_v[0]        & 0xFFFu;
         uint32_t y1 = (S.wclip_v[0] >> 16) & 0xFFFu;
         if (x1 > x0 && y1 > y0 && x1 - x0 + 1 < 600u)
-            g_wide_shift = 0.25f * (0.5f * (float)(x0 + x1 + 1) - 320.0f);
+            g_wide_shift = (1.0f - g_wide_s) * (0.5f * (float)(x0 + x1 + 1) - 320.0f);
     }
 
     /* The vertices, where each attribute sits in them, and the value of
@@ -5072,10 +5101,11 @@ static void do_draw_body(void)
         PROF_ADD(unif);
     }
     /* Widescreen's 2D squeeze (see nv2a_widescreen): ndc.x is
-     * (x - vpOff.x) / vpScale.x, so 4/3 more scale is 3/4 the width. */
+     * (x - vpOff.x) / vpScale.x, so 1/s more scale is s the width (at 16:9,
+     * 4/3 more scale and 3/4 the width). */
     float vp_scale_eff[4];
     memcpy(vp_scale_eff, S.u.vp_scale, sizeof vp_scale_eff);
-    if (g_wide_squeeze) vp_scale_eff[0] *= 4.0f / 3.0f;
+    if (g_wide_squeeze) vp_scale_eff[0] *= 1.0f / g_wide_s;
     if (memcmp(g_last.vp_scale, vp_scale_eff, sizeof vp_scale_eff)
      || memcmp(g_last.vp_off, S.u.vp_off, sizeof S.u.vp_off)
      || g_last.wide_shift != g_wide_shift) {
@@ -5384,7 +5414,7 @@ static void do_draw_body(void)
            * sight on the console and in plain view once squeezed. */
           if (g_wide_squeeze || g_wide_shift != 0.0f) {
               float c = 0.5f * (float)g_fbo_w;
-              float a = c + 0.75f * ((float)cx0 - c), b = c + 0.75f * ((float)cx1 - c);
+              float a = c + g_wide_s * ((float)cx0 - c), b = c + g_wide_s * ((float)cx1 - c);
               cx0 = a > 0.0f ? (uint32_t)floorf(a) : 0u;
               cx1 = b > 0.0f ? (uint32_t)ceilf(b) : 0u;
               clip = 1;
