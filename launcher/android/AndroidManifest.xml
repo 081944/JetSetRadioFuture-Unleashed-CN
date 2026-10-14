@@ -22,7 +22,8 @@
         android:hardwareAccelerated="true"
         android:extractNativeLibs="true"
         android:isGame="true"
-        android:appCategory="game">
+        android:appCategory="game"
+        android:enableOnBackInvokedCallback="false">
 
         <!-- First the setup screen: it finds the game in the app's folder, or
              unpacks a disc image there, then starts the game. -->

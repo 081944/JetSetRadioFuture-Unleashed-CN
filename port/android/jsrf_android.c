@@ -10,9 +10,10 @@
  *   argv[3]  its cache folder, for temporary files
  *
  * What the Linux launcher and the iPhone app do before the engine starts is
- * done here: the log (Logs/last-run.log, the one before kept as
- * previous-run.log), the environment, the working folder. Then host_main
- * runs on a thread with a 16 MB stack -- SDL's own is a Java thread's.
+ * done here: the environment (as the library is loaded), the log
+ * (Logs/last-run.log, the one before kept as previous-run.log), the folders.
+ * Then host_main runs on a thread with a 16 MB stack -- SDL's own is a Java
+ * thread's.
  *
  * The setup screen (SetupActivity) unpacks a disc image through
  * nativeProbe / nativeUnpack below, over port/ios/xiso.c.
@@ -76,7 +77,9 @@ static int cfg_get_int(const char *file, const char *key, int def)
     return v;
 }
 
-/* The same settings as the Linux and Windows launchers'; full screen always. */
+/* The same settings as the Linux and Windows launchers'; full screen always.
+ * Then SDL's: Back is the game's (the Xbox Back button, nv2a_gl.c) rather than
+ * a way out of it, and the phone's motion sensor is not a controller. */
 static const char *const k_env[][2] = {
     { "RECOMP_USB", "1" }, { "RECOMP_GL", "1" }, { "RECOMP_PB_EXEC", "1" },
     { "RECOMP_VBLANK", "1" }, { "RECOMP_AC97_READY_NOTRAP", "1" },
@@ -84,7 +87,18 @@ static const char *const k_env[][2] = {
     { "RECOMP_ABI_RESTORE", "1" }, { "RECOMP_LOCK_IDLE", "1" },
     { "RECOMP_GL_CURTAIN", "skip" }, { "RECOMP_MUTE", "0" }, { "RECOMP_WINDOW", "1" },
     { "RECOMP_FULLSCREEN", "1" },
+    { "SDL_ANDROID_TRAP_BACK_BUTTON", "1" }, { "SDL_ACCELEROMETER_AS_JOYSTICK", "0" },
 };
+
+/* Set when the library is loaded, before the runtime's own constructors run
+ * (priority 101 comes first): some of them read these, and on a computer the
+ * launcher has set them before the engine starts. Anything already set wins. */
+__attribute__((constructor(101))) static void android_env(void)
+{
+    size_t i;
+    for (i = 0; i < sizeof k_env / sizeof k_env[0]; i++)
+        setenv(k_env[i][0], k_env[i][1], 0);
+}
 
 struct host_call { int (*host)(void); int rc; };
 
@@ -105,15 +119,12 @@ int nv_android_main(int argc, char **argv, int (*host)(void))
     struct host_call call;
     pthread_attr_t a;
     pthread_t t;
-    size_t i;
 
     if (!game || !data) {
         __android_log_print(ANDROID_LOG_ERROR, TAG, "started without the game and data folders");
         return 1;
     }
     open_log(data);
-    for (i = 0; i < sizeof k_env / sizeof k_env[0]; i++)
-        setenv(k_env[i][0], k_env[i][1], 0);
     snprintf(save, sizeof save, "%s/save", data);
     snprintf(cfg, sizeof cfg, "%s/settings", data);
     mkdir_p(save);
@@ -174,8 +185,8 @@ static int unpack_progress(void *ctx, uint64_t done, uint64_t total)
     return go ? 0 : 1;
 }
 
-/* Unpacks the image at `iso` (a path, or /proc/self/fd/N for a picked file)
- * into `dest`; progress goes to this.onUnpackProgress(done, total), which
+/* Unpacks the image at `iso` (a path, or "fd:N" for a file the picker
+ * handed over as a descriptor) into `dest`; progress goes to this.onUnpackProgress(done, total), which
  * returns false to stop. null on success, else a sentence for the player. */
 JNIEXPORT jstring JNICALL
 Java_com_jumatt_jsrfunleashed_SetupActivity_nativeUnpack(JNIEnv *env, jobject self,

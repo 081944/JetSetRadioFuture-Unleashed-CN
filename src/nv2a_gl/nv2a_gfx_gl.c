@@ -21,6 +21,10 @@
 #  undef GL_GLEXT_PROTOTYPES
 #  include <GLES3/gl32.h>
 #  include <GLES2/gl2ext.h>
+   /* The NDK's gl2ext.h predates EXT_depth_clamp (Mesa's has it). */
+#  ifndef GL_DEPTH_CLAMP_EXT
+#    define GL_DEPTH_CLAMP_EXT 0x864F
+#  endif
 #elif defined(NV2A_GL_USE_CGL) || (defined(NV2A_GL_USE_SDL) && defined(__APPLE__))
 #  include <OpenGL/gl3.h>
 #  include <OpenGL/gl3ext.h>

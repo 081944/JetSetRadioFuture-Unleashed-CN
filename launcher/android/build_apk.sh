@@ -59,8 +59,10 @@ cmake -S "$repo/port" -B "$W/engine" -G "$GENERATOR" -DCMAKE_TOOLCHAIN_FILE="$TC
       -DANDROID_ABI=$ABI -DANDROID_PLATFORM=android-$API -DCMAKE_BUILD_TYPE=Release \
       -DJSRF_VERSION="$VER" -DJSRF_GEN_DIR="$GEN" \
       -DSDL2_DIR="$W/sdl-install/lib/cmake/SDL2" > "$W/engine-configure.log"
-cmake --build "$W/engine" -j"$JOBS" --target jsrf_recomp > "$W/engine-build.log" 2>&1 \
-    || { grep -E 'error' "$W/engine-build.log" | head -20; exit 1; }
+# Past the first failure, so that one build lists every error.
+if [ "$GENERATOR" = Ninja ]; then KEEP="-k 0"; else KEEP="-k"; fi
+cmake --build "$W/engine" -j"$JOBS" --target jsrf_recomp -- $KEEP > "$W/engine-build.log" 2>&1 \
+    || { grep -E 'error:|undefined symbol|undefined reference' "$W/engine-build.log" | sort -u | head -60; exit 1; }
 
 echo "== resources, code, package"
 R="$W/res"

@@ -75,6 +75,13 @@ if(WIN32)
     add_compile_definitions(XBOXRECOMP_WIN_GL=1)
 endif()
 
+# Android: plain char is signed on x86 and on Apple's arm64, everywhere this
+# has run so far; the Arm ABI that Android follows makes it unsigned. Signed,
+# as it was tested.
+if(ANDROID)
+    add_compile_options(-fsigned-char)
+endif()
+
 # The runtime: everything in this repository outside port/ and launcher/.
 add_subdirectory("${JSRF_REPO}" "${CMAKE_BINARY_DIR}/xboxrecomp")
 
@@ -153,7 +160,11 @@ elseif(ANDROID)
     # pthreads are in bionic's libc; log and android for the glue.
     target_include_directories(jsrf_recomp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/ios")
     target_link_libraries(jsrf_recomp PRIVATE m dl log android)
-    target_link_options(jsrf_recomp PRIVATE -Wl,--no-undefined)
+    # -Bsymbolic: the game's functions call one another directly rather than
+    # through the PLT, as in an executable (nothing ever interposes on them);
+    # they stay in the dynamic symbol table, which is what names them in a
+    # crash report.
+    target_link_options(jsrf_recomp PRIVATE -Wl,--no-undefined -Wl,-Bsymbolic)
 else()
     target_link_libraries(jsrf_recomp PRIVATE pthread m dl)
     target_link_options(jsrf_recomp PRIVATE -rdynamic)

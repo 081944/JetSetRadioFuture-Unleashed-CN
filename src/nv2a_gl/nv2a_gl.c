@@ -1185,7 +1185,7 @@ int nv_window_pref_widescreen(void) { return sdl_cfg_get("widescreen", 0) != 0; 
  *   Space, J   A        K  B            H  X     L  Y
  *   E          R trigger                Q  L trigger
  *   R          Black                    F  White
- *   Return     Start                    Esc  Back
+ *   Return     Start                    Esc  Back (and Android's Back)
  *   C / V      left / right stick click
  * F11 or Alt+Return: full screen. F10: widescreen. F9: resolution. */
 static volatile unsigned short g_sdl_kb_buttons;
@@ -1201,7 +1201,7 @@ static void sdl_key(SDL_Scancode sc, int down)
     case SDL_SCANCODE_A:      bit = 1u << 2; break;
     case SDL_SCANCODE_D:      bit = 1u << 3; break;
     case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: bit = 1u << 4; break;
-    case SDL_SCANCODE_ESCAPE: bit = 1u << 5; break;
+    case SDL_SCANCODE_ESCAPE: case SDL_SCANCODE_AC_BACK: bit = 1u << 5; break;   /* AC_BACK: Android's Back */
     case SDL_SCANCODE_UP:     bit = 1u << 6; break;
     case SDL_SCANCODE_DOWN:   bit = 1u << 7; break;
     case SDL_SCANCODE_LEFT:   bit = 1u << 8; break;

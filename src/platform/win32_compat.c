@@ -1685,11 +1685,12 @@ VOID DebugBreak(void) {
 
 VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt)
 {
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__ANDROID__)
     /* Darwin's memset_s is only declared when __STDC_WANT_LIB_EXT1__ is set
      * before every string.h in the translation unit, which is not something a
-     * compat header can promise. A volatile store cannot be optimised away
-     * either, and needs no cooperation from libc. */
+     * compat header can promise; Android's bionic has no explicit_bzero (and
+     * memset_explicit only from API 34). A volatile store cannot be optimised
+     * away either, and needs no cooperation from libc. */
     {
         volatile unsigned char *q = (volatile unsigned char *)ptr;
         while (cnt--) *q++ = 0;

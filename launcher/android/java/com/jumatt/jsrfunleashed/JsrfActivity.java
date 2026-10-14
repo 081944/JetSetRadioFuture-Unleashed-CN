@@ -1,5 +1,7 @@
 package com.jumatt.jsrfunleashed;
 
+import android.content.pm.ActivityInfo;
+
 import java.io.File;
 
 import org.libsdl.app.SDLActivity;
@@ -23,5 +25,12 @@ public class JsrfActivity extends SDLActivity {
             data.getAbsolutePath(),                      /* Logs/, settings, save/ */
             getCacheDir().getAbsolutePath(),             /* temporary files */
         };
+    }
+
+    /** Landscape, either way up. SDL would let a resizable window turn with
+     *  the phone, into portrait too. */
+    @Override
+    public void setOrientationBis(int w, int h, boolean resizable, String hint) {
+        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
     }
 }
