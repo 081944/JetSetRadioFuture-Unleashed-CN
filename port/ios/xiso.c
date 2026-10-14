@@ -313,12 +313,23 @@ static int mkdirs(const char *dir)
     free(p);
     return rc;
 }
+/* The image: a path, or "fd:N" for one the caller already has open -- an
+ * Android app gets a descriptor from the system's file picker, not a path. A
+ * duplicate, so it is closed like any other. */
+static int open_image(const char *iso_path)
+{
+#if !defined(_WIN32)
+    if (!strncmp(iso_path, "fd:", 3)) return dup(atoi(iso_path + 3));
+#endif
+    return open(iso_path, O_RDONLY);
+}
+
 
 int xiso_probe(const char *iso_path)
 {
     uint64_t base, size;
     uint32_t rs, rz;
-    int fd = open(iso_path, O_RDONLY), ok;
+    int fd = open_image(iso_path), ok;
     if (fd < 0) return 0;
     ok = x_fsize(fd, &size) == 0 && find_volume(fd, size, &base, &rs, &rz);
     close(fd);
@@ -336,7 +347,7 @@ int xiso_extract(const char *iso_path, const char *dest_dir,
     x.err = err; x.errlen = errlen;
     if (err && errlen) err[0] = 0;
     x.progress = progress; x.ctx = ctx;
-    x.fd = open(iso_path, O_RDONLY);
+    x.fd = open_image(iso_path);
     if (x.fd < 0) return fail(&x, "Could not open the disc image: %s", strerror(errno));
     if (x_fsize(x.fd, &x.size)) { close(x.fd); return fail(&x, "Could not read the disc image: %s", strerror(errno)); }
     if (!find_volume(x.fd, x.size, &x.base, &root_sector, &root_size)) {

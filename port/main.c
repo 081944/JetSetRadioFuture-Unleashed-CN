@@ -41,7 +41,11 @@
 #include <windows.h>
 #include <mmsystem.h>     /* timeBeginPeriod */
 #else
+#if defined(__ANDROID__)
+#include "platform/android_backtrace.h"   /* <execinfo.h> is API 33 and later */
+#else
 #include <execinfo.h>
+#endif
 /* <ucontext.h> on Darwin is the deprecated getcontext/makecontext header and
  * refuses to compile without _XOPEN_SOURCE, which would in turn hide the BSD
  * declarations the rest of this file needs. All that is wanted from it is the
@@ -148,6 +152,12 @@ static int g_scale_env_ours;
 void recomp_restart_self(void);
 void recomp_restart_self(void)
 {
+#if defined(__ANDROID__)
+    /* Android: the process is the app's, not a program that can exec itself.
+     * A choice made in game (F9) is stored, and applies at the next start. */
+    fprintf(stderr, "  [WIN] restart: not on Android -- the choice applies at the next start\n");
+    return;
+#endif
     if (!g_argv || !g_argv[0]) return;
     fflush(stdout); fflush(stderr);
     /* The relaunched process inherits this environment, and an explicit
@@ -567,7 +577,7 @@ static void segv_handler(int sig, siginfo_t *si, void *ctx)
         fprintf(stderr, "\n  native stack (symbols found in the first 2000 slots):\n");
         { int shown = 0; for (int i = 0; i < 2000 && shown < 20; i++) {
             uintptr_t v = ((uintptr_t *)rsp)[i];
-            if (dladdr((void *)v, &di) && di.dli_sname && di.dli_fname && strstr(di.dli_fname, "jsrf_recomp")
+            if (dladdr((void *)v, &di) && di.dli_sname && di.dli_fname && (strstr(di.dli_fname, "jsrf_recomp") || strstr(di.dli_fname, "libmain.so"))
                 && strncmp(di.dli_sname, "sub_", 4) == 0) {
                 fprintf(stderr, "    [rsp+%-5d] %s+0x%lx\n", i*8, di.dli_sname, (unsigned long)(v - (uintptr_t)di.dli_saddr)); shown++; }
         } }
@@ -992,6 +1002,12 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
 }
 
 /* Console entry point (for debugging -- lets you see printf output) */
+#if defined(__ANDROID__)
+/* Android: SDL's Java side (SDLActivity) loads libmain.so and calls SDL_main
+ * on a thread of its own, with the arguments JsrfActivity gives it. */
+#define main SDL_main
+int SDL_main(int argc, char **argv);
+#endif
 int main(int argc, char **argv)
 {
     /* --version: the version this engine was built as (port/CMakeLists.txt:
@@ -1010,6 +1026,15 @@ int main(int argc, char **argv)
     {
         extern int nv_ios_main(int argc, char **argv, int (*host)(void));
         return nv_ios_main(argc, argv, host_main);
+    }
+#endif
+#if defined(__ANDROID__)
+    /* Android: port/android/jsrf_android.c sets the environment the
+     * launchers would, opens the log, and runs host_main on a thread with a
+     * large stack (SDL's own thread has a Java thread's). */
+    {
+        extern int nv_android_main(int argc, char **argv, int (*host)(void));
+        return nv_android_main(argc, argv, host_main);
     }
 #endif
     if (argc > 1) g_game_dir_arg = argv[1];
