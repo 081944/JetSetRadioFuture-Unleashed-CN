@@ -159,7 +159,7 @@ static volatile LONG g_nv2a_ack_stop = 0;
  * old period as its timeout, so a kick is served in microseconds and nothing
  * else changes. RECOMP_NV2A_KICK=0 turns both off (polling only, as before).
  */
-#if !defined(_WIN32)
+#if !defined(_WIN32) || defined(XBOXRECOMP_WIN_GL)
 #include <pthread.h>
 #include <sched.h>
 static pthread_mutex_t s_kick_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -842,13 +842,13 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             static int us = -1;
             if (us < 0) {
                 const char *e = getenv("RECOMP_ACK_SLEEP_US");
-#if defined(_WIN32)
+#if defined(_WIN32) && !defined(XBOXRECOMP_WIN_GL)
                 us = e ? atoi(e) : 0;
 #else
                 us = e ? atoi(e) : 200;
 #endif
             }
-#if !defined(_WIN32)
+#if !defined(_WIN32) || defined(XBOXRECOMP_WIN_GL)
             if (us > 0) {
                 if (s_kick_on < 0) { const char *e = getenv("RECOMP_NV2A_KICK"); s_kick_on = e ? atoi(e) : 1; }
                 if (s_kick_on && s_hurry) sched_yield();
@@ -1277,6 +1277,7 @@ volatile uint64_t g_icall_count = 0;
 /* Used only by the startup RAM probe below: a store that faults means the
  * backing object is shorter than the mapping claims, and the probe wants to
  * carry on past it rather than die. */
+#if !defined(_WIN32)
 static volatile sig_atomic_t g_ram_probe_failed;
 static sigjmp_buf g_ram_probe_jmp;
 
@@ -1286,6 +1287,7 @@ static void ram_probe_handler(int s)
     g_ram_probe_failed = 1;
     siglongjmp(g_ram_probe_jmp, 1);
 }
+#endif
 
 
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)

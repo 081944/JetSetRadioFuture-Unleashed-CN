@@ -22,7 +22,15 @@ add_compile_definitions(
     NOMINMAX
 )
 
-# Option to build examples
+# Windows with the host layers the Mac and Linux builds use -- the OpenGL
+# renderer (nv2a_gl) through SDL2 and libepoxy, SDL2's sound and controllers --
+# instead of Direct3D 11, XAudio2 and XInput. JSRF Unleashed's Windows build
+# (MinGW) turns it on: its title brings its own D3D and draws through the
+# pushbuffer, which is nv2a_gl's job on every other host.
+option(XBOXRECOMP_WIN_GL "Windows: OpenGL/SDL2 host layers instead of D3D11/XAudio2/XInput" OFF)
+if(WIN32 AND XBOXRECOMP_WIN_GL)
+    add_compile_definitions(XBOXRECOMP_WIN_GL=1)
+endif()
 
 # ── Runtime Libraries ─────────────────────────────────────────
 
@@ -46,8 +54,8 @@ add_subdirectory(src/apu)
 # GPU: NV2A hardware emulation (register handlers, MMIO, push buffer)
 add_subdirectory(src/nv2a)
 
-# NV2A -> OpenGL translation (POSIX only for now: it needs EGL)
-if(NOT WIN32)
+# NV2A -> OpenGL translation (POSIX, and Windows with XBOXRECOMP_WIN_GL)
+if(NOT WIN32 OR XBOXRECOMP_WIN_GL)
     add_subdirectory(src/nv2a_gl)
 endif()
 
@@ -73,7 +81,7 @@ target_link_libraries(xboxrecomp INTERFACE
     xbox_usb
     xbox_apu
     xbox_nv2a
-    $<$<NOT:$<BOOL:${WIN32}>>:xbox_nv2a_gl>
+    $<$<OR:$<NOT:$<BOOL:${WIN32}>>,$<BOOL:${XBOXRECOMP_WIN_GL}>>:xbox_nv2a_gl>
     xbox_video
 )
 

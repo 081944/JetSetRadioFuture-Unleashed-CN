@@ -152,12 +152,22 @@ static int resolve_symlink(const char* xbox_path, char* out, size_t out_size)
     return 0;
 }
 
+/* Set by NtCreateFile while it translates a FILE_DIRECTORY_FILE open: a
+ * partition device opened as a directory is its filesystem, not the device
+ * image. */
+int g_xbox_translate_want_dir;
+
 /* ======================================================================== */
 #if defined(_WIN32)
 /* ======================================================================== */
 
+/* kernel.h's KernelMode is a macro, and the RPC headers shlobj.h pulls in
+ * have a structure field of that name. */
+#pragma push_macro("KernelMode")
+#undef KernelMode
 #include <shlobj.h>
 #include <winioctl.h>
+#pragma pop_macro("KernelMode")
 
 static WCHAR s_game_dir[MAX_PATH];
 static WCHAR s_save_dir[MAX_PATH];
@@ -238,6 +248,8 @@ static BOOL xbox_partition_device_path(const char *xbox_path, WCHAR *out, DWORD 
     int digit;
     const char *rest;
 
+    if (g_xbox_translate_want_dir)
+        return FALSE;               /* a directory open: the filesystem view */
     if (!len)
         return FALSE;
     digit = xbox_path[len];
@@ -245,9 +257,15 @@ static BOOL xbox_partition_device_path(const char *xbox_path, WCHAR *out, DWORD 
         return FALSE;
 
     rest = xbox_path + len + 1;
-    /* Nothing below it, allowing for a single trailing separator. */
-    if (*rest == '\\' || *rest == '/')
+    /* Nothing below it, allowing for a single trailing separator -- except
+     * that "Partition1\" and "Partition2\" are the root directories of the
+     * game/save and system filesystems, which the rules table places (as the
+     * POSIX branch does). */
+    if (*rest == '\\' || *rest == '/') {
+        if (digit == '1' || digit == '2')
+            return FALSE;
         rest++;
+    }
     if (*rest != '\0')
         return FALSE;
 
@@ -263,8 +281,11 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
      * that passed NULL silently pointed its game dir and its saves at another
      * game's folders. Generic now -- a caller that wants a title-specific
      * location should pass one. */
+    /* UTF-8 when the process runs with the UTF-8 code page (the engine's
+     * manifest asks for it), the ANSI page where that is not honoured. */
     if (game_dir) {
-        MultiByteToWideChar(CP_UTF8, 0, game_dir, -1, s_game_dir, MAX_PATH);
+        if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, game_dir, -1, s_game_dir, MAX_PATH))
+            MultiByteToWideChar(CP_ACP, 0, game_dir, -1, s_game_dir, MAX_PATH);
     } else {
         /* Neutral default: the CWD's "game" subdirectory, which is the
          * layout the game projects use (see templates/new-game). */
@@ -272,7 +293,8 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     }
 
     if (save_dir) {
-        MultiByteToWideChar(CP_UTF8, 0, save_dir, -1, s_save_dir, MAX_PATH);
+        if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, save_dir, -1, s_save_dir, MAX_PATH))
+            MultiByteToWideChar(CP_ACP, 0, save_dir, -1, s_save_dir, MAX_PATH);
     } else {
         if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, save_base))) {
             swprintf_s(s_save_dir, MAX_PATH, L"%s\\xboxrecomp", save_base);
@@ -312,6 +334,21 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         }
         swprintf_s(image, MAX_PATH, L"%s\\%s", s_save_dir, XBOX_DISK_IMAGE_NAME);
         xbox_write_partition_table(image);
+        /* The whole disk is the retail 5 GB (0x9C4400 sectors), as on POSIX
+         * -- only where the file can be sparse, so it costs no space. */
+        {
+            HANDLE h = CreateFileW(image, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (h != INVALID_HANDLE_VALUE) {
+                DWORD ret;
+                LARGE_INTEGER end;
+                end.QuadPart = (LONGLONG)(0x009C4400ull * 512ull);
+                if (DeviceIoControl(h, FSCTL_SET_SPARSE, NULL, 0, NULL, 0, &ret, NULL)
+                    && SetFilePointerEx(h, end, NULL, FILE_BEGIN))
+                    SetEndOfFile(h);
+                CloseHandle(h);
+            }
+        }
         /* The other partition devices, sized to the same geometry the table
          * above describes, so a title that asks the device how big it is gets
          * an answer consistent with the table it just read. Marked sparse
@@ -525,7 +562,6 @@ static void posix_create_partition_images(void)
     }
 }
 
-int g_xbox_translate_want_dir;   /* set by NtCreateFile when FILE_DIRECTORY_FILE */
 static BOOL posix_partition_device_path(const char *xbox_path, char *out, DWORD n)
 {
     if (g_xbox_translate_want_dir) return FALSE;   /* directory open -> filesystem view */

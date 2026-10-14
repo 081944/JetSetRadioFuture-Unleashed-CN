@@ -89,14 +89,17 @@ uint32_t xbox_LastFileError(void)
     return g_xbox_last_file_error;
 }
 
-/* Convert Xbox share access to Win32 */
+/* Share access: everything, whatever the title asked.
+ *
+ * The POSIX backend has no share modes at all, and the title runs there; here
+ * a title's own exclusive open (share 0) made its second open of the same file
+ * -- a streaming reader beside a loader -- fail with a sharing violation that
+ * the console's single-process kernel would not have raised against itself in
+ * the same way. Same behaviour on every host. */
 static DWORD xbox_share_to_win32(ULONG Share)
 {
-    DWORD result = 0;
-    if (Share & 0x01) result |= FILE_SHARE_READ;
-    if (Share & 0x02) result |= FILE_SHARE_WRITE;
-    if (Share & 0x04) result |= FILE_SHARE_DELETE;
-    return result;
+    (void)Share;
+    return FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 }
 
 /* Translate an Xbox OBJECT_ATTRIBUTES path to a Win32 wide path */
@@ -123,49 +126,62 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     if (!FileHandle || !ObjectAttributes)
         return STATUS_INVALID_PARAMETER;
 
-    if (!translate_obj_path(ObjectAttributes, win_path, MAX_PATH)) {
+    /* The directory hint, as on POSIX: a partition device opened as a
+     * directory is its filesystem (the rules table), not the device image
+     * -- a title asking for free space opens the partition with
+     * FILE_DIRECTORY_FILE | FILE_OPEN_FOR_FREE_SPACE_QUERY and wants the
+     * volume, not the bytes. */
+    const char *xbox_path = get_xbox_path(ObjectAttributes);
+    extern int g_xbox_translate_want_dir;
+    g_xbox_translate_want_dir = (CreateOptions & XBOX_FILE_DIRECTORY_FILE) ? 1 : 0;
+    BOOL tr = translate_obj_path(ObjectAttributes, win_path, MAX_PATH);
+    g_xbox_translate_want_dir = 0;
+    if (!tr) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
 
-    /* A partition device opened as a directory.
-     *
-     * The path layer maps \Device\Harddisk0\PartitionN to a PartitionN.img
-     * backing file, but a title asking for free space opens the partition with
-     * FILE_DIRECTORY_FILE | FILE_OPEN_FOR_FREE_SPACE_QUERY -- it wants the
-     * volume, not the bytes. Opening a regular file as a directory fails, and
-     * the title reads STATUS_OBJECT_PATH_NOT_FOUND as "no such volume".
-     *
-     * Half-Life 2's CRT probes partition0 this way during startup and treats
-     * the failure as fatal. Redirecting to the directory that holds the image
-     * gives a handle that is valid for exactly what the caller is going to do
-     * with it, which is NtQueryVolumeInformationFile. */
+    /* FILE_DIRECTORY_FILE on something that exists but is a plain file: the
+     * console answers STATUS_NOT_A_DIRECTORY, and a title that probes "is
+     * this a folder?" that way needs to hear "no, it is a file" rather than
+     * "the path does not exist" (the POSIX branch's ENOTDIR). */
     if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) &&
         GetFileAttributesW(win_path) != INVALID_FILE_ATTRIBUTES &&
         !(GetFileAttributesW(win_path) & FILE_ATTRIBUTE_DIRECTORY)) {
-        WCHAR *slash = wcsrchr(win_path, L'\\');
-        if (slash && slash != win_path) {
-            *slash = 0;
-            xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
-                     "NtCreateFile: directory open of a device image, "
-                     "using its containing directory instead");
+        NTSTATUS st = 0xC0000103u;   /* STATUS_NOT_A_DIRECTORY */
+        fprintf(stderr, "  [FILE] open %s -> %S FAILED (a file, opened as a folder) opts=0x%X disp=%u -> 0x%08X\n",
+                xbox_path ? xbox_path : "?", win_path, (unsigned)CreateOptions, (unsigned)CreateDisposition, (unsigned)st);
+        if (IoStatusBlock) {
+            IoStatusBlock->Status = st;
+            IoStatusBlock->Information = 0;
         }
+        return st;
     }
 
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             CreateDirectoryW(win_path, NULL);
-        h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
+        /* Read access whatever was asked, as POSIX opens a directory
+         * O_RDONLY: a directory handle is for listing and for asking about
+         * the volume, and write access to one can be refused. */
+        h = CreateFileW(win_path, GENERIC_READ | ((DesiredAccess & XBOX_DELETE) ? DELETE : 0),
             xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS, NULL);
     } else {
-        if (CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING)
-            flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
+        DWORD access = xbox_access_to_win32(DesiredAccess);
+        DWORD disp = xbox_disposition_to_win32(CreateDisposition);
+        /* Creating or truncating implies writing (the POSIX backend's
+         * O_CREAT/O_TRUNC -> O_RDWR): without it Windows refuses the open. */
+        if (disp != OPEN_EXISTING && !(access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA)))
+            access |= GENERIC_WRITE;
+        /* No FILE_FLAG_NO_BUFFERING for XBOX_FILE_NO_INTERMEDIATE_BUFFERING:
+         * Windows then insists on host-sector-aligned buffers, offsets and
+         * lengths, which a title's DVD-sector reads are not; POSIX ignores
+         * the flag too. */
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
-        h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
-            xbox_share_to_win32(ShareAccess), NULL,
-            xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
+        h = CreateFileW(win_path, access, xbox_share_to_win32(ShareAccess), NULL,
+                        disp, flags_and_attrs, NULL);
     }
 
     if (h == INVALID_HANDLE_VALUE) {
@@ -179,19 +195,24 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         /* A warning, not a compiled-out trace: a failed open is how a title
          * silently decides a volume or asset is missing, and in a Release
          * build that decision was invisible. */
-        xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
-                 "NtCreateFile FAILED: %S (err=%u)", win_path, err);
+        NTSTATUS st;
+        switch (err) {
+            case ERROR_FILE_NOT_FOUND: st = STATUS_OBJECT_NAME_NOT_FOUND; break;
+            case ERROR_PATH_NOT_FOUND: st = STATUS_OBJECT_PATH_NOT_FOUND; break;
+            case ERROR_ACCESS_DENIED:  st = STATUS_ACCESS_DENIED; break;
+            case ERROR_FILE_EXISTS:
+            case ERROR_ALREADY_EXISTS: st = STATUS_OBJECT_NAME_COLLISION; break;
+            case ERROR_DIRECTORY:      st = 0xC0000103u; break;   /* STATUS_NOT_A_DIRECTORY */
+            default:                   st = STATUS_UNSUCCESSFUL; break;
+        }
+        fprintf(stderr, "  [FILE] open %s -> %S FAILED err=%u opts=0x%X disp=%u -> 0x%08X\n",
+                xbox_path ? xbox_path : "?", win_path, (unsigned)err, (unsigned)CreateOptions,
+                (unsigned)CreateDisposition, (unsigned)st);
         if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+            IoStatusBlock->Status = st;
             IoStatusBlock->Information = 0;
         }
-        switch (err) {
-            case ERROR_FILE_NOT_FOUND: return STATUS_OBJECT_NAME_NOT_FOUND;
-            case ERROR_PATH_NOT_FOUND: return STATUS_OBJECT_PATH_NOT_FOUND;
-            case ERROR_ACCESS_DENIED:  return STATUS_ACCESS_DENIED;
-            case ERROR_ALREADY_EXISTS: return STATUS_OBJECT_NAME_COLLISION;
-            default:                   return STATUS_UNSUCCESSFUL;
-        }
+        return st;
     }
 
     *FileHandle = h;
@@ -199,9 +220,16 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
     }
-    XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile: %S -> handle=%p", win_path, h);
+    fprintf(stderr, "  [FILE] open %s -> %S (handle=%p, opts=0x%X)\n",
+            xbox_path ? xbox_path : "?", win_path, h, (unsigned)CreateOptions);
+    { extern void xbox_file_open_hook(const char *) __attribute__((weak));
+      if (xbox_file_open_hook && xbox_path) xbox_file_open_hook(xbox_path); }
     return STATUS_SUCCESS;
 }
+
+/* Counted so the periodic kernel summary can say whether a title sitting on
+ * a loading screen is loading (as on POSIX). */
+unsigned long long g_read_bytes, g_read_calls;
 
 NTSTATUS __stdcall xbox_NtReadFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
@@ -226,6 +254,13 @@ NTSTATUS __stdcall xbox_NtReadFile(
     }
 
     if (result || GetLastError() == ERROR_HANDLE_EOF) {
+        /* A short read leaves the rest of the buffer as the title found it;
+         * on the console the sector padding reads as zero. JSRF reads
+         * Media/Progress/Progress.dat (27776 bytes) as 28160 and parses to the
+         * end of its buffer -- see the POSIX twin below. The count stays short. */
+        if (bytes_read < Length)
+            memset((uint8_t *)Buffer + bytes_read, 0, Length - bytes_read);
+        if (bytes_read > 0) { g_read_bytes += bytes_read; g_read_calls++; }
         IoStatusBlock->Information = bytes_read;
         if (bytes_read == 0 && Length > 0) {
             IoStatusBlock->Status = STATUS_END_OF_FILE;
@@ -460,7 +495,12 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             at.dwHighDateTime = info->LastAccessTime.HighPart;
             wt.dwLowDateTime = info->LastWriteTime.LowPart;
             wt.dwHighDateTime = info->LastWriteTime.HighPart;
-            SetFileTime(FileHandle, &ct, &at, &wt);
+            /* A time of zero means "leave it unchanged" in NT's semantics; set
+             * literally it would date the file 1601. */
+            SetFileTime(FileHandle,
+                        info->CreationTime.QuadPart ? &ct : NULL,
+                        info->LastAccessTime.QuadPart ? &at : NULL,
+                        info->LastWriteTime.QuadPart ? &wt : NULL);
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }
@@ -493,7 +533,7 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
 {
-    (void)FileHandle; (void)Length;
+    (void)Length;
     if (!IoStatusBlock || !FsInformation)
         return STATUS_INVALID_PARAMETER;
 
@@ -501,12 +541,31 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             ULARGE_INTEGER free_bytes, total_bytes, total_free;
-            if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
+            WCHAR vol[MAX_PATH];
+            const WCHAR *where = NULL;
+            DWORD vl = GetFinalPathNameByHandleW(FileHandle, vol, MAX_PATH, FILE_NAME_NORMALIZED);
+            if (vl && vl < MAX_PATH) where = vol;
+            if (GetDiskFreeSpaceExW(where, &free_bytes, &total_bytes, &total_free)
+                || GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
                 info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
-                info->TotalAllocationUnits.QuadPart = total_bytes.QuadPart / cs;
-                info->AvailableAllocationUnits.QuadPart = free_bytes.QuadPart / cs;
+                ULONGLONG total = total_bytes.QuadPart, avail = free_bytes.QuadPart;
+                /* Console-sized volumes, not the host's: a title does its
+                 * free-space arithmetic in 32 bits sized for a 750 MB cache
+                 * partition, and JSRF's cache builder concluded a big host
+                 * disk had no room and looped looking for a set to evict. */
+                if (total > 0x2EE00000ull) total = 0x2EE00000ull;
+                if (avail > total) avail = total;
+                info->TotalAllocationUnits.QuadPart = total / cs;
+                info->AvailableAllocationUnits.QuadPart = avail / cs;
+                { static int n;
+                  if (n++ < 12)
+                      fprintf(stderr, "  [FILE] free space on %S: %llu of %llu units of %u bytes\n",
+                              where ? where : L"(current drive)",
+                              (unsigned long long)info->AvailableAllocationUnits.QuadPart,
+                              (unsigned long long)info->TotalAllocationUnits.QuadPart,
+                              (unsigned)(info->BytesPerSector * info->SectorsPerAllocationUnit)); }
             } else {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
                 info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;

@@ -19,6 +19,8 @@
 #if defined(NV2A_GL_USE_CGL) || (defined(NV2A_GL_USE_SDL) && defined(__APPLE__))
 #  include <OpenGL/gl3.h>
 #  include <OpenGL/gl3ext.h>
+#elif defined(_WIN32)
+#  include <epoxy/gl.h>     /* opengl32.dll stops at 1.1: see nv2a_gl.c */
 #else
 #  include <GL/gl.h>
 #  include <GL/glext.h>

@@ -62,6 +62,11 @@
 #  if defined(__APPLE__)
 #    include <OpenGL/gl3.h>
 #    include <OpenGL/gl3ext.h>
+#  elif defined(_WIN32)
+     /* opengl32.dll stops at OpenGL 1.1: everything after it is fetched from
+      * the driver at run time, which libepoxy does behind the usual names. */
+#    include <epoxy/gl.h>
+#    include <direct.h>
 #  else
 #    include <GL/gl.h>
 #    include <GL/glext.h>
@@ -81,6 +86,11 @@
 #include <stddef.h>
 
 #include "d3d8_swizzle.h"          /* swizzle + DXT helpers, header-only */
+
+#if defined(_WIN32)
+/* Windows' mkdir takes no mode. */
+#  define mkdir(path, mode) _mkdir(path)
+#endif
 
 static double mono_now(void);
 
@@ -1085,6 +1095,12 @@ static void sdl_cfg_path(char *buf, size_t n)
 {
     const char *f = getenv("JSRF_SETTINGS_FILE"), *x = getenv("XDG_CONFIG_HOME"),
                *h = getenv("HOME");
+#if defined(_WIN32)
+    /* %LOCALAPPDATA%\JSRF Unleashed\settings: the launcher's, which also
+     * passes it as JSRF_SETTINGS_FILE. */
+    const char *ad = getenv("LOCALAPPDATA");
+    if (!(f && *f) && ad && *ad) { snprintf(buf, n, "%s/JSRF Unleashed/settings", ad); return; }
+#endif
     if (f && *f)      snprintf(buf, n, "%s", f);
     else if (x && *x) snprintf(buf, n, "%s/jsrf-unleashed/settings", x);
     else if (h && *h) snprintf(buf, n, "%s/.config/jsrf-unleashed/settings", h);

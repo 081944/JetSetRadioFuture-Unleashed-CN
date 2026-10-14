@@ -15,7 +15,7 @@
  *
  * Off unless RECOMP_FB_WINDOW is set.
  */
-#if defined(_WIN32)
+#if defined(_WIN32) && !defined(XBOXRECOMP_WIN_GL)
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>

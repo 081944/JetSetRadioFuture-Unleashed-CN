@@ -9,6 +9,6 @@ target_include_directories(xbox_video PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
 target_link_libraries(xbox_video PUBLIC xbox_d3d8)
-if(WIN32)
+if(WIN32 AND NOT XBOXRECOMP_WIN_GL)
     target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32)
 endif()

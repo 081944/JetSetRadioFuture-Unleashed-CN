@@ -27,9 +27,24 @@
 #include <math.h>
 static double jsrf_now(void);   /* defined further down */
 
+#if defined(_WIN32)
+/* No pwrite on Windows: a seek and a write do the same for the one writer here. */
+#include <io.h>
+static long long jsrf_pwrite(int fd, const void *buf, size_t n, long long off)
+{
+    if (_lseeki64(fd, off, SEEK_SET) < 0) return -1;
+    return _write(fd, buf, (unsigned)n);
+}
+#define pwrite jsrf_pwrite
+#endif
+
 /* The Win32 shim's thread id, so traces here and the kernel's [WAITLOG]
- * name the same thread. */
+ * name the same thread. (On Windows it is the real one, from <windows.h>.) */
+#if !defined(_WIN32)
 extern uint32_t GetCurrentThreadId(void);
+#else
+#include "platform/xbox_winnt.h"     /* <windows.h>, as the runtime includes it */
+#endif
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 

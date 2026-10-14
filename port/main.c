@@ -34,6 +34,13 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <signal.h>
+#if defined(_WIN32)
+/* Windows: the crash report comes from an unhandled-exception filter rather
+ * than signal handlers, and the window is SDL2's, owned by the renderer's
+ * thread exactly as on Linux. */
+#include <windows.h>
+#include <mmsystem.h>     /* timeBeginPeriod */
+#else
 #include <execinfo.h>
 /* <ucontext.h> on Darwin is the deprecated getcontext/makecontext header and
  * refuses to compile without _XOPEN_SOURCE, which would in turn hide the BSD
@@ -48,6 +55,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <dlfcn.h>
+#endif /* !_WIN32 */
 #include "win32_compat.h"
 #include "recomp_icall_feedback.h"
 #include "apu.h"
@@ -146,9 +154,34 @@ void recomp_restart_self(void)
      * RECOMP_GL_SCALE wins over the stored choice -- so the copy made at
      * startup came back as "explicit" and every restart returned at the old
      * resolution: picking a new one from the menu never took. */
+#if defined(_WIN32)
+    /* _execv would split a path with spaces in it ("JSRF - Jet Set Radio
+     * Future (USA)") into several arguments: start the same command line
+     * again, on the same console and log, and end this process. */
+    {
+        STARTUPINFOW si;
+        PROCESS_INFORMATION pi;
+        wchar_t exe[MAX_PATH];
+        if (g_scale_env_ours) _putenv("RECOMP_GL_SCALE=");
+        ZeroMemory(&si, sizeof si);
+        si.cb = sizeof si;
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+        si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+        si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
+        if (GetModuleFileNameW(NULL, exe, MAX_PATH)
+            && CreateProcessW(exe, GetCommandLineW(), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            ExitProcess(0);
+        }
+        fprintf(stderr, "  [WIN] could not relaunch (error %lu)\n", GetLastError());
+    }
+#else
     if (g_scale_env_ours) unsetenv("RECOMP_GL_SCALE");
     execv(g_argv[0], g_argv);          /* only returns on failure */
     fprintf(stderr, "  [WIN] could not relaunch: %s\n", strerror(errno));
+#endif
 }
 
 static const char *game_dir(void)
@@ -272,7 +305,16 @@ static void term_handler(int sig)
 /* JSRF_PROTECT_DATA=1: write-protect the XBE's .data while the title music
  * starts, so the first write into it is caught with a backtrace. Armed by
  * jsrf_protect_data_arm() (called from a file-open hook); each fault logs,
- * unprotects that page and resumes. */
+ * unprotects that page and resumes. POSIX only: on Windows the switch says
+ * so and does nothing. */
+#if defined(_WIN32)
+void jsrf_protect_data_arm(void)
+{
+    static int said;
+    if (getenv("JSRF_PROTECT_DATA") && !said++)
+        fprintf(stderr, "[PROTECT] JSRF_PROTECT_DATA is not available on Windows\n");
+}
+#else
 #include <sys/mman.h>
 #include <dlfcn.h>
 static int g_protect_data_armed;
@@ -307,8 +349,86 @@ void jsrf_protect_data_arm(void)
     fprintf(stderr, "[PROTECT] trap pages armed through all aliases\n");
     fflush(stderr);
 }
+#endif /* !_WIN32 */
 
 
+/* Where the bad pointer was stored (shared by the POSIX and the Windows
+ * crash handlers). */
+static void report_bad_pointer(uintptr_t fault_addr)
+{
+    /* Where the bad pointer was stored.
+     *
+     * A fault on an address the guest computed says what the value was and
+     * nothing about where it came from, and the same wrong value has now
+     * turned up in the same place across many runs. Guest RAM is 64 MB --
+     * small enough to search outright -- so scanning it for that exact dword
+     * names the structures holding it. That is the difference between "a
+     * pointer is wrong" and "this field of this object is wrong", and a
+     * watchpoint on the address printed here names whatever wrote it.
+     *
+     * Searching for the fault address alone was a mistake that cost a whole
+     * crash: a load of [esi+4] faults at esi+4, but what the guest stored --
+     * and what is therefore findable in RAM -- is esi. The register values go
+     * into the search with it, and the object around each hit is printed,
+     * because "this dword is at 0x1C4A30" is a lead and "this dword is the
+     * sibling field of the node at 0x1C4A00, whose vtable is zero" is an
+     * answer. */
+    {
+        uint32_t bad = (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset);
+        uint32_t cand[8]; int ncand = 0, ci;
+        uint32_t regs[7];
+        regs[0] = bad;   regs[1] = g_eax; regs[2] = g_ecx; regs[3] = g_edx;
+        regs[4] = g_ebx; regs[5] = g_esi; regs[6] = g_edi;
+        for (ci = 0; ci < 7; ci++) {
+            int j, dup = 0;
+            /* Only values that cannot be guest addresses are interesting: a
+             * live pointer into RAM turns up in a thousand places and says
+             * nothing about which of them is the one that went wrong. */
+            if (regs[ci] < (64u << 20))
+                continue;
+            for (j = 0; j < ncand; j++) if (cand[j] == regs[ci]) dup = 1;
+            if (!dup) cand[ncand++] = regs[ci];
+        }
+        if (ncand && g_xbox_mem_offset) {
+            const uint32_t *ram = (const uint32_t *)(uintptr_t)g_xbox_mem_offset;
+            size_t words = (64u << 20) / 4, i;
+            int found[8]; int total = 0;
+            for (ci = 0; ci < ncand; ci++) found[ci] = 0;
+            for (i = 0x1000; i < words && total < 24; i++) {
+                uint32_t w = ram[i];
+                for (ci = 0; ci < ncand; ci++) {
+                    if (w != cand[ci] || found[ci] >= 4) continue;
+                    found[ci]++; total++;
+                    fprintf(stderr, "  %08X is stored at guest 0x%08X\n",
+                            cand[ci], (unsigned)(i * 4));
+                    if (found[ci] <= 2) {
+                        /* The object around it. A scene-graph node is walked
+                         * through +0x28 (child) and +0x30 (sibling), so the
+                         * dump starts far enough back to show a node header
+                         * whichever field the hit turned out to be. */
+                        long base = (long)(i * 4) - 0x30;
+                        int k;
+                        if (base < 0) base = 0;
+                        if ((size_t)(base >> 2) + 16 > words) base = 0;
+                        for (k = 0; k < 16; k += 4) {
+                            fprintf(stderr, "    +%04lX: %08X %08X %08X %08X\n",
+                                    (unsigned long)(base + k * 4),
+                                    ram[(base >> 2) + k + 0], ram[(base >> 2) + k + 1],
+                                    ram[(base >> 2) + k + 2], ram[(base >> 2) + k + 3]);
+                        }
+                    }
+                    break;
+                }
+            }
+            for (ci = 0; ci < ncand; ci++)
+                if (!found[ci])
+                    fprintf(stderr, "  %08X is not stored anywhere in guest "
+                            "RAM -- it was computed, not loaded\n", cand[ci]);
+        }
+    }
+}
+
+#if !defined(_WIN32)
 /*
  * The faulting instruction pointer and stack pointer, whatever the host is.
  *
@@ -431,76 +551,7 @@ static void segv_handler(int sig, siginfo_t *si, void *ctx)
     { extern void xbox_kernel_thread_report(void);
       xbox_kernel_thread_report(); }
 
-    /* Where the bad pointer was stored.
-     *
-     * A fault on an address the guest computed says what the value was and
-     * nothing about where it came from, and the same wrong value has now
-     * turned up in the same place across many runs. Guest RAM is 64 MB --
-     * small enough to search outright -- so scanning it for that exact dword
-     * names the structures holding it. That is the difference between "a
-     * pointer is wrong" and "this field of this object is wrong", and a
-     * watchpoint on the address printed here names whatever wrote it.
-     *
-     * Searching for the fault address alone was a mistake that cost a whole
-     * crash: a load of [esi+4] faults at esi+4, but what the guest stored --
-     * and what is therefore findable in RAM -- is esi. The register values go
-     * into the search with it, and the object around each hit is printed,
-     * because "this dword is at 0x1C4A30" is a lead and "this dword is the
-     * sibling field of the node at 0x1C4A00, whose vtable is zero" is an
-     * answer. */
-    {
-        uint32_t bad = (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset);
-        uint32_t cand[8]; int ncand = 0, ci;
-        uint32_t regs[7];
-        regs[0] = bad;   regs[1] = g_eax; regs[2] = g_ecx; regs[3] = g_edx;
-        regs[4] = g_ebx; regs[5] = g_esi; regs[6] = g_edi;
-        for (ci = 0; ci < 7; ci++) {
-            int j, dup = 0;
-            /* Only values that cannot be guest addresses are interesting: a
-             * live pointer into RAM turns up in a thousand places and says
-             * nothing about which of them is the one that went wrong. */
-            if (regs[ci] < (64u << 20))
-                continue;
-            for (j = 0; j < ncand; j++) if (cand[j] == regs[ci]) dup = 1;
-            if (!dup) cand[ncand++] = regs[ci];
-        }
-        if (ncand && g_xbox_mem_offset) {
-            const uint32_t *ram = (const uint32_t *)(uintptr_t)g_xbox_mem_offset;
-            size_t words = (64u << 20) / 4, i;
-            int found[8]; int total = 0;
-            for (ci = 0; ci < ncand; ci++) found[ci] = 0;
-            for (i = 0x1000; i < words && total < 24; i++) {
-                uint32_t w = ram[i];
-                for (ci = 0; ci < ncand; ci++) {
-                    if (w != cand[ci] || found[ci] >= 4) continue;
-                    found[ci]++; total++;
-                    fprintf(stderr, "  %08X is stored at guest 0x%08X\n",
-                            cand[ci], (unsigned)(i * 4));
-                    if (found[ci] <= 2) {
-                        /* The object around it. A scene-graph node is walked
-                         * through +0x28 (child) and +0x30 (sibling), so the
-                         * dump starts far enough back to show a node header
-                         * whichever field the hit turned out to be. */
-                        long base = (long)(i * 4) - 0x30;
-                        int k;
-                        if (base < 0) base = 0;
-                        if ((size_t)(base >> 2) + 16 > words) base = 0;
-                        for (k = 0; k < 16; k += 4) {
-                            fprintf(stderr, "    +%04lX: %08X %08X %08X %08X\n",
-                                    (unsigned long)(base + k * 4),
-                                    ram[(base >> 2) + k + 0], ram[(base >> 2) + k + 1],
-                                    ram[(base >> 2) + k + 2], ram[(base >> 2) + k + 3]);
-                        }
-                    }
-                    break;
-                }
-            }
-            for (ci = 0; ci < ncand; ci++)
-                if (!found[ci])
-                    fprintf(stderr, "  %08X is not stored anywhere in guest "
-                            "RAM -- it was computed, not loaded\n", cand[ci]);
-        }
-    }
+    report_bad_pointer(fault_addr);
     fprintf(stderr, "  Xbox regs: eax=0x%08X ecx=0x%08X edx=0x%08X esp=0x%08X\n", g_eax, g_ecx, g_edx, g_esp);
     fprintf(stderr, "  Xbox regs: ebx=0x%08X esi=0x%08X edi=0x%08X\n", g_ebx, g_esi, g_edi);
     fprintf(stderr, "  Xbox VA of fault: 0x%08X\n", (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset));
@@ -532,6 +583,80 @@ static void segv_handler(int sig, siginfo_t *si, void *ctx)
     _exit(139);
 }
 
+#else /* _WIN32 */
+
+/* The image this code is in, for naming native addresses as offsets into it
+ * (llvm-symbolizer or the linker map turns those into function names). */
+static void exe_range(uintptr_t *lo, uintptr_t *hi)
+{
+    const unsigned char *base = (const unsigned char *)GetModuleHandleW(NULL);
+    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)base;
+    const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    *lo = (uintptr_t)base;
+    *hi = (uintptr_t)base + nt->OptionalHeader.SizeOfImage;
+}
+
+/* Every fault the process does not handle itself ends here, on whichever
+ * thread it happened: the same report the POSIX signal handler writes. */
+static LONG WINAPI win_crash_filter(EXCEPTION_POINTERS *ep)
+{
+    const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    const CONTEXT *c = ep->ContextRecord;
+    uintptr_t fault_addr = 0, lo, hi;
+    const char *what = "";
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2) {
+        fault_addr = (uintptr_t)er->ExceptionInformation[1];
+        what = er->ExceptionInformation[0] == 0 ? " (read)"
+             : er->ExceptionInformation[0] == 1 ? " (write)" : " (execute)";
+    }
+    exe_range(&lo, &hi);
+    fprintf(stderr, "[CRASH] exception 0x%08lX%s, fault addr=0x%llX\n",
+            (unsigned long)er->ExceptionCode, what, (unsigned long long)fault_addr);
+    if (c->Rip >= lo && c->Rip < hi)
+        fprintf(stderr, "  native RIP=%p (jsrf_recomp.exe+0x%llX)\n",
+                (void *)(uintptr_t)c->Rip, (unsigned long long)(c->Rip - lo));
+    else
+        fprintf(stderr, "  native RIP=%p (outside the engine's image)\n",
+                (void *)(uintptr_t)c->Rip);
+    { const unsigned char *p = (const unsigned char *)(uintptr_t)c->Rip;
+      if (!IsBadReadPtr(p, 8))
+          fprintf(stderr, "  faulting instruction: %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                  p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]); }
+    { extern void xbox_kernel_thread_report(void);
+      xbox_kernel_thread_report(); }
+    if (fault_addr)
+        report_bad_pointer(fault_addr);
+    fprintf(stderr, "  Xbox regs: eax=0x%08X ecx=0x%08X edx=0x%08X esp=0x%08X\n", g_eax, g_ecx, g_edx, g_esp);
+    fprintf(stderr, "  Xbox regs: ebx=0x%08X esi=0x%08X edi=0x%08X\n", g_ebx, g_esi, g_edi);
+    if (fault_addr)
+        fprintf(stderr, "  Xbox VA of fault: 0x%08X\n", (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset));
+    { extern uint32_t xbox_current_thread_stack_top(void);
+      fprintf(stderr, "  thread stack top: 0x%08X (0 = main thread)\n", xbox_current_thread_stack_top()); }
+    print_guest_context();
+    /* Return addresses into the engine on the native stack, innermost first. */
+    {
+        const uintptr_t *sp = (const uintptr_t *)(uintptr_t)c->Rsp;
+        int i, shown = 0;
+        fprintf(stderr, "  native stack (engine addresses in the first 2000 slots):\n");
+        for (i = 0; i < 2000 && shown < 20; i++) {
+            uintptr_t v;
+            if (IsBadReadPtr(sp + i, sizeof *sp)) break;
+            v = sp[i];
+            if (v > lo && v < hi) {
+                fprintf(stderr, "    [rsp+%-5d] jsrf_recomp.exe+0x%llX\n", i * 8,
+                        (unsigned long long)(v - lo));
+                shown++;
+            }
+        }
+    }
+    { extern void recomp_icallv_dump(void); recomp_icallv_dump(); }
+    RECOMP_ICALL_FEEDBACK_DUMP();
+    fflush(stderr);
+    _exit(139);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+#endif /* _WIN32 */
+
 /* ── WinMain ───────────────────────────────────────────────── */
 
 static int host_main(void)
@@ -553,9 +678,17 @@ static int host_main(void)
      * time the process is already in a bad way, and SymInitialize
      * allocates. Failure is not fatal -- the handler prints no name. */
     {
+#if defined(_WIN32)
+        SetUnhandledExceptionFilter(win_crash_filter);
+        /* Sleep() and every timed wait round to the system tick, 15.6 ms
+         * unless asked: a frame paced at 60 Hz would come out at 32 ms. One
+         * millisecond, as a POSIX host's sleeps are. */
+        timeBeginPeriod(1);
+#else
         struct sigaction sa; memset(&sa, 0, sizeof sa);
         sa.sa_sigaction = segv_handler; sa.sa_flags = SA_SIGINFO;
         sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL); sigaction(SIGILL, &sa, NULL);
+#endif
         signal(SIGTERM, term_handler); signal(SIGINT, term_handler);
     }
 

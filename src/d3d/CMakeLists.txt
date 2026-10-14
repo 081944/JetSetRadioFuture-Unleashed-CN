@@ -2,7 +2,7 @@
 #   _WIN32 -> backed by Direct3D 11 (d3d8_*.c, d3d8_combiners.c, d3d8_vsh.c)
 #   POSIX  -> backed by OpenGL 3.3 core via SDL2 + libepoxy (d3d8_gl.c)
 
-if(WIN32)
+if(WIN32 AND NOT XBOXRECOMP_WIN_GL)
     add_library(xbox_d3d8 STATIC
         d3d8_device.c
         d3d8_resources.c
@@ -16,7 +16,7 @@ if(WIN32)
     # Offline smoke test for the pure format layer (no D3D11 device needed).
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_smoke
                      ${CMAKE_CURRENT_BINARY_DIR}/d3d8_smoke)
-elseif(APPLE)
+elseif(APPLE OR XBOXRECOMP_WIN_GL)
     # Nothing to build: a title that brings its own D3D (JSRF's is linked into
     # its executable) reaches the GPU through the pushbuffer and nv2a_gl, and
     # the OpenGL D3D8 below wants SDL2 and libepoxy, which a Mac only has

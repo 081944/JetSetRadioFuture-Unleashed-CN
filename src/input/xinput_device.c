@@ -105,7 +105,7 @@ static int input_script(DWORD port, XBOX_INPUT_STATE *pState)
     return 0;
 }
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) || defined(XBOXRECOMP_WIN_GL)
 /* The window's keyboard, merged in rather than instead.
  *
  * Someone with a pad in their hands and someone using the keyboard should
@@ -183,7 +183,7 @@ static int host_pad_off(void)
 #endif
 
 /* ======================================================================== */
-#if defined(_WIN32)
+#if defined(_WIN32) && !defined(XBOXRECOMP_WIN_GL)
 /* ====================  XInput backend  ================================== */
 /* ======================================================================== */
 

@@ -80,6 +80,9 @@ endif()
 # where every package is an x86_64 library an arm64 binary cannot link.
 if(APPLE AND NOT DEFINED NV2A_GL_CONTEXT)
     set(NV2A_GL_CONTEXT "cgl")
+elseif(WIN32 AND NOT DEFINED NV2A_GL_CONTEXT)
+    # Windows has neither EGL nor CGL: the window and its context are SDL2's.
+    set(NV2A_GL_CONTEXT "sdl")
 elseif(NOT DEFINED NV2A_GL_CONTEXT)
     set(NV2A_GL_CONTEXT "egl")
 endif()
@@ -101,6 +104,14 @@ elseif(NV2A_GL_CONTEXT STREQUAL "sdl")
     endif()
 else()
     target_link_libraries(xbox_nv2a_gl PUBLIC OpenGL::GL EGL m)
+endif()
+if(WIN32)
+    # opengl32.dll exports OpenGL 1.1 and nothing after it; the 3.3 core entry
+    # points come through libepoxy, which asks the driver for them.
+    find_path(EPOXY_INCLUDE_DIR epoxy/gl.h REQUIRED)
+    find_library(EPOXY_LIBRARY epoxy REQUIRED)
+    target_include_directories(xbox_nv2a_gl PUBLIC ${EPOXY_INCLUDE_DIR})
+    target_link_libraries(xbox_nv2a_gl PUBLIC ${EPOXY_LIBRARY})
 endif()
 message(STATUS "nv2a_gl context: ${NV2A_GL_CONTEXT}")
 

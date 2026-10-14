@@ -13,7 +13,7 @@
 
 #include "apu_xaudio2.h"
 
-#if !defined(_WIN32) && !defined(__APPLE__)
+#if (!defined(_WIN32) || defined(XBOXRECOMP_WIN_GL)) && !defined(__APPLE__)
 
 #include <SDL.h>
 #include <stdatomic.h>

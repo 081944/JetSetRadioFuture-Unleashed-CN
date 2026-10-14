@@ -7724,7 +7724,12 @@ void xbox_kernel_bridge_init(void)
 #endif
 #include <time.h>
 #include <pthread.h>
+#if defined(_WIN32)
+/* The call chain at a watched store: what <execinfo.h>'s backtrace() gives. */
+#define backtrace(buf, n) ((int)CaptureStackBackTrace(0, (DWORD)(n), (buf), NULL))
+#else
 #include <execinfo.h>
+#endif
 
 uint32_t g_recomp_watch_lo, g_recomp_watch_span;
 uint32_t g_recomp_watch2_lo, g_recomp_watch2_span;

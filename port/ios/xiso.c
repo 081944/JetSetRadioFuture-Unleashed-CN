@@ -33,7 +33,61 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+
+#if defined(_WIN32)
+/* Windows (the launcher unpacks a disc image with this too): the same calls
+ * in binary mode, with 64-bit offsets -- a full disc image is 7.8 GB -- and
+ * UTF-8 paths through the wide-character file API. */
+#include <io.h>
+#include <direct.h>
+#include <windows.h>
+typedef long long x_ssize;
+static int x_wide(const char *path, wchar_t *w, int n)
+{
+    return MultiByteToWideChar(CP_UTF8, 0, path, -1, w, n) > 0;
+}
+static int x_open(const char *path, int flags, int mode)
+{
+    wchar_t w[2048];
+    (void)mode;
+    if (!x_wide(path, w, 2048)) { errno = ENOENT; return -1; }
+    return _wopen(w, flags | _O_BINARY, _S_IREAD | _S_IWRITE);
+}
+static int x_mkdir(const char *path, int mode)
+{
+    wchar_t w[2048];
+    (void)mode;
+    if (!x_wide(path, w, 2048)) { errno = ENOENT; return -1; }
+    return _wmkdir(w);
+}
+static x_ssize x_pread(int fd, void *b, size_t n, uint64_t off)
+{
+    if (_lseeki64(fd, (long long)off, SEEK_SET) < 0) return -1;
+    return _read(fd, b, (unsigned)(n > (1u << 30) ? (1u << 30) : n));
+}
+static int x_fsize(int fd, uint64_t *size)
+{
+    struct _stat64 st;
+    if (_fstat64(fd, &st)) return -1;
+    *size = (uint64_t)st.st_size;
+    return 0;
+}
+#define open(path, flags, ...) x_open((path), (flags), 0)
+#define mkdir(path, mode)      x_mkdir((path), (mode))
+#define write(fd, b, n)        _write((fd), (b), (unsigned)(n))
+#define close(fd)              _close(fd)
+#else
 #include <unistd.h>
+typedef ssize_t x_ssize;
+#define x_pread(fd, b, n, off) pread((fd), (b), (n), (off_t)(off))
+static int x_fsize(int fd, uint64_t *size)
+{
+    struct stat st;
+    if (fstat(fd, &st)) return -1;
+    *size = (uint64_t)st.st_size;
+    return 0;
+}
+#endif
 
 #define XISO_SECTOR        2048u
 #define XISO_HEADER_OFFSET 0x10000u
@@ -81,7 +135,7 @@ static int read_at(int fd, void *b, size_t n, uint64_t off)
 {
     size_t got = 0;
     while (got < n) {
-        ssize_t r = pread(fd, (char *)b + got, n - got, (off_t)(off + got));
+        x_ssize r = x_pread(fd, (char *)b + got, n - got, off + got);
         if (r < 0 && errno == EINTR) continue;
         if (r <= 0) return -1;
         got += (size_t)r;
@@ -93,7 +147,7 @@ static int write_all(int fd, const void *b, size_t n)
 {
     size_t put = 0;
     while (put < n) {
-        ssize_t w = write(fd, (const char *)b + put, n - put);
+        x_ssize w = write(fd, (const char *)b + put, n - put);
         if (w < 0 && errno == EINTR) continue;
         if (w <= 0) return -1;
         put += (size_t)w;
@@ -262,12 +316,11 @@ static int mkdirs(const char *dir)
 
 int xiso_probe(const char *iso_path)
 {
-    struct stat st;
-    uint64_t base;
+    uint64_t base, size;
     uint32_t rs, rz;
     int fd = open(iso_path, O_RDONLY), ok;
     if (fd < 0) return 0;
-    ok = fstat(fd, &st) == 0 && find_volume(fd, (uint64_t)st.st_size, &base, &rs, &rz);
+    ok = x_fsize(fd, &size) == 0 && find_volume(fd, size, &base, &rs, &rz);
     close(fd);
     return ok;
 }
@@ -276,7 +329,6 @@ int xiso_extract(const char *iso_path, const char *dest_dir,
                  xiso_progress_fn progress, void *ctx, char *err, size_t errlen)
 {
     Xiso x;
-    struct stat st;
     uint32_t root_sector, root_size;
     int rc;
 
@@ -286,8 +338,7 @@ int xiso_extract(const char *iso_path, const char *dest_dir,
     x.progress = progress; x.ctx = ctx;
     x.fd = open(iso_path, O_RDONLY);
     if (x.fd < 0) return fail(&x, "Could not open the disc image: %s", strerror(errno));
-    if (fstat(x.fd, &st)) { close(x.fd); return fail(&x, "Could not read the disc image: %s", strerror(errno)); }
-    x.size = (uint64_t)st.st_size;
+    if (x_fsize(x.fd, &x.size)) { close(x.fd); return fail(&x, "Could not read the disc image: %s", strerror(errno)); }
     if (!find_volume(x.fd, x.size, &x.base, &root_sector, &root_size)) {
         close(x.fd);
         return fail(&x, "That file is not an Xbox disc image.");

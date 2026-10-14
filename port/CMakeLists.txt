@@ -67,6 +67,14 @@ if(NOT JSRF_VERSION)
 endif()
 message(STATUS "JSRF Unleashed version: ${JSRF_VERSION}")
 
+# Windows (MinGW): the runtime's OpenGL / SDL2 host layers, as on Linux and the
+# Mac, rather than its Direct3D 11 ones -- the title draws through its own D3D
+# and the pushbuffer, which is what nv2a_gl renders everywhere else.
+if(WIN32)
+    set(XBOXRECOMP_WIN_GL ON)
+    add_compile_definitions(XBOXRECOMP_WIN_GL=1)
+endif()
+
 # The runtime: everything in this repository outside port/ and launcher/.
 add_subdirectory("${JSRF_REPO}" "${CMAKE_BINARY_DIR}/xboxrecomp")
 
@@ -98,7 +106,34 @@ target_include_directories(jsrf_recomp PRIVATE
     "${JSRF_GEN_DIR}"
     "${JSRF_REPO}/include"
 )
-if(WIN32)
+if(WIN32 AND XBOXRECOMP_WIN_GL)
+    # The icon, a manifest (UTF-8 file names, a sharp window on a high-DPI
+    # screen) and version information, shared with the launcher
+    # (launcher/windows).
+    enable_language(RC)
+    string(REGEX MATCH "^([0-9]+)[.]([0-9]+)[.]([0-9]+)" _jsrf_v "${JSRF_VERSION}")
+    if(_jsrf_v)
+        set(_jsrf_vnum "${CMAKE_MATCH_1},${CMAKE_MATCH_2},${CMAKE_MATCH_3},0")
+    else()
+        set(_jsrf_vnum "0,0,0,0")
+    endif()
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/jsrf_version.h"
+         "#define JSRF_VER_NUM ${_jsrf_vnum}\n#define JSRF_VER_STR \"${JSRF_VERSION}\"\n")
+    target_sources(jsrf_recomp PRIVATE "${JSRF_REPO}/launcher/windows/resources.rc")
+    target_include_directories(jsrf_recomp PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    set_source_files_properties("${JSRF_REPO}/launcher/windows/resources.rc" PROPERTIES
+        COMPILE_DEFINITIONS "JSRF_ENGINE")
+    # An 8 MB stack for the main thread and for the threads the title creates
+    # (CreateThread with size 0 takes the image's), as a Linux main thread has:
+    # recompiled functions nest as deeply as the guest's calls, and Windows'
+    # default is 1 MB.
+    find_package(Threads REQUIRED)
+    target_link_libraries(jsrf_recomp PRIVATE Threads::Threads winmm dbghelp)
+    target_link_options(jsrf_recomp PRIVATE -Wl,--stack,0x800000)
+    # The linker map names the function at any jsrf_recomp.exe+offset a crash
+    # report prints (kept with a release build, not shipped).
+    target_link_options(jsrf_recomp PRIVATE "-Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/jsrf_recomp.map")
+elseif(WIN32)
     target_link_libraries(jsrf_recomp PRIVATE d3d11 dxgi dxguid xinput winmm dbghelp)
 else()
     target_link_libraries(jsrf_recomp PRIVATE pthread m dl)

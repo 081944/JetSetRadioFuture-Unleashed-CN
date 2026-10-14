@@ -16,10 +16,11 @@ if(APPLE)
     # file compiles to nothing here and waveOut does not exist at all, so the
     # AudioQueue backend answers the same five entry points instead.
     list(APPEND XBOX_APU_SOURCES apu_coreaudio.c)
-elseif(WIN32)
+elseif(WIN32 AND NOT XBOXRECOMP_WIN_GL)
     list(APPEND XBOX_APU_SOURCES apu_xaudio2.c)
 else()
-    # Linux: SDL2's audio, answering the same entry points (apu_sdl.c).
+    # Linux, and Windows with XBOXRECOMP_WIN_GL: SDL2's audio, answering the
+    # same entry points (apu_sdl.c).
     list(APPEND XBOX_APU_SOURCES apu_sdl.c)
 endif()
 
@@ -45,7 +46,7 @@ if(MSVC)
     )
 endif()
 
-if(WIN32)
+if(WIN32 AND NOT XBOXRECOMP_WIN_GL)
     target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm)
 elseif(APPLE)
     target_link_libraries(xbox_apu PRIVATE platform
@@ -54,4 +55,7 @@ else()
     # Linux: platform layer (Win32 primitives on POSIX) + SDL2 audio + libm
     find_package(SDL2 REQUIRED)
     target_link_libraries(xbox_apu PRIVATE platform SDL2::SDL2 m)
+    if(WIN32)
+        target_link_libraries(xbox_apu PRIVATE kernel32 winmm)
+    endif()
 endif()
