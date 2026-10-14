@@ -429,9 +429,29 @@ static DWORD g_packet[XBOX_MAX_CONTROLLERS];
 /* Open the attached game controllers into free slots, in the order SDL lists
  * them, and let go of any that went away -- so a pad plugged in (or paired)
  * after the game started is picked up. */
+static void list_devices(void)
+{
+    /* What SDL sees, whenever that changes: a pad that is listed but has no
+     * controller mapping is not used, and one that is not listed at all was
+     * never seen -- two different reports. Names and USB ids only: a device
+     * path can carry a Bluetooth address, and logs end up in public issues. */
+    static int last = -1;
+    int i, n = SDL_NumJoysticks();
+    if (n == last) return;
+    last = n;
+    fprintf(stderr, "[PAD] SDL sees %d input device(s)\n", n < 0 ? 0 : n);
+    for (i = 0; i < n; i++) {
+        const char *nm = SDL_JoystickNameForIndex(i);
+        fprintf(stderr, "[PAD]   %d: %s (%04x:%04x)%s\n", i, nm ? nm : "unnamed",
+                SDL_JoystickGetDeviceVendor(i), SDL_JoystickGetDeviceProduct(i),
+                SDL_IsGameController(i) ? "" : " -- no controller mapping, not used");
+    }
+}
+
 static void open_controllers(void)
 {
     int slot, i;
+    list_devices();
     for (slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++)
         if (g_pads[slot] && !SDL_GameControllerGetAttached(g_pads[slot])) {
             fprintf(stderr, "[PAD] controller %d gone\n", slot);
@@ -462,8 +482,24 @@ static void open_controllers(void)
 void xbox_InputInit(void)
 {
     if (host_pad_off()) return;
-    if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
-        SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
+    if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER)) {
+#if defined(_WIN32)
+        /*
+         * Windows delivers a pad's input to a window. SDL makes that window
+         * on the thread that starts its joystick support -- here the game's
+         * own thread, which asks for the pad first -- and reads it only when
+         * that thread pumps its messages, which the game's thread never does
+         * (the window's events are pumped by the GPU thread). An Xbox pad is
+         * claimed by SDL's raw-input driver, so it was found, opened, and
+         * never moved: "the controller doesn't work". With this SDL keeps a
+         * thread of its own for the window and its messages, which is what
+         * the hint is for, and pads plugged in later are found there too.
+         */
+        SDL_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");
+#endif
+        if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0)
+            fprintf(stderr, "[PAD] no controller support: %s\n", SDL_GetError());
+    }
     open_controllers();
 }
 
