@@ -27,8 +27,8 @@ you own.
 |---|---|
 | macOS 12 or later, Apple Silicon (M1 or later) | [JSRF-Unleashed-macOS-arm64.zip](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-macOS-arm64.zip) |
 | Linux, x86_64 (glibc 2.34 or later: Ubuntu 22.04, Debian 12, Fedora 36 and newer) | [JSRF-Unleashed-linux-x86_64.tar.gz](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-linux-x86_64.tar.gz) — less tested than the Mac build |
-| iPhone and iPad, iOS 15 or later (iPhone XS or newer recommended) | [JSRF-Unleashed-iOS.ipa](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-iOS.ipa) — **new and experimental**: plays on iPhone, far less played than the Mac build |
-| Windows 10 or 11, 64-bit | [JSRF-Unleashed-windows-x86_64.zip](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-windows-x86_64.zip) — **new and experimental**: played under CrossOver and Wine, not yet on a Windows PC |
+| iPhone and iPad, iOS 15 or later (iPhone XS or newer recommended) | [JSRF-Unleashed-iOS.ipa](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-iOS.ipa) — less tested on iPads |
+| Windows 10 or 11, 64-bit | [JSRF-Unleashed-windows-x86_64.zip](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-windows-x86_64.zip) — tested under Wine |
 
 Every version is on the [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases) page; what changed is in the [changelog](CHANGELOG.md).
 
@@ -204,8 +204,8 @@ Playable, early, and not yet played from start to finish.
 | Music, sound effects, voices | works |
 | Widescreen 16:9 | works in game; the title screen stays 4:3 |
 | Linux build | boots, menus, starting a new game; far less played than the Mac build |
-| Windows build | new: plays under CrossOver and Wine (title, loading a save, the garage); not yet tried on a Windows PC |
-| iPhone / iPad build | new: plays on iPhone; far less played than the Mac build |
+| Windows build | tested under Wine |
+| iPhone / iPad build | plays on iPhone; less tested on iPads |
 | Later areas | little tested — expect bugs |
 | Known issues | an occasional "disc error" screen during a load |
 
