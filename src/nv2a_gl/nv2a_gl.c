@@ -1225,15 +1225,30 @@ static void sdl_key(SDL_Scancode sc, int down)
     if (analog >= 0) g_sdl_kb_analog[analog] = down ? 255 : 0;
 }
 
+#if defined(__ANDROID__)
+/* The Android app's on-screen controls (port/android/jsrf_android.c): what
+ * they hold, in the same bits, and 1 while they are showing -- the pad then
+ * counts as connected with nothing held, as on the iPhone. */
+int nv_touch_keys(unsigned short *buttons, unsigned char *analog);
+#endif
+
 /* Read by the input layer (xinput_device.c), with the Mac's signature. */
 int nv_window_keys(unsigned short *buttons, unsigned char *analog)
 {
     int i, any;
     unsigned short b = g_sdl_kb_buttons;
+    unsigned char ta[8] = { 0 };
+#if defined(__ANDROID__)
+    unsigned short tb = 0;
+    int touch = nv_touch_keys(&tb, ta);
+    b |= tb;
+#else
+    int touch = 0;
+#endif
     if (buttons) *buttons = b;
-    any = b != 0;
+    any = b != 0 || touch;
     for (i = 0; i < 8; i++) {
-        unsigned char v = g_sdl_kb_analog[i];
+        unsigned char v = g_sdl_kb_analog[i] > ta[i] ? g_sdl_kb_analog[i] : ta[i];
         if (analog) analog[i] = v;
         if (v) any = 1;
     }
@@ -1247,6 +1262,12 @@ static void sdl_toggle_fullscreen(void)
     SDL_ShowCursor(fs ? SDL_ENABLE : SDL_DISABLE);
     fprintf(stderr, "[WIN] full screen %s\n", fs ? "off" : "on");
 }
+
+/* Widescreen asked for from another thread (the Android app's settings): done
+ * at the next sdl_pump, by the thread that owns the window, as F10 is. */
+static volatile int g_sdl_want_wide = -1;
+void nv_window_request_widescreen(int on);
+void nv_window_request_widescreen(int on) { g_sdl_want_wide = on ? 1 : 0; }
 
 static void sdl_toggle_widescreen(void)
 {
@@ -1365,6 +1386,11 @@ static void sdl_present(GLuint src_fbo, int sw, int sh)
 static void sdl_pump(void)
 {
     SDL_Event ev;
+    if (g_sdl_want_wide >= 0) {
+        int want = g_sdl_want_wide;
+        g_sdl_want_wide = -1;
+        if (want != nv2a_widescreen()) sdl_toggle_widescreen();
+    }
     while (SDL_PollEvent(&ev)) {
         switch (ev.type) {
         case SDL_QUIT:

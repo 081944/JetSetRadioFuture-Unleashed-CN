@@ -155,6 +155,80 @@ int nv_android_main(int argc, char **argv, int (*host)(void))
     return call.rc;
 }
 
+/* ---- the on-screen controls (JsrfActivity's TouchPadView) ---------------- */
+
+/* What the controls hold: the keyboard's bits (Start, Back, and the d-pad
+ * the stick gives, which menus read), the buttons as analog values (A B X Y
+ * Black White LT RT), the stick, and whether the controls are showing. */
+static volatile unsigned short g_touch_buttons;
+static volatile unsigned char  g_touch_analog[8];
+static volatile short g_touch_x, g_touch_y;
+static volatile int   g_touch_stick, g_touch_shown;
+
+JNIEXPORT void JNICALL
+Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeTouch(JNIEnv *env, jclass cls, jint buttons,
+                                                       jint analog, jint x, jint y,
+                                                       jboolean stick, jboolean shown)
+{
+    int i;
+    (void)env; (void)cls;
+    for (i = 0; i < 8; i++) g_touch_analog[i] = ((analog >> i) & 1) ? 255 : 0;
+    g_touch_x = (short)x;
+    g_touch_y = (short)y;
+    g_touch_stick = stick ? 1 : 0;
+    g_touch_buttons = (unsigned short)buttons;
+    g_touch_shown = shown ? 1 : 0;
+}
+
+/* Merged in by nv2a_gl.c's nv_window_keys; 1 while the controls show. */
+int nv_touch_keys(unsigned short *buttons, unsigned char *analog);
+int nv_touch_keys(unsigned short *buttons, unsigned char *analog)
+{
+    int i, any = g_touch_shown || g_touch_buttons;
+    *buttons = g_touch_buttons;
+    for (i = 0; i < 8; i++) {
+        analog[i] = g_touch_analog[i];
+        if (analog[i]) any = 1;
+    }
+    return any;
+}
+
+/* xinput_device.c: the on-screen stick moves the left stick, while a thumb
+ * is on it (this replaces its weak "none"). */
+int nv_window_touch_stick(short *x, short *y);
+int nv_window_touch_stick(short *x, short *y)
+{
+    if (!g_touch_stick) return 0;
+    *x = g_touch_x;
+    *y = g_touch_y;
+    return 1;
+}
+
+/* The settings: widescreen now (by the window's thread, as F10 does it). */
+int  nv2a_widescreen(void);
+void nv_window_request_widescreen(int on);
+
+JNIEXPORT jboolean JNICALL
+Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeWidescreen(JNIEnv *env, jclass cls)
+{
+    (void)env; (void)cls;
+    return nv2a_widescreen() ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeSetWidescreen(JNIEnv *env, jclass cls, jboolean on)
+{
+    (void)env; (void)cls;
+    nv_window_request_widescreen(on ? 1 : 0);
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeVersion(JNIEnv *env, jclass cls)
+{
+    (void)cls;
+    return (*env)->NewStringUTF(env, JSRF_VERSION);
+}
+
 /* ---- the setup screen's unpacker (SetupActivity) ------------------------- */
 
 JNIEXPORT jstring JNICALL
