@@ -16,7 +16,7 @@
       "bundleIdentifier": "com.jumatt.jsrf-unleashed",
       "developerName": "JuMatt",
       "subtitle": "Jet Set Radio Future, natively",
-      "localizedDescription": "Jet Set Radio Future, statically recompiled: the game's own code translated to native code and running on Metal -- not an emulator.\n\nBring your own game: the USA release of Jet Set Radio Future. After installing, open the app once, then copy the game into its folder in the Files app (On My iPhone > JSRF Unleashed): either the extracted folder with default.xbe in it, or the disc image (.iso), which the app unpacks itself.\n\nA controller is the best way to play (Xbox, PlayStation, MFi and others); without one there are on-screen controls. Widescreen 16:9; saves are kept in the game's folder.\n\nExperimental: plays on iPhone, but far less played than the Mac build. Bug reports with the log from the app's Logs folder are welcome on GitHub.",
+      "localizedDescription": "Jet Set Radio Future, statically recompiled: the game's own code translated to native code and running on Metal -- not an emulator.\n\nBring your own game: the USA release of Jet Set Radio Future. After installing, open the app once, then copy the game into its folder in the Files app (On My iPhone > JSRF Unleashed): either the extracted folder with default.xbe in it, or the disc image (.iso), which the app unpacks itself.\n\nA controller is the best way to play (Xbox, PlayStation, MFi and others); without one there are on-screen controls. Widescreen 16:9, or the whole screen on iPhone; saves are kept in the game's folder.\n\nExperimental: plays on iPhone, but far less played than the Mac build. Bug reports with the log from the app's Logs folder are welcome on GitHub.",
       "iconURL": "https://raw.githubusercontent.com/JuMatt/JetSetRadioFuture-Unleashed/main/launcher/icon/AppIcon.iconset/icon_512x512.png",
       "tintColor": "#9EDB29",
       "category": "games",
@@ -26,6 +26,15 @@
         "privacy": {}
       },
       "versions": [
+        {
+          "version": "0.4.4",
+          "buildVersion": "0.4.4",
+          "date": "2026-10-14T23:00:28Z",
+          "localizedDescription": "Fill the screen: a new choice in ⚙ › Picture widens the game to the whole iPhone screen. 16:9 stays the default, and the title screen stays 4:3. The picture is a new setting: if you had switched widescreen off, pick 4:3 again in ⚙ › Picture. Also a stability fix for long sessions, which the other versions already had.",
+          "downloadURL": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/download/v0.4.4/JSRF-Unleashed-iOS.ipa",
+          "size": 13188601,
+          "minOSVersion": "15.0"
+        },
         {
           "version": "0.2.0",
           "buildVersion": "0.2.0",
