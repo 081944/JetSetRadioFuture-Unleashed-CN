@@ -10,6 +10,20 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.4.1 — 14 October 2026
+
+- **Windows: smoother frames.** Each frame now reaches the screen in step
+  with the display, from a thread of its own, as the Metal renderer does it
+  on the Mac, and the game is paced to the display's refresh: on a 60 Hz
+  screen (and on 120 or 240 Hz ones) each frame is shown once. Before, the
+  game's own clock and the display's drifted apart, and every few seconds a
+  frame stayed up twice and the next was not shown at all. Played under
+  CrossOver on a Mac; not yet on a Windows PC. The log now says every 10
+  seconds how many frames were shown and how long each stayed on screen
+  (`[PRESENT]` lines in `last-run.log`).
+- The Android download is 0.4.0's, the Linux download 0.3.1's, and the Mac
+  and iPhone downloads are 0.2.0's, unchanged; AltStore keeps offering 0.2.0.
+
 ## 0.4.0 — 14 October 2026
 
 - **Android** (new): `JSRF-Unleashed-android-arm64.apk`, for
