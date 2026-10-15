@@ -27,6 +27,15 @@
       },
       "versions": [
         {
+          "version": "0.4.6",
+          "buildVersion": "0.4.6",
+          "date": "2026-10-15T16:01:00Z",
+          "localizedDescription": "The black city in the Skyscraper District and Pharaoh Park is fixed: the game's fog was emulated wrongly, which painted the scenery entirely in the fog colour. Areas with a coloured fog no longer come out as a flat wall of that colour, and distant buildings fade into the night or the haze as they should.",
+          "downloadURL": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/download/v0.4.6/JSRF-Unleashed-iOS.ipa",
+          "size": 13257625,
+          "minOSVersion": "15.0"
+        },
+        {
           "version": "0.4.5",
           "buildVersion": "0.4.5",
           "date": "2026-10-15T13:41:46Z",
