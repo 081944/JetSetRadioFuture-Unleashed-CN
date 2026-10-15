@@ -10,6 +10,32 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.4.7 — 15 October 2026
+
+- **Android: on-screen controls and controllers on phones that call one of
+  their own parts a gamepad.** Two players saw the intro play with no
+  on-screen controls, and their Bluetooth controllers (an Xbox Series X
+  controller, an 8BitDo Ultimate 2) did nothing. Many phones list one of
+  their own parts as a gamepad: the device their fingerprint reader or side
+  buttons send keys through declares gamepad buttons. The app counted it as
+  a controller and hid the on-screen controls, and SDL took it for one too:
+  it was opened first, as player 1's controller, and a real controller went
+  in as player 2's, which the game does not read.
+- A device now counts as a controller only if it has a stick, or a d-pad
+  that reports as one (SDL's own rule for this, which the app now turns
+  on). On those phones the on-screen controls show, and a controller
+  connected to them is player 1's.
+- The log says what the app made of each device Android calls a gamepad
+  (its name, how many axes it has, whether it counts as a controller) and
+  whether the on-screen controls are showing.
+- Tested in the Android emulator with a stand-in for such a phone part,
+  there from the start, and a controller connected 20 seconds in that
+  pressed Start and A. With 0.4.6 the on-screen controls were missing and
+  the controller did nothing. With 0.4.7 the controls showed, went away
+  when the controller connected, and the controller started the game.
+- Only the Android download is new: the Mac, iPhone, Linux and Windows
+  downloads are 0.4.6's, unchanged.
+
 ## 0.4.6 — 15 October 2026
 
 - **Skyscraper District and Pharaoh Park: the city is back.** A player on a

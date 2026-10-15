@@ -45,6 +45,13 @@ static void mkdir_p(const char *path)
     mkdir(buf, 0755);
 }
 
+/* Lines from the Java side (JsrfActivity: which input devices it counts as
+ * controllers). They come before the log is open -- the activity starts
+ * before the engine -- so they wait here until jlog_start prints them. */
+static pthread_mutex_t g_jlog_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_jlog[4096];
+static int  g_log_open;
+
 /* Logs/last-run.log, the one before it kept as previous-run.log. Both
  * streams append to the same file, unbuffered. */
 static void open_log(const char *data)
@@ -63,6 +70,17 @@ static void open_log(const char *data)
     setvbuf(stderr, NULL, _IONBF, 0);
 }
 
+/* From here on the Java side's lines go straight into the log; the ones that
+ * waited go in now -- after the version line, which stays the log's first. */
+static void jlog_start(void)
+{
+    pthread_mutex_lock(&g_jlog_mu);
+    g_log_open = 1;
+    fputs(g_jlog, stderr);
+    g_jlog[0] = 0;
+    pthread_mutex_unlock(&g_jlog_mu);
+}
+
 /* key=value lines (the file the engine's F9/F10 keys write to as well). */
 static int cfg_get_int(const char *file, const char *key, int def)
 {
@@ -79,7 +97,13 @@ static int cfg_get_int(const char *file, const char *key, int def)
 
 /* The same settings as the Linux and Windows launchers'; full screen always.
  * Then SDL's: Back is the game's (the Xbox Back button, nv2a_gl.c) rather than
- * a way out of it, and the phone's motion sensor is not a controller. */
+ * a way out of it, the phone's motion sensor is not a controller, and neither
+ * is a device without a stick or a d-pad. Phones list some of their own parts
+ * as gamepads -- the fingerprint reader's or the side buttons' device declares
+ * gamepad buttons -- and SDL took one for a controller: it was opened first,
+ * into player 1's place, and a real controller paired after it went into
+ * player 2's, which the game does not read. SDL_TV_REMOTE_AS_JOYSTICK=0 is
+ * SDL's own rule for this (fewer than two axes and no hat: not a joystick). */
 static const char *const k_env[][2] = {
     { "RECOMP_USB", "1" }, { "RECOMP_GL", "1" }, { "RECOMP_PB_EXEC", "1" },
     { "RECOMP_VBLANK", "1" }, { "RECOMP_AC97_READY_NOTRAP", "1" },
@@ -88,6 +112,7 @@ static const char *const k_env[][2] = {
     { "RECOMP_GL_CURTAIN", "skip" }, { "RECOMP_MUTE", "0" }, { "RECOMP_WINDOW", "1" },
     { "RECOMP_FULLSCREEN", "1" },
     { "SDL_ANDROID_TRAP_BACK_BUTTON", "1" }, { "SDL_ACCELEROMETER_AS_JOYSTICK", "0" },
+    { "SDL_TV_REMOTE_AS_JOYSTICK", "0" },
 };
 
 /* Set when the library is loaded, before the runtime's own constructors run
@@ -139,6 +164,7 @@ int nv_android_main(int argc, char **argv, int (*host)(void))
         fprintf(stderr, "[ANDROID] cannot enter %s: %s\n", game, strerror(errno));
     fprintf(stderr, "[ANDROID] JSRF Unleashed %s\n[ANDROID] game: %s\n[ANDROID] data: %s\n",
             JSRF_VERSION, game, data);
+    jlog_start();
 
     call.host = host;
     call.rc = 1;
@@ -220,6 +246,24 @@ Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeSetWidescreen(JNIEnv *env, jcla
 {
     (void)env; (void)cls;
     nv_window_request_widescreen(on ? 1 : 0);
+}
+
+/* A line for the log, from the Java side. */
+JNIEXPORT void JNICALL
+Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeLog(JNIEnv *env, jclass cls, jstring line)
+{
+    const char *s = (*env)->GetStringUTFChars(env, line, NULL);
+    (void)cls;
+    if (!s) return;
+    pthread_mutex_lock(&g_jlog_mu);
+    if (g_log_open)
+        fprintf(stderr, "%s\n", s);
+    else if (strlen(g_jlog) + strlen(s) + 2 < sizeof g_jlog) {
+        strcat(g_jlog, s);
+        strcat(g_jlog, "\n");
+    }
+    pthread_mutex_unlock(&g_jlog_mu);
+    (*env)->ReleaseStringUTFChars(env, line, s);
 }
 
 JNIEXPORT jstring JNICALL

@@ -6,6 +6,7 @@ import android.hardware.input.InputManager;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.InputDevice;
+import android.view.MotionEvent;
 import android.view.ViewGroup;
 import android.widget.RelativeLayout;
 import android.widget.Toast;
@@ -29,9 +30,11 @@ public class JsrfActivity extends SDLActivity
     static native boolean nativeWidescreen();
     static native void nativeSetWidescreen(boolean on);
     static native String nativeVersion();
+    static native void nativeLog(String line);
 
     private TouchPadView mPad;
     private InputManager mInput;
+    private String mPadsSaid = "";
 
     @Override
     protected String[] getLibraries() {
@@ -85,11 +88,39 @@ public class JsrfActivity extends SDLActivity
     @Override public void onInputDeviceRemoved(int id) { updateControls(); }
     @Override public void onInputDeviceChanged(int id) { updateControls(); }
 
-    private static boolean isController(InputDevice d) {
+    /** Android calls it a gamepad or a joystick. */
+    private static boolean looksLikePad(InputDevice d) {
         if (d == null || d.isVirtual()) return false;
         int s = d.getSources();
         return (s & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
             || (s & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK;
+    }
+
+    /** Its sticks' and triggers' axes, and its d-pad's when it reports one as
+     *  axes: {axes, hat axes}, counted as SDL counts them. */
+    private static int[] axesOf(InputDevice d) {
+        int axes = 0, hats = 0;
+        for (InputDevice.MotionRange r : d.getMotionRanges()) {
+            if ((r.getSource() & InputDevice.SOURCE_CLASS_JOYSTICK) == 0) continue;
+            if (r.getAxis() == MotionEvent.AXIS_HAT_X || r.getAxis() == MotionEvent.AXIS_HAT_Y) hats++;
+            else axes++;
+        }
+        return new int[] { axes, hats };
+    }
+
+    /** A controller: a gamepad with a stick or a d-pad that reports as axes.
+     *
+     *  Being called a gamepad is not enough. Phones list some of their own
+     *  parts as gamepads -- the fingerprint reader's or the side buttons'
+     *  device declares gamepad buttons -- and counting those hid the on-screen
+     *  controls on such a phone with nothing connected. They have no axes.
+     *  SDL is told the same (SDL_TV_REMOTE_AS_JOYSTICK in
+     *  port/android/jsrf_android.c), so the engine does not take one for
+     *  player 1's controller either. */
+    private static boolean isController(InputDevice d) {
+        if (!looksLikePad(d)) return false;
+        int[] a = axesOf(d);
+        return a[0] >= 2 || a[1] >= 2;
     }
 
     private boolean touchPref() {
@@ -101,11 +132,28 @@ public class JsrfActivity extends SDLActivity
     private void updateControls() {
         if (mPad == null) return;
         boolean pad = false;
-        for (int id : InputDevice.getDeviceIds())
-            if (isController(InputDevice.getDevice(id))) pad = true;
+        StringBuilder said = new StringBuilder();
+        for (int id : InputDevice.getDeviceIds()) {
+            InputDevice d = InputDevice.getDevice(id);
+            if (!looksLikePad(d)) continue;
+            boolean c = isController(d);
+            int[] a = axesOf(d);
+            if (c) pad = true;
+            /* Into the log: what each device Android calls a gamepad was
+             * taken for. Its name and counts only -- a descriptor can carry
+             * a Bluetooth address, and logs end up in public issues. */
+            said.append(String.format(java.util.Locale.ROOT, "[PAD] Android: %s: %d axes, %d hat axes -- %s\n",
+                    d.getName(), a[0], a[1], c ? "a controller" : "no stick or d-pad, not a controller"));
+        }
         boolean want = !pad && touchPref();
         mPad.setControls(want);
-        Log.i("JSRF", "controls: " + (pad ? "a controller" : want ? "on screen" : "none shown"));
+        said.append("[PAD] Android: on-screen controls ").append(pad ? "hidden (a controller)" : want ? "shown" : "hidden (the setting)");
+        String line = said.toString();
+        if (!line.equals(mPadsSaid)) {
+            mPadsSaid = line;
+            Log.i("JSRF", line);
+            for (String l : line.split("\n")) nativeLog(l);
+        }
     }
 
     /* ---- settings ---- */
