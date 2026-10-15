@@ -10,6 +10,34 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.4.5 — 15 October 2026
+
+- **Chuo Street: no more crash at the third tank.** A player's log showed
+  the game crashing every time he tagged his third tank. The tanks' sound
+  function was one of 27 functions of the game that the translation had
+  never found: their addresses appear only as constants in the game's code
+  (written into an object, into a table filled at startup, or handed to a
+  new thread), which neither the recompiler nor the later scans of the
+  game's tables looked at. Each call to it was skipped, and the skip left
+  the stack 8 bytes off; when the third tank was tagged, a tank routine came
+  back 16 bytes off and the game crashed. The 27 are translated now.
+- **Sounds that never played.** 17 of the 27 are sound functions, one for
+  each of 17 kinds of objects, the tanks among them. Whatever sounds they
+  start never played until now.
+- **A missing function costs less.** A call into code that was never
+  translated is still skipped, but the stack is now left the way the calling
+  code expects, so the next missing function costs a sound rather than the
+  game. The log names each one in full four times, then once every thousand
+  calls (the player's log was 1.4 MB of the same lines).
+- Tested in the iPhone Simulator, jumping straight into the tank fight and
+  skating toward the tanks with the same script on 0.4.4 and on 0.4.5:
+  0.4.4 skipped the tanks' sound function 793 times; 0.4.5 skipped nothing,
+  started 329 sounds against 211 and did not crash. The third tank itself
+  has not been reached in a test yet.
+- Every download is 0.4.5: Windows, Linux, Mac, Android and iPhone. The
+  Mac download, 0.2.0's until now, and the Linux one, 0.3.1's, have every
+  change since that applies to them.
+
 ## 0.4.4 — 15 October 2026
 
 - **iPhone: the picture can fill the screen.** At 16:9 the game has black
