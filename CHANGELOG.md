@@ -10,10 +10,14 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
-## 0.4.7 — 15 October 2026
+## 0.4.7 — 15 October 2026 — Android only
 
-- **Android: on-screen controls and controllers on phones that call one of
-  their own parts a gamepad.** Two players saw the intro play with no
+An Android-only fix. The Mac, iPhone, Linux and Windows downloads are
+0.4.6's, unchanged: the 0.4.7 release carries them over, and they still say
+0.4.6.
+
+- **On-screen controls and controllers on phones that call one of their
+  own parts a gamepad.** Two players saw the intro play with no
   on-screen controls, and their Bluetooth controllers (an Xbox Series X
   controller, an 8BitDo Ultimate 2) did nothing. Many phones list one of
   their own parts as a gamepad: the device their fingerprint reader or side
@@ -33,8 +37,6 @@ page.
   pressed Start and A. With 0.4.6 the on-screen controls were missing and
   the controller did nothing. With 0.4.7 the controls showed, went away
   when the controller connected, and the controller started the game.
-- Only the Android download is new: the Mac, iPhone, Linux and Windows
-  downloads are 0.4.6's, unchanged.
 
 ## 0.4.6 — 15 October 2026
 
