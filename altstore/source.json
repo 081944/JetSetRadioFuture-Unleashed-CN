@@ -27,6 +27,15 @@
       },
       "versions": [
         {
+          "version": "0.4.5",
+          "buildVersion": "0.4.5",
+          "date": "2026-10-15T13:41:46Z",
+          "localizedDescription": "No more crash at the third tank in Chuo Street: the tanks' sound function and 26 more functions of the game that were missing are in now, and the sounds of 17 kinds of objects, the tanks among them, play for the first time. A call into code that is still missing no longer upsets the stack.",
+          "downloadURL": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/download/v0.4.5/JSRF-Unleashed-iOS.ipa",
+          "size": 13257198,
+          "minOSVersion": "15.0"
+        },
+        {
           "version": "0.4.4",
           "buildVersion": "0.4.4",
           "date": "2026-10-14T23:00:28Z",
