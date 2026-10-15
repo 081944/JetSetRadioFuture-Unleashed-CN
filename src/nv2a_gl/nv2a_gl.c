@@ -208,6 +208,7 @@ extern uint32_t  xbox_ContiguousBlockSerial(uint32_t va);
 #define M_SET_FOG_ENABLE            0x02A4
 #define M_SET_FOG_COLOR             0x02A8
 #define M_SET_FOG_PARAMS            0x09C0   /* +0..+8, three floats */
+#define M_SET_FOG_PLANE             0x09D0   /* +0..+C, four floats */
 #define M_SET_SHADER_CLIP_PLANE_MODE 0x1E6C  /* per stage, per component: >= or < */
 #define M_SET_SHADER_STAGE_PROGRAM  0x1E70   /* texture shader mode, 5 bits per stage */
 #define M_SET_SHADER_OTHER_STAGE_INPUT 0x1E78
@@ -347,6 +348,8 @@ static struct {
     uint32_t fog_mode, fog_gen_mode, fog_enable;
     uint32_t shader_stage_prog, shader_clip_mode, shader_other_input;
     float    fog_params[3];
+    float    fog_plane[4];       /* NV097_SET_FOG_PLANE: the fixed-function
+                                  * transform's planar fog distance */
     uint32_t control0;           /* NV097_SET_CONTROL0 */
     uint32_t zminmax;            /* NV097_SET_ZMIN_MAX_CONTROL */
 
@@ -2366,6 +2369,11 @@ static void ff_describe(Nv2aVshFixed *f)
     for (i = 0; i < 4; i++)
         if (S.attr[9 + i].size) f->inputs_read |= 1u << (9 + i);
     f->tex_matrix = (uint8_t)(S.ff_texmat_enable & 0xF);
+    /* How the fog distance is made. Part of the shape whether or not fog is
+     * on: the title switches fog on and off between neighbouring batches,
+     * and with the enable left to a uniform those share one program. */
+    f->fog_gen = (uint8_t)(S.fog_gen_mode <= 6 ? S.fog_gen_mode : 0xFF);
+    if (f->fog_gen == 6 && S.attr[5].size) f->inputs_read |= 1u << 5;
     f->lit = (uint8_t)(S.ff_lighting ? 1 : 0);
     /* RECOMP_GL_FF_NOLIGHT=1: the old way -- the stream colour through, or
      * white -- for A/B. */
@@ -4860,10 +4868,30 @@ static void do_draw_body(void)
       use = (mode == 9) ? (S.xf_mode == NV2A_XF_MODE_FIXED ? 0 : 1) : mode;
       if (uses(slot, NV2A_U_POSMODE))
           G->uniform_i(NV2A_U_POSMODE, use); }
-    /* Whether the fog register carries a real factor or a flat 1.0. Uniforms
-     * belong to the program object, so this goes in per draw like the rest. */
+    /* Whether the fog register carries a real factor or a flat 1.0, and how
+     * a fog distance becomes that factor. Uniforms belong to the program
+     * object, so these go in per draw like the rest -- the last three only
+     * with fog on, since with it off the shader never reads them. */
     if (uses(slot, NV2A_U_FOGENABLE))
         G->uniform_i(NV2A_U_FOGENABLE, S.fog_enable ? 1 : 0);
+    if (S.fog_enable && uses(slot, NV2A_U_FOGMODE)) {
+        /* NV097_SET_FOG_MODE, folded for the shader: 0 linear, 1 exp,
+         * 2 exp2, plus 4 for the forms that take the absolute value. */
+        int m;
+        switch (S.fog_mode) {
+        case 0x0800: m = 1; break;   /* EXP */
+        case 0x0801: m = 2; break;   /* EXP2 */
+        case 0x0802: m = 5; break;   /* EXP_ABS */
+        case 0x0803: m = 6; break;   /* EXP2_ABS */
+        case 0x0804: m = 4; break;   /* LINEAR_ABS */
+        default:     m = 0; break;   /* LINEAR (0x2601) */
+        }
+        G->uniform_i(NV2A_U_FOGMODE, m);
+    }
+    if (S.fog_enable && uses(slot, NV2A_U_FOGPARAM))
+        uni2f(NV2A_U_FOGPARAM, S.fog_params[0], S.fog_params[1]);
+    if (S.fog_enable && uses(slot, NV2A_U_FOGPLANE))
+        G->uniform_f(NV2A_U_FOGPLANE, S.fog_plane, 1);
     /*
      * RECOMP_GL_DRAWID: paint each draw with its own index instead of its
      * colour, so the finished frame says which draw owns which pixel.
@@ -5014,8 +5042,10 @@ static void do_draw_body(void)
     /* The fixed-function lighting's state, for a lit batch. Uploaded every
      * draw: the title changes the light's colour between batches (its pause
      * map colours each element that way), and uniforms are per program. */
-    if (uses(slot, NV2A_U_LTSCENEAMB)) {
+    /* Model-view 0: the lighting's eye space, and the fog distance's. */
+    if (uses(slot, NV2A_U_FFMV))
         G->uniform_f(NV2A_U_FFMV, &S.ff_mv[0][0], 4);
+    if (uses(slot, NV2A_U_LTSCENEAMB)) {
         G->uniform_f(NV2A_U_FFIMV, &S.ff_imv[0][0], 4);
         G->uniform_f(NV2A_U_LTSCENEAMB, S.scene_ambient, 1);
         G->uniform_f(NV2A_U_LTMATEM, S.material_emission, 1);
@@ -8160,20 +8190,27 @@ static void do_draw_body(void)
                       S.specular_params[3], S.specular_params[4], S.specular_params[5]);
           }
       } }
-    /* RECOMP_GL_FOGLOG=1: the fog state each draw runs with, whenever it
-     * changes (first 400 changes) -- enable, mode, how the coordinate is
-     * made, colour, the three parameters, and which pipeline drew. */
-    { static int on = -1, n; static uint32_t last[8];
+    /* RECOMP_GL_FOGLOG=1: each distinct fog state draws run with, the first
+     * time one does (up to 256 of them) -- enable, mode, how the distance is
+     * made, colour, the three parameters, the plane, and which pipeline
+     * drew. Distinct states rather than changes: this title switches fog on
+     * and off between neighbouring batches, and a log of changes was used up
+     * on the first level frames. */
+    { static int on = -1, n; static uint32_t seen[256][12];
       if (on < 0) on = getenv("RECOMP_GL_FOGLOG") ? 1 : 0;
-      if (on && n < 400) {
-          uint32_t cur[8];
+      if (on && n < 256) {
+          uint32_t cur[12]; int k;
           cur[0] = S.fog_enable; cur[1] = S.fog_mode; cur[2] = S.fog_gen_mode; cur[3] = S.fog_color;
-          memcpy(&cur[4], S.fog_params, 12); cur[7] = 0;
-          if (memcmp(cur, last, sizeof cur)) {
-              memcpy(last, cur, sizeof cur); n++;
-              fprintf(stderr, "[FOG] draw %u flip %u: enable %u mode %04X gen %u colour %08X params %g %g %g | %s\n",
+          memcpy(&cur[4], S.fog_params, 12); memcpy(&cur[7], S.fog_plane, 16);
+          cur[11] = S.xf_mode == NV2A_XF_MODE_FIXED;
+          for (k = 0; k < n; k++) if (!memcmp(cur, seen[k], sizeof cur)) break;
+          if (k == n) {
+              memcpy(seen[n++], cur, sizeof cur);
+              fprintf(stderr, "[FOG] draw %u flip %u: enable %u mode %04X gen %u colour %08X params %g %g %g"
+                      " plane %g %g %g %g | %s\n",
                       S.draws, S.flips, S.fog_enable, S.fog_mode, S.fog_gen_mode, S.fog_color,
                       S.fog_params[0], S.fog_params[1], S.fog_params[2],
+                      S.fog_plane[0], S.fog_plane[1], S.fog_plane[2], S.fog_plane[3],
                       S.xf_mode == NV2A_XF_MODE_FIXED ? "fixed-function" : "program");
           }
       } }
@@ -9125,6 +9162,10 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
     }
     if (method >= M_SET_FOG_PARAMS && method < M_SET_FOG_PARAMS + 12) {
         memcpy(&S.fog_params[(method - M_SET_FOG_PARAMS) / 4], &param, 4);
+        return;
+    }
+    if (method >= M_SET_FOG_PLANE && method < M_SET_FOG_PLANE + 16) {
+        memcpy(&S.fog_plane[(method - M_SET_FOG_PLANE) / 4], &param, 4);
         return;
     }
     if (method >= M_SET_WINDOW_CLIP_HORZ && method < M_SET_WINDOW_CLIP_HORZ + 32) {

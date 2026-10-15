@@ -51,6 +51,9 @@ const Nv2aUniformDesc nv2a_uniform_desc[NV2A_U_COUNT] = {
     V("ltEye",      VEC4,  1),
     V("ltSpecPow",  FLOAT, 1),
     V("wideShift",  FLOAT, 1),
+    V("fogMode",    INT,   1),
+    V("fogParam",   VEC2,  1),
+    V("fogPlane",   VEC4,  1),
     /* fragment stage */
     F("drawTint",   VEC4,  1),
     F("fogColor",   VEC4,  1),
@@ -72,6 +75,9 @@ const Nv2aUniformDesc nv2a_uniform_desc[NV2A_U_COUNT] = {
 
 #undef V
 #undef F
+
+/* The Metal backend keeps a bit per uniform in a 64-bit mask. */
+typedef char nv2a_uniform_count_fits_a_mask[(NV2A_U_COUNT <= 64) ? 1 : -1];
 
 /* In a struct: c[] has a buffer of its own and samplers are arguments. */
 static int in_struct(int id)

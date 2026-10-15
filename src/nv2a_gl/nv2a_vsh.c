@@ -367,6 +367,9 @@ NV2A_GLSL_VERSION
 "uniform int  posMode;   // how to read what the program wrote to oPos\n"
 "uniform float wideShift; // widescreen: a framed 3D view moved toward the centre, pixels\n"
 "uniform int  fogEnable; // NV097_SET_FOG_ENABLE\n"
+"uniform int  fogMode;   // NV097_SET_FOG_MODE: 0 linear, 1 exp, 2 exp2, +4 the _ABS forms\n"
+"uniform vec2 fogParam;  // NV097_SET_FOG_PARAMS 0 and 1\n"
+"uniform vec4 fogPlane;  // NV097_SET_FOG_PLANE\n"
 "out vec4 oD0;\n"
 "out vec4 oD1;\n"
 "out vec4 oT0;\n"
@@ -377,21 +380,36 @@ NV2A_GLSL_VERSION
 "\n"
 "// The fog factor the combiner's FOG register carries in its alpha.\n"
 "//\n"
-"// A vertex program writes a fog COORDINATE here, not a factor: this title\n"
-"// writes eye distance, so the values arriving are in the hundreds and\n"
-"// thousands. Handing that to the combiner as an alpha was catastrophic --\n"
-"// a final combiner that mixes towards the fog colour with a weight of 1282\n"
-"// drives every channel far negative against this title's black fog colour\n"
-"// and clamps to black. That is why the city rendered perfectly and the\n"
-"// people in it came out as silhouettes: the batches that vanished are\n"
-"// exactly the ones whose programs write fog.\n"
+"// What arrives is a fog DISTANCE, not a factor: a vertex program writes one\n"
+"// to oFog (this title writes eye distance, in the hundreds and thousands),\n"
+"// and the fixed-function transform makes one as NV097_SET_FOG_GEN_MODE\n"
+"// says. The hardware turns it into a factor with the mode and the two\n"
+"// parameters the title set (xemu, hw/xbox/nv2a/pgraph/glsl/vsh.c); for\n"
+"// linear fog the parameters are 1 + end / (end - start) and\n"
+"// -1 / (end - start), so a distance of zero gives 1.0 and keeps the\n"
+"// fragment, and one past the end gives 0.0 and paints it in the fog colour.\n"
 "//\n"
-"// With fog switched off, which is how this title draws the tutorial, the\n"
-"// hardware's factor is 1.0 -- leave the fragment alone. With it on, clamp\n"
-"// the program's own value, which is what the console does for a coordinate\n"
-"// a program supplies itself.\n"
+"// It stays unclamped here: the fragment stage clamps it after\n"
+"// interpolation, as the hardware does, so a triangle reaching past the end\n"
+"// of the fog still shades evenly across. Fog switched off is a factor of\n"
+"// 1.0 -- the fragment as it is.\n"
+"float nv_fog_factor(float d, int en, int mode, vec2 p) {\n"
+"    if (en == 0) return 1.0;\n"
+"    float f;\n"
+"    int m = mode & 3;\n"
+"    if (m == 0) {          // linear: (end - d) / (end - start)\n"
+"        if (isinf(d)) d = 0.0;\n"
+"        f = p.x + d * p.y - 1.0;\n"
+"    } else if (m == 1) {   // exp: 1 / e^(d * density)\n"
+"        if (mode < 4 && isinf(d)) d = 0.0;\n"
+"        f = p.x + exp2(d * p.y * 16.0) - 1.5;\n"
+"    } else {               // exp2: 1 / e^((d * density)^2)\n"
+"        f = p.x + exp2(-d * d * p.y * p.y * 32.0) - 1.5;\n"
+"    }\n"
+"    return mode >= 4 ? abs(f) : f;\n"
+"}\n"
 "float nv_fog(float coord) {\n"
-"    return fogEnable != 0 ? clamp(coord, 0.0, 1.0) : 1.0;\n"
+"    return nv_fog_factor(coord, fogEnable, fogMode, fogParam);\n"
 "}\n"
 "\n"
 "// The NV2A's LIT, which differs from the GL fixed-function one in the\n"
@@ -561,19 +579,15 @@ static void emit_program_body(SB *sb, const Nv2aVshProgram *p)
         "    vec4 oPos = vec4(0.0, 0.0, 0.0, 1.0);\n"
         /* Fog defaults to NONE, not to full fog.
          *
-         * oFogC leaves here as oFog.x and becomes the alpha of the combiner's
-         * FOG register, where 1.0 means "keep the fragment" and 0.0 means
-         * "replace it with the fog colour". Starting oFog at zero therefore
-         * told every program that does not write fog -- which is every
-         * character program in this title -- to paint itself entirely in the
-         * fog colour. The world's programs do write it, so the city came out
-         * correct while the people in it came out as dark silhouettes, which
-         * is exactly the picture: vehicles and trees in full colour, the
-         * skaters nearly black and lost against the scenery.
-         *
-         * The console's default is no fog until a program asks for it, so
-         * that is what this is. A program that writes the register still
-         * overrides it on the very next line. */
+         * oFog.x is a fog distance, which nv_fog() turns into the alpha of
+         * the combiner's FOG register, where 1.0 means "keep the fragment"
+         * and 0.0 means "replace it with the fog colour". A program that does
+         * not write the register -- every character program in this title --
+         * must come out unfogged: a distance of zero or one does, in every
+         * fog mode the title uses (back when the register was handed to the
+         * combiner as a factor, a zero here painted the skaters entirely in
+         * the fog colour). A program that writes the register overrides this
+         * on the very next line. */
         "    vec4 oFog = vec4(1.0);\n"
         "    vec4 oPts = vec4(1.0);\n"
         "    vec4 oB0 = vec4(0.0);\n"
@@ -748,6 +762,10 @@ static int emit_ff(const Nv2aVshFixed *f, char *buf, int bufsize, int msl)
             "uniform vec4 ltSpotDir[8];  // NV097_SET_LIGHT_SPOT_DIRECTION\n"
             "uniform vec4 ltEye;         // NV097_SET_EYE_POSITION\n"
             "uniform float ltSpecPow;    // specular exponent\n");
+    if (!f->lit && (f->fog_gen == 1 || f->fog_gen == 2 || f->fog_gen == 3))
+        sb_add(&sb,
+            "\n// For the fog distance, which is measured in eye space.\n"
+            "uniform vec4 ffMV[4];       // NV097_SET_MODEL_VIEW_MATRIX 0, as sent\n");
     sb_add(&sb,
         "\nuniform vec4 ffMat[4];      // NV097_SET_COMPOSITE_MATRIX\n"
         "uniform vec4 ffVpOff;       // NV097_SET_VIEWPORT_OFFSET, as written\n"
@@ -908,6 +926,46 @@ static int emit_ff(const Nv2aVshFixed *f, char *buf, int bufsize, int msl)
             sb_add(&sb, "    %s = v%d;\n", o[i], v);
         }
     }
+    /*
+     * The fog distance, made the way NV097_SET_FOG_GEN_MODE says (xemu
+     * vsh-ff.c, after NV_fog_distance): the epilogue's nv_fog() turns it into
+     * the factor with the title's mode and parameters, as for a program.
+     *
+     * This used to leave oFog at zero, which nv_fog() then took as the
+     * factor itself: zero, every fixed-function vertex painted entirely in
+     * the fog colour whenever the title switched fog on. This title draws
+     * its scenery fixed-function and switches fog on for the night stages --
+     * linear, from 300 to 3000 units, in black -- so in the Skyscraper
+     * District and Pharaoh Park the whole city came out black around a
+     * character drawn as it should be, and the stages with a coloured fog
+     * came out as a flat wall of that colour.
+     */
+    if (f->fog_gen == 1 || f->fog_gen == 2 || f->fog_gen == 3)
+        sb_add(&sb,
+            "    vec4 fogEye = vec4(dot(v0, ffMV[0]), dot(v0, ffMV[1]),\n"
+            "                       dot(v0, ffMV[2]), dot(v0, ffMV[3]));\n");
+    switch (f->fog_gen) {
+    case 0:     /* SPEC_ALPHA: the alpha of the batch's specular colour */
+        sb_add(&sb, f->has_specular ? "    oFog.x = clamp(v4.a, 0.0, 1.0);\n"
+                                    : "    oFog.x = 0.0;\n");
+        break;
+    case 1:     /* RADIAL: distance from the eye */
+        sb_add(&sb, "    oFog.x = length(fogEye.xyz);\n");
+        break;
+    case 2:     /* PLANAR: distance from a plane in eye space */
+        sb_add(&sb, "    oFog.x = dot(fogPlane.xyz, fogEye.xyz) + fogPlane.w;\n");
+        break;
+    case 3:     /* ABS_PLANAR */
+        sb_add(&sb, "    oFog.x = abs(dot(fogPlane.xyz, fogEye.xyz) + fogPlane.w);\n");
+        break;
+    case 6:     /* FOG_X: the batch's own fog coordinate */
+        sb_add(&sb, (f->inputs_read & (1u << 5)) ? "    oFog.x = v5.x;\n"
+                                                 : "    oFog.x = 0.0;\n");
+        break;
+    default:
+        sb_add(&sb, "    oFog.x = 0.0;\n");
+        break;
+    }
     sb_add(&sb, "    oFogC = 1.0;\n");
     emit_viewport_epilogue(&sb, 1);
     if (msl) msl_vertex_tail(&sb);
@@ -1030,6 +1088,23 @@ static const char *MSL_PRELUDE =
 "    float d = src.x, s = src.y, p = clamp(src.w, -127.9961f, 127.9961f);\n"
 "    float spec = (d > 0.0f && s > 0.0f) ? exp2(p * log2(max(s, 1e-30f))) : 0.0f;\n"
 "    return float4(1.0f, max(d, 0.0f), spec, 1.0f);\n"
+"}\n"
+"\n"
+"// The fog factor from a fog distance: see the GLSL prelude.\n"
+"static inline float nv_fog_factor(float d, int en, int mode, float2 p) {\n"
+"    if (en == 0) return 1.0f;\n"
+"    float f;\n"
+"    int m = mode & 3;\n"
+"    if (m == 0) {\n"
+"        if (isinf(d)) d = 0.0f;\n"
+"        f = p.x + d * p.y - 1.0f;\n"
+"    } else if (m == 1) {\n"
+"        if (mode < 4 && isinf(d)) d = 0.0f;\n"
+"        f = p.x + exp2(d * p.y * 16.0f) - 1.5f;\n"
+"    } else {\n"
+"        f = p.x + exp2(-d * d * p.y * p.y * 32.0f) - 1.5f;\n"
+"    }\n"
+"    return mode >= 4 ? abs(f) : f;\n"
 "}\n";
 
 /* Everything before the body: the prelude, the structs, the function's
@@ -1072,9 +1147,9 @@ static void msl_vertex_head(SB *sb, uint16_t inputs_read)
         NV2A_MSL_BUF_ATTRS);
     if (nv2a_uniform_msl_defines(tmp, (int)sizeof tmp, 0, "U")) sb_add(sb, "%s", tmp);
     else sb->overflow = 1;
-    /* The GLSL prelude's nv_fog() reads the fogEnable uniform, which at file
-     * scope in Metal is not in sight; as a macro it is. */
-    sb_add(sb, "#define nv_fog(coord) (fogEnable != 0 ? clamp((coord), 0.0, 1.0) : 1.0)\n");
+    /* The GLSL prelude's nv_fog() reads the fog uniforms, which at file
+     * scope in Metal are not in sight; as a macro they are. */
+    sb_add(sb, "#define nv_fog(coord) nv_fog_factor((coord), fogEnable, fogMode, fogParam)\n");
     for (i = 0; i < NV2A_VSH_NUM_INPUTS; i++)
         if (inputs_read & (1u << i))
             sb_add(sb, "    float4 v%d = nv_attr(A, nv_vb, vid, %d);\n", i, i);

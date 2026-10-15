@@ -673,8 +673,9 @@ static uint64_t uniforms_used(const char *vsrc, const char *fsrc)
         if (d->type == NV2A_UT_SAMPLER) continue;
         if (word_in(d->frag ? fb : vb, d->name)) m |= 1ull << id;
     }
-    /* nv_fog() reads fogEnable through a macro the body only names. */
-    if (word_in(vb, "nv_fog")) m |= 1ull << NV2A_U_FOGENABLE;
+    /* nv_fog() reads the fog uniforms through a macro the body only names. */
+    if (word_in(vb, "nv_fog"))
+        m |= (1ull << NV2A_U_FOGENABLE) | (1ull << NV2A_U_FOGMODE) | (1ull << NV2A_U_FOGPARAM);
     return m;
 }
 

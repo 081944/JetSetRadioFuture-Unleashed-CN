@@ -420,7 +420,10 @@ static int psh_emit(const Nv2aPshState *ps, char *buf, int bufsize, int msl)
     sb(&s,
        "    vec4 r_v0 = oD0;\n"
        "    vec4 r_v1 = oD1;\n"
-       "    vec4 r_fog = vec4(fogColor.rgb, oFogC);\n");
+       /* The vertex stage hands over the fog factor unclamped, so that it
+        * interpolates across a triangle the way the hardware's does; it is
+        * clamped here, per fragment. */
+       "    vec4 r_fog = vec4(fogColor.rgb, clamp(oFogC, 0.0, 1.0));\n");
     /* R0 starts black with texture 0's alpha (xemu psh.c: r0 = 0, r0.a =
      * t0.a, or 1 when stage 0 is NONE). It used to start as the whole of
      * texture 0, which fed t0's colour to any combiner that read R0 before

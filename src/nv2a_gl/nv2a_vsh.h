@@ -206,6 +206,9 @@ typedef struct {
                              * 0 the material, 1 the vertex diffuse, 2 its specular */
     uint8_t  lflags;        /* 1 separate specular, 2 local eye,
                              * 4 specular enable, 8 normalization */
+    uint8_t  fog_gen;       /* NV097_SET_FOG_GEN_MODE: how the fog distance is
+                             * made -- 0 specular alpha, 1 radial, 2 planar,
+                             * 3 abs planar, 6 the fog coordinate (v5) */
     uint16_t light_mask;    /* NV097_SET_LIGHT_ENABLE_MASK, 2 bits a light:
                              * 0 off, 1 infinite, 2 local, 3 spot */
 } Nv2aVshFixed;
