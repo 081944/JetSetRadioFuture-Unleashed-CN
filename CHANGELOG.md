@@ -10,6 +10,38 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.4.6 — 15 October 2026
+
+- **Skyscraper District and Pharaoh Park: the city is back.** A player on a
+  Steam Deck saw his character there and nothing else: the whole city around
+  him was black. These areas switch the console's fog on (black, from 300 to
+  3000 units away), and the engine got fog wrong for the scenery, which the
+  game draws with the console's fixed-function transform: every one of its
+  vertices was given a fog factor of zero, which paints it entirely in the
+  fog colour. Black fog, black city.
+- **The areas with a coloured fog** had the same bug, in their own colour:
+  three of the later areas came out as a flat wall of pinkish brown or olive,
+  with the characters and a few objects standing in it.
+- Fog is now worked out the way the console does it. The fixed-function
+  transform measures each vertex's distance from the camera the way the game
+  asks it to, the game's own vertex programs supply theirs as before, and
+  both become a fog factor through the fog mode and the start and end
+  distances the game sets. Distant buildings fade into the night or the haze
+  as they should, instead of the scenery vanishing, and the scenery the game
+  draws with its own programs, which never faded at all, fades too.
+- The renderer is the same code on every platform (Metal on the Mac and
+  iPhone, OpenGL on Linux, Windows and Android), so every download has the
+  fix.
+- Tested in Pharaoh Park with the Mac build on OpenGL, the renderer of the
+  Linux and Windows builds, and on Metal, and in the iPhone Simulator, which
+  also went through one mission in each of 13 areas, from Shibuya Terminal
+  to Pharaoh Park: no crash, no shader that failed to compile, the three
+  areas with a coloured fog drawn as they should be, and the areas without
+  fog exactly as before. The Linux build was started on Mesa and the
+  Windows build under Wine, every shader compiling, and the Android build
+  ran in the Android emulator.
+- Every download is 0.4.6: Mac, iPhone, Linux, Windows and Android.
+
 ## 0.4.5 — 15 October 2026
 
 - **Chuo Street: no more crash at the third tank.** A player's log showed
