@@ -1141,13 +1141,52 @@ extern uint64_t g_recomp_abi_repairs;
 /**
  * RECOMP_ICALL_SAFE - Stack-safe indirect call.
  *
- * Restores g_esp to saved_esp (pre-argument value) on lookup failure,
- * preventing stdcall argument leaks on failed vtable calls.
- * Use this when the caller pushes arguments that the callee would
- * normally clean up (stdcall convention).
+ * On lookup failure the call is skipped, and esp has to end up where the
+ * callee would have left it. saved_esp is esp before the arguments were
+ * pushed: right for a callee that pops its own (stdcall, thiscall with
+ * arguments), wrong for a cdecl one, whose caller pops them with the `add
+ * esp, N` after the call -- restoring saved_esp there made that add pop N
+ * bytes that were no longer pushed, and every skipped call left the stack N
+ * bytes high. recomp_icall_skip_esp() reads the caller's next instruction
+ * to tell the two apart.
  */
 extern int g_icall_verbose;
 void recomp_icallv_record(uint32_t va, uint32_t esp0, uint32_t esp1, uint32_t eax, uint32_t ra);
+
+/* Where esp goes when RECOMP_ICALL_SAFE skips a call it cannot resolve.
+ *
+ * The call pushed its arguments and then the return address: g_esp points at
+ * the return address, saved_esp is esp before the arguments. A callee that
+ * pops its own (stdcall, thiscall with arguments) would have left esp at
+ * saved_esp. A cdecl one leaves them to the caller, which pops them with the
+ * instruction it returns to, `add esp, N` (83 C4 ib / 81 C4 id): there esp
+ * has to come back just past the return address, the arguments still pushed.
+ *
+ * Restoring saved_esp in both cases left every skipped cdecl call's stack
+ * high by the size of its arguments. In JSRF the tanks' sound callback in
+ * Chuo Street (0x000EDB00) was missing from the build and is called through
+ * a `push, push, call, add esp 8` wrapper: each call left 8 bytes, and when
+ * the third tank was tagged a tank routine came back 16 bytes off and the
+ * game went on to "run out of memory" and read 0xFFFFFFDA.
+ *
+ * Here rather than in the runtime so that any runtime builds with it; only
+ * the failure path calls it. */
+static __attribute__((noinline, unused)) uint32_t recomp_icall_skip_esp(uint32_t saved_esp)
+{
+    uint32_t ra, args, pops = 0;
+    if (saved_esp < g_esp + 4)
+        return saved_esp;
+    args = saved_esp - (g_esp + 4);
+    ra = MEM32(g_esp);
+    if (args == 0 || args > 0x400 || !g_xbox_code_hi ||
+        ra < g_xbox_code_lo || ra + 6 > g_xbox_code_hi)
+        return saved_esp;
+    if (MEM8(ra) == 0x83 && MEM8(ra + 1) == 0xC4 && MEM8(ra + 2) < 0x80)
+        pops = MEM8(ra + 2);
+    else if (MEM8(ra) == 0x81 && MEM8(ra + 1) == 0xC4)
+        pops = MEM32(ra + 2);
+    return pops >= args ? g_esp + 4 : saved_esp;
+}
 #define RECOMP_ICALL_SAFE(xbox_va, saved_esp) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
@@ -1155,19 +1194,19 @@ void recomp_icallv_record(uint32_t va, uint32_t esp0, uint32_t esp1, uint32_t ea
     g_icall_count++; \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
         recomp_icall_not_code_log(_va); \
-        g_esp = (saved_esp); eax = 0; break; \
+        g_esp = recomp_icall_skip_esp(saved_esp); eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
     if (g_icall_verbose) { uint32_t _e0 = g_esp, _ra = MEM32(g_esp); \
         if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); RECOMP_ABI_CALL(_va, _fn); } \
-        else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
+        else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); recomp_icall_fail_log(_va); g_esp = recomp_icall_skip_esp(saved_esp); eax = 0; } \
         recomp_icallv_record(_va, _e0, g_esp, eax, _ra); break; } \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
-           recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
+           recomp_icall_fail_log(_va); g_esp = recomp_icall_skip_esp(saved_esp); eax = 0; } \
 } while(0)
 
 /**

@@ -273,11 +273,32 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
  * During early bring-up you will see many of these. Most are harmless
  * (the ICALL macro pops the dummy return address and continues).
  * Focus on the ones that cause crashes or incorrect behavior.
+ *
+ * Said in full the first 4 times for an address, then once every 1000: a
+ * missing callback runs every frame, and 1590 copies of the same 18 lines
+ * made a player's log 1.4 MB without saying anything the first copy had not.
  */
 void recomp_icall_fail_log(uint32_t va)
 {
+    enum { SLOTS = 64 };
+    static uint32_t seen[SLOTS];
+    static uint64_t hits[SLOTS];
+    static int nseen;
+    uint64_t n = 0;
+    int k;
+    for (k = 0; k < nseen && seen[k] != va; k++)
+        ;
+    if (k == nseen && nseen < SLOTS) { seen[k] = va; hits[k] = 0; nseen++; }
+    if (k < nseen) n = ++hits[k];
+    if (n > 4 && n % 1000) return;
+
     fprintf(stderr, "[ICALL] Failed to resolve VA 0x%08X (total calls: %llu)\n",
             va, (unsigned long long)g_icall_count);
+    if (n > 4) {
+        fprintf(stderr, "  (%llu times for this address)\n", (unsigned long long)n);
+        fflush(stderr);
+        return;
+    }
 
     /* Dump last 16 call targets from the ring buffer */
     fprintf(stderr, "  Recent ICALL targets:\n");
