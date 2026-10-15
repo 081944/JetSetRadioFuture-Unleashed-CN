@@ -44,8 +44,8 @@ Every version is on the [Releases](https://github.com/JuMatt/JetSetRadioFuture-U
    once.
 3. It asks where your game is: pick the folder that contains `default.xbe`,
    or a disc image (`.iso`), which it unpacks once if
-   [extract-xiso](https://github.com/XboxDev/extract-xiso) is installed
-   (`brew install extract-xiso`). It remembers the choice.
+   [extract-xiso](https://github.com/XboxDev/extract-xiso) is installed. It
+   remembers the choice.
 
 Saves are kept in the game folder, in `UDATA` (where an Xbox keeps them), so
 copy that folder to back them up, and keep it if you replace the game files.
