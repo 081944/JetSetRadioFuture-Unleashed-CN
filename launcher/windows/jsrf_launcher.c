@@ -354,8 +354,23 @@ static int game_from_image(const wchar_t *iso, wchar_t *game, size_t n)
     join(game, n, g_base, name);
     if (is_game(game)) return 0;
     to_utf8(iso, u8, sizeof u8);
-    if (!xiso_probe(u8))
-        return fail(L"That file is not an Xbox disc image.");
+    {
+        /* What the file is, before minutes and gigabytes go into unpacking
+         * it: not an Xbox disc image (a zip...), another game's disc, another
+         * build of the game (port/xbe_check.c). */
+        char why[640];
+        wchar_t w[1024], text[2048];
+        int r = jsrf_xbe_check_iso(u8, why, sizeof why);
+        if (r != JSRF_XBE_OK) {
+            from_utf8(why, w, 1024);
+            _snwprintf(text, 2048, L"%hs.\n\n%ls%hs%hs", JSRF_XBE_HEADING, w,
+                       r == JSRF_XBE_OTHER ? "\n\n" : "",
+                       r == JSRF_XBE_OTHER ? JSRF_XBE_OTHER_ADVICE : "");
+            text[2047] = 0;
+            say(text, MB_ICONWARNING);
+            return 1;
+        }
+    }
     _snwprintf(msg, 1024, L"JSRF Unleashed will unpack your disc image once, into:\n\n%ls\n\n"
                           L"It takes a minute or two and needs about as much free space as "
                           L"the image. Go ahead?", game);
@@ -405,14 +420,14 @@ static void rotate_logs(const wchar_t *log, const wchar_t *dir)
     }
 }
 
-/* ---- is it the USA release? ---------------------------------------------------
+/* ---- is it the standalone US disc? -------------------------------------------
  *
- * The engine is the USA release's program translated address for address;
- * the European and Japanese releases are built differently, start, and crash
- * a few seconds in. port/xbe_check.c compares default.xbe's section table
- * with the USA build's. Returns 0 if these are the USA release's files (or
- * the file cannot be read: the engine checks again), else says what they are
- * and returns 1. */
+ * The engine is the standalone US disc's program translated address for
+ * address; the European and Japanese releases and the Sega GT 2002 combo
+ * discs are built differently, start, and crash a few seconds in.
+ * port/xbe_check.c compares default.xbe's section table with that build's.
+ * Returns 0 if these are its files (or the file cannot be read: the engine
+ * checks again), else says what they are and returns 1. */
 static int other_release(const wchar_t *game)
 {
     wchar_t p[MAX_PATH * 2], text[2048], w[1024];
@@ -428,8 +443,7 @@ static int other_release(const wchar_t *game)
     fclose(f);
     if (jsrf_xbe_check(head, got, why, sizeof why) != JSRF_XBE_OTHER) return 0;
     from_utf8(why, w, 1024);
-    _snwprintf(text, 2048, L"This isn't the USA release of Jet Set Radio Future.\n\n%ls\n\n%hs",
-               w, JSRF_XBE_OTHER_ADVICE);
+    _snwprintf(text, 2048, L"%hs.\n\n%ls\n\n%hs", JSRF_XBE_HEADING, w, JSRF_XBE_OTHER_ADVICE);
     text[2047] = 0;
     say(text, MB_ICONWARNING);
     return 1;
@@ -505,8 +519,9 @@ static int run(const wchar_t *game, int scale, int fullscreen)
         /* The engine's own check (if this launcher's could not read the file):
          * its log says what the files are. Ask for the folder next time. */
         cfg_set("game_dir", "");
-        _snwprintf(msg, 2048, L"This isn't the USA release of Jet Set Radio Future.\n\n%hs\n\n"
-                              L"The log says which release it is:\n%ls", JSRF_XBE_OTHER_ADVICE, log);
+        _snwprintf(msg, 2048, L"%hs.\n\n%hs\n\n"
+                              L"The log says what the files are:\n%ls", JSRF_XBE_HEADING,
+                              JSRF_XBE_OTHER_ADVICE, log);
         msg[2047] = 0;
         say(msg, MB_ICONWARNING);
     } else if (code != 0) {
@@ -593,10 +608,17 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE prev, PWSTR cmdline, int show)
     if (!game[0] && !pick_folder(game, MAX_PATH * 2))
         return 0;                                   /* the dialog was cancelled */
 
-    if (is_file(game) && is_image_name(game)) {
-        wchar_t iso[MAX_PATH * 2];
-        wcscpy(iso, game);
-        if (game_from_image(iso, game, MAX_PATH * 2)) return 1;
+    if (is_file(game)) {
+        /* default.xbe itself means its folder; any other file is taken for a
+         * disc image, and game_from_image says what it is if it is not one. */
+        wchar_t *slash = wcsrchr(game, L'\\');
+        if (slash && !_wcsicmp(slash + 1, L"default.xbe")) {
+            *slash = 0;
+        } else {
+            wchar_t iso[MAX_PATH * 2];
+            wcscpy(iso, game);
+            if (game_from_image(iso, game, MAX_PATH * 2)) return 1;
+        }
     } else if (is_dir(game) && !is_game(game)) {
         wchar_t iso[MAX_PATH * 2];
         if (find_image_in(game, iso, MAX_PATH * 2)) {
