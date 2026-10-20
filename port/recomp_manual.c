@@ -2890,6 +2890,98 @@ static void jsrf_where(uint32_t fl, uint32_t obj)
             jsrf_now(), fl, obj, b0[12], b0[13], b0[14]);
 }
 
+/* ---- where a skater is posed: JSRF_EVT_LOG=<seconds> ------------------------
+ *
+ * The character select's preview skaters were drawn into the floor and under
+ * the rails they grind. Every that many seconds, for each skeleton posed
+ * through sub_00047970 (the usual "pose this skeleton with this motion"):
+ * who called sub_00047970 (the return address above its saved ebx), the
+ * matrix the skeleton was posed under (the matrix stack's top: translation and
+ * up axis -- up exactly vertical means a world-space pass), and the posed
+ * bones: bone 0, bone 1, the lowest and the highest bone, in that space. Plus,
+ * from sub_00080BD0, each character's own position (+0xCA4). Enough to tell a
+ * skater posed low (bones under the matrix origin) from one placed low. */
+static double evt_period = -1;
+static int evt_on(void)
+{
+    if (evt_period < 0) {
+        const char *e = getenv("JSRF_EVT_LOG");
+        evt_period = e ? atof(e) : 0;
+    }
+    return evt_period > 0;
+}
+static void jsrf_evt_pose(uint32_t caller, uint32_t obj, uint32_t motion)
+{
+    static struct { uint32_t obj, caller; double next; } seen[256];
+    const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+    const uint32_t lim = 64u << 20;
+    uint32_t nb, mats, top, i, lo = 0, hi = 0;
+    const float *mt, *b;
+    float ylo = 1e30f, yhi = -1e30f;
+    int k, slot = -1;
+    double now = jsrf_now();
+    if (obj < 0x10000u || obj + 0x24u > lim) return;
+    top = *(const uint32_t *)(m + 0x264C04u);
+    top = (top >= 0x10000u && top + 4 <= lim) ? *(const uint32_t *)(m + top) : 0;
+    mt = (top >= 0x10000u && top + 64 <= lim) ? (const float *)(m + top) : NULL;
+    /* One line per object and pass kind (world: up exactly vertical). */
+    {
+        uint32_t kind = (mt && fabsf(mt[5] - 1.0f) < 1e-3f && fabsf(mt[4]) < 1e-3f && fabsf(mt[6]) < 1e-3f) ? 1u : 0u;
+        uint32_t key = caller ^ kind;
+        for (k = 0; k < 256; k++) {
+            if (seen[k].obj == obj && seen[k].caller == key) { slot = k; break; }
+            if (!seen[k].obj) { seen[k].obj = obj; seen[k].caller = key; slot = k; break; }
+        }
+        if (slot < 0) {                    /* full: a new scene's objects -- start over */
+            memset(seen, 0, sizeof seen);
+            seen[0].obj = obj; seen[0].caller = key; slot = 0;
+        }
+        if (now < seen[slot].next) return;
+        seen[slot].next = now + evt_period;
+        nb = *(const uint32_t *)(m + obj + 0x1c);
+        mats = *(const uint32_t *)(m + obj + 0x20);
+        fprintf(stderr, "[EVT] t=%.2f flip %u obj %08X from %08X %s", now, nv2a_gl_flips(), obj, caller,
+                kind ? "world" : "other");
+        if (mt) fprintf(stderr, " | matrix at (%.2f %.2f %.2f) up (%.3f %.3f %.3f)",
+                        mt[12], mt[13], mt[14], mt[4], mt[5], mt[6]);
+        if (motion >= 0x10000u && motion + 0x10u <= lim)
+            fprintf(stderr, " | motion %08X root flags %08X", *(const uint32_t *)(m + motion),
+                    *(const uint32_t *)(m + motion + 8));
+        if (nb == 20 && mats >= 0x10000u && mats + 64u * 20u <= lim) {
+            for (i = 0; i < 20; i++) {
+                b = (const float *)(m + mats + 64u * i);
+                if (b[13] < ylo) { ylo = b[13]; lo = i; }
+                if (b[13] > yhi) { yhi = b[13]; hi = i; }
+            }
+            b = (const float *)(m + mats);
+            fprintf(stderr, " | bone0 (%.2f %.2f %.2f) bone1 (%.2f %.2f %.2f) lowest %u y %.2f highest %u y %.2f",
+                    b[12], b[13], b[14], b[16 + 12], b[16 + 13], b[16 + 14], lo, ylo, hi, yhi);
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
+}
+static void jsrf_evt_char(uint32_t self)
+{
+    static struct { uint32_t obj; double next; } seen[64];
+    const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+    const float *p;
+    int k, slot = -1;
+    double now = jsrf_now();
+    if (self < 0x10000u || self + 0xCB0u > (64u << 20)) return;
+    for (k = 0; k < 64; k++) {
+        if (seen[k].obj == self) { slot = k; break; }
+        if (!seen[k].obj) { seen[k].obj = self; slot = k; break; }
+    }
+    if (slot < 0) { memset(seen, 0, sizeof seen); seen[0].obj = self; slot = 0; }
+    if (now < seen[slot].next) return;
+    seen[slot].next = now + evt_period;
+    p = (const float *)(m + self + 0xCA4u);
+    fprintf(stderr, "[EVTCHAR] t=%.2f flip %u char %08X at (%.2f %.2f %.2f)\n", now, nv2a_gl_flips(),
+            self, p[0], p[1], p[2]);
+    fflush(stderr);
+}
+
 /* ---- the poser: census + snapshot ---------------------------------------- */
 extern void sub_0005F0F0_gen(void);
 void sub_0005F0F0(void)
@@ -2904,6 +2996,14 @@ void sub_0005F0F0(void)
         if (c && *c == '@') census_sec = atof(c + 1);
         else census_flip = c ? (uint32_t)strtoul(c, 0, 0) : 0;
         init = 1;
+    }
+    /* Called through sub_00047970: its caller's return address sits above
+     * sub_00047970's saved ebx, at GARG(7). */
+    if (evt_on() && GARG(0) == 0x0004798Du) {
+        uint32_t caller = GARG(7), o = GARG(1), mo = GARG(3);
+        sub_0005F0F0_gen();
+        jsrf_evt_pose(caller, o, mo);
+        return;
     }
     snap = jsrf_snap_begin(0x0005F0F0u);
     if (!census_flip && census_sec < 0) {
@@ -3409,6 +3509,7 @@ void sub_00080BD0(void)
     const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
     uint32_t self = g_ecx;
     sub_00080BD0_gen();
+    if (evt_on()) jsrf_evt_char(self);
     if (ev_log_on() && self >= 0x10000u && self < (64u << 20)) {
         uint32_t f308 = *(const uint32_t *)(m + self + 0x308u);
         uint32_t f2f8 = *(const uint32_t *)(m + self + 0x2F8u);
