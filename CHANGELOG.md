@@ -10,6 +10,39 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.4.8 — 20 October 2026
+
+- **The robot at the future site of the Rokkaku Expo Stadium starts.** A
+  player on Android 0.4.7 could not finish the Urban Battle there ("Destroy
+  the Rokkaku piece of junk!"): the robot hung where it had been made, out
+  of reach, and never moved, attacked or could be tagged. Every earlier
+  version had the same soft lock. The robot's first step, the one that puts
+  it in the stadium and starts it, was one of four functions of the game
+  that the translation had never found. Each of the four sits right after
+  another function, and the recompiler took it for the end of that one, so
+  no earlier scan saw it as missing. The game called it every frame and
+  every call was skipped. It is in now: the robot fights at ground level,
+  moves around the stadium and attacks, and its arms can be grinded and the
+  marks on it sprayed.
+- **The Rokkaku robots make their sounds.** Their sound function was another
+  of the four. The Terror Drone at Hikage Street calls it four times a frame
+  for its thrusters; every call was skipped, so the robots were silent.
+- The other two are handlers in two of the game's per-object tables, each
+  placed right after a jump table that the recompiler read as code. Nothing
+  has been seen calling them yet.
+- Found by listing every address that the game's tables or its code's
+  constants hold, that follows the end of a function, and that no
+  translated function starts at — inside other functions this time.
+- Tested on the Mac with the game code of 0.4.7 and of 0.4.8. With 0.4.7's,
+  the robot at the future site never leaves its first state and the game
+  calls the missing function every frame; with 0.4.8's it goes through its
+  whole routine, and a test player put on its arms grinded them and sprayed
+  one of its marks off. The Terror Drone at Hikage Street, which worked
+  before, was sprayed the same way with both and moved on after each mark.
+  The Linux build was started on Mesa, the Windows build under Wine and the
+  Android build in the Android emulator.
+- Every download is 0.4.8: Mac, iPhone, Linux, Windows and Android.
+
 ## 0.4.7 — 15 October 2026 — Android only
 
 An Android-only fix. The Mac, iPhone, Linux and Windows downloads are
