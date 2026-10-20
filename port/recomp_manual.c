@@ -176,6 +176,30 @@ static recomp_func_t seeded_lookup(uint32_t va)
     return (recomp_func_t)0;
 }
 
+/* JSRF_NO_SEEDED=<va>[,<va>...] (test only): leave those seeded functions
+ * out, as a build from before they were lifted would -- to reproduce what a
+ * player on an older version saw. */
+static int seeded_left_out(uint32_t va)
+{
+    static int n = -1;
+    static uint32_t out[16];
+    if (n < 0) {
+        const char *s = getenv("JSRF_NO_SEEDED");
+        char *e;
+        n = 0;
+        while (s && *s && n < 16) {
+            uint32_t v = (uint32_t)strtoul(s, &e, 0);
+            if (e == s) break;
+            out[n++] = v;
+            s = *e == ',' ? e + 1 : e;
+        }
+        if (n) fprintf(stderr, "[MANUAL] JSRF_NO_SEEDED: %d seeded function(s) left out\n", n);
+    }
+    for (int i = 0; i < n; i++)
+        if (out[i] == va) return 1;
+    return 0;
+}
+
 /* ── A DirectSound spin, made cooperative ──────────────────────
  *
  * 0x001A308E, in the XDK's DirectSound library:
@@ -248,6 +272,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
         if (manual_on) {
             recomp_func_t f;
             if (xbox_va == 0x001A308Eu) return manual_sub_001A308E;
+            if (seeded_left_out(xbox_va)) return (recomp_func_t)0;
             f = seeded_lookup(xbox_va);
             if (f) return f;
         }
@@ -817,7 +842,8 @@ static void jsrf_hook_switch(void)
 {
     extern void recomp_trace_enable_hooks(void);
     if (getenv("JSRF_WATCH_SNDMGR") || getenv("JSRF_DEEP_ESP")
-     || getenv("JSRF_BONE_CHECK") || getenv("JSRF_CRI_CALLS"))
+     || getenv("JSRF_BONE_CHECK") || getenv("JSRF_CRI_CALLS")
+     || getenv("JSRF_ROBO_LOG"))
         recomp_trace_enable_hooks();
 }
 
@@ -849,9 +875,161 @@ static void cri_census(uint32_t va)
     }
 }
 
+/* JSRF_ROBO_LOG=<seconds> (test only): the Rokkaku robots built on
+ * Media/Enemy/Robo. Enemy type 27 (made by sub_000ECF50; per-frame update
+ * sub_000ECDB0, state at +0x128) is the Terror Drone of the Urban Battle at
+ * the future site of the Expo Stadium; type 12 (made by sub_000EAC20; its
+ * brain's update is sub_000EA6A0, state at +8) is the other robot. One line
+ * per robot whenever its state changes, every that many seconds otherwise,
+ * and every few frames while it attacks (states 2 and 3); with the player's
+ * position, the robot's grind rails (its component at +0xBC keeps their
+ * handles in the rail table at 0x0022FCE8, see sub_000179B0; each rail's
+ * bounds at +0x10/+0x1C, its points at +4, how many at +0x28) and its four
+ * graffiti spots (+0x174, 16 bytes each). One line too for each enemy a
+ * mission creates (sub_000C0B30), with its type.
+ * JSRF_ROBO_RIDE=<seconds>[:<rail>[:<point>]][,...] (with the log): at each
+ * of those times (up to 8), put the player 40 units above a point of that
+ * rail of the drone (rail 0 by default; the point by its index, or -1 for
+ * the lowest, the default, -2 for the highest) -- to see whether landing on
+ * it starts a grind -- and log the player's position every 0.2 s for 5 s
+ * after. */
+static float s_player_pos[3];
+static uint32_t s_player_va;
+static uint32_t robo_rail(const uint8_t *m, uint32_t h)
+{
+    uint32_t p;
+    int guard;
+    if (h == 0xFFFFFFFFu) return 0;
+    p = *(const uint32_t *)(m + 0x0022FCE8u + 0x890u + (h & 0xFFu) * 4u);
+    for (guard = 0; p >= 0x10000u && p < (64u << 20) && guard < 256; guard++) {
+        if (*(const uint32_t *)(m + p + 0x38) == h) return p;
+        p = *(const uint32_t *)(m + p + 0x94);
+    }
+    return 0;
+}
+static void jsrf_robo_log(uint32_t va)
+{
+    static double period = -1, ride_t[8], ride_until = -1, ride_next;
+    static int ride_rail[8], ride_pt[8], ride_n, ride_cur;
+    static struct { uint32_t obj, state, calls; double next; } r[16];
+    const uint8_t *m;
+    const uint32_t *w;
+    const float *f;
+    const uint32_t *cw;
+    const float *cf;
+    uint32_t obj, st, comp;
+    int i, k, fine, t27, nrails;
+    double now;
+    if (va != 0x000ECDB0u && va != 0x000EA6A0u && va != 0x000C0B30u) return;
+    if (period < 0) {
+        const char *e = getenv("JSRF_ROBO_LOG");
+        period = e ? atof(e) : 0;
+        e = getenv("JSRF_ROBO_RIDE");
+        while (e && *e && ride_n < 8) {
+            char *x;
+            ride_t[ride_n] = strtod(e, &x);
+            if (x == e) break;
+            ride_rail[ride_n] = *x == ':' ? (int)strtol(x + 1, &x, 10) : 0;
+            ride_pt[ride_n] = *x == ':' ? (int)strtol(x + 1, &x, 10) : -1;
+            ride_n++;
+            e = *x == ',' ? x + 1 : x;
+        }
+    }
+    if (period <= 0) return;
+    m = (const uint8_t *)g_xbox_mem_offset;
+    now = pad_now();
+    if (va == 0x000C0B30u) {
+        uint32_t desc = GARG(2);
+        fprintf(stderr, "[ROBO] t=%.1f enemy created: type %d (args %08X %08X)\n", now,
+                desc >= 0x10000u && desc < (64u << 20) ? (int)*(const uint32_t *)(m + desc) : -1,
+                GARG(1), desc);
+        fflush(stderr);
+        return;
+    }
+    obj = g_ecx;
+    if (obj < 0x10000u || obj >= (64u << 20)) return;
+    w = (const uint32_t *)(m + obj);
+    f = (const float *)(m + obj);
+    st = va == 0x000ECDB0u ? w[0x128 / 4] : w[0x8 / 4];
+    for (i = 0; i < 16 && r[i].obj && r[i].obj != obj; i++)
+        ;
+    if (i == 16) return;
+    if (!r[i].obj) { r[i].obj = obj; r[i].state = 0xFFFFFFFFu; r[i].next = 0; r[i].calls = 0; }
+    r[i].calls++;
+    t27 = va == 0x000ECDB0u;
+    comp = obj + (t27 ? 0xBCu : 0x30u);       /* the rails-and-spots component, sub_000EB830 */
+    nrails = t27 ? 2 : 5;
+    cw = (const uint32_t *)(m + comp);
+    cf = (const float *)(m + comp);
+    if (ride_cur < ride_n && now >= ride_t[ride_cur] && s_player_va) {
+        int rr = ride_rail[ride_cur], rp = ride_pt[ride_cur];
+        uint32_t rl = rr >= 0 && rr < nrails ? robo_rail(m, cw[1 + rr]) : 0;
+        ride_cur++;
+        if (rl) {
+            uint32_t pts = *(const uint32_t *)(m + rl + 4), n = *(const uint32_t *)(m + rl + 0x28), lo = 0;
+            if (pts >= 0x10000u && pts < (64u << 20) && n && n < 64) {
+                const float *P = (const float *)(m + pts);
+                float *pl = (float *)((uint8_t *)g_xbox_mem_offset + s_player_va + 0xCA4);
+                if (rp >= 0) lo = (uint32_t)(rp < (int)n ? rp : (int)n - 1);
+                else
+                    for (k = 1; k < (int)n; k++)
+                        if (rp == -2 ? P[k * 6 + 1] > P[lo * 6 + 1] : P[k * 6 + 1] < P[lo * 6 + 1]) lo = (uint32_t)k;
+                fprintf(stderr, "[ROBO] t=%.1f ride: player (%.1f %.1f %.1f) -> 40 above point %u of rail %d"
+                        " (%.1f %.1f %.1f) of the type-%d robot\n", now, pl[0], pl[1], pl[2], lo, rr,
+                        P[lo * 6], P[lo * 6 + 1], P[lo * 6 + 2], t27 ? 27 : 12);
+                pl[0] = P[lo * 6]; pl[1] = P[lo * 6 + 1] + 40.0f; pl[2] = P[lo * 6 + 2];
+                ride_until = now + 5.0; ride_next = now;
+            }
+        } else
+            fprintf(stderr, "[ROBO] t=%.1f ride: the robot has no rail %d\n", now, rr);
+    }
+    if (now < ride_until && now >= ride_next) {
+        fprintf(stderr, "[ROBO] t=%.2f riding? player at (%.1f %.1f %.1f)\n", now,
+                s_player_pos[0], s_player_pos[1], s_player_pos[2]);
+        ride_next = now + 0.2;
+    }
+    fine = t27 && (st == 2 || st == 3) && r[i].calls % 6 == 0;
+    if (st == r[i].state && now < r[i].next && !fine) return;
+    if (t27)
+        fprintf(stderr, "[ROBO] t=%.2f type27 %08X state %u%s count %u idx %u shot %u flags %08X"
+                " motion %08X@%.2f %08X@%.2f at (%.1f %.1f %.1f) ground %.1f dist %.1f player (%.1f %.1f %.1f)\n",
+                now, obj, st, st != r[i].state ? " (new)" : "", w[0x12C / 4], w[0x134 / 4],
+                w[0x138 / 4], w[0x90 / 4], w[0x148 / 4], f[0x154 / 4], w[0x14C / 4], f[0x158 / 4],
+                f[0x48 / 4], f[0x4C / 4], f[0x50 / 4], f[0x88 / 4], f[0x74 / 4],
+                s_player_pos[0], s_player_pos[1], s_player_pos[2]);
+    else {
+        uint32_t ent = w[4 / 4];
+        const float *ef = ent >= 0x10000u && ent < (64u << 20) ? (const float *)(m + ent + 0x44) : 0;
+        fprintf(stderr, "[ROBO] t=%.1f type12 %08X state %u%s +10 %08X +144 %08X at (%.1f %.1f %.1f) ground %.1f"
+                " entity %08X at (%.1f %.1f %.1f) flags %08X player (%.1f %.1f %.1f)\n", now, obj, st,
+                st != r[i].state ? " (new)" : "", w[0x10 / 4], w[0x144 / 4], f[0x14 / 4], f[0x18 / 4],
+                f[0x1C / 4], f[0x2C / 4], ent, ef ? ef[0] : 0.0f, ef ? ef[1] : 0.0f, ef ? ef[2] : 0.0f,
+                ef ? *(const uint32_t *)(m + ent + 0xA4) : 0u, s_player_pos[0], s_player_pos[1], s_player_pos[2]);
+    }
+    if (now >= r[i].next) {
+        for (k = 0; k < nrails; k++) {
+            uint32_t h = cw[1 + k], rl = robo_rail(m, h);
+            if (!rl) { fprintf(stderr, "[ROBO]   rail %d: handle %08X, none\n", k, h); continue; }
+            {
+                const float *R = (const float *)(m + rl);
+                fprintf(stderr, "[ROBO]   rail %d: handle %08X, %u points, (%.1f %.1f %.1f) .. (%.1f %.1f %.1f)\n",
+                        k, h, *(const uint32_t *)(m + rl + 0x28), R[0x10 / 4], R[0x14 / 4], R[0x18 / 4],
+                        R[0x1C / 4], R[0x20 / 4], R[0x24 / 4]);
+            }
+        }
+        fprintf(stderr, "[ROBO]   graffiti: handles %08X %08X %08X %08X progress %.2f %.2f %.2f %.2f\n",
+                cw[0x3C / 4], cw[0x40 / 4], cw[0x44 / 4], cw[0x48 / 4], cf[0x4C / 4], cf[0x50 / 4],
+                cf[0x54 / 4], cf[0x58 / 4]);
+    }
+    fflush(stderr);
+    if (st != r[i].state || now >= r[i].next) r[i].next = now + period;
+    r[i].state = st;
+}
+
 void recomp_trace_user_hook(const char *name, uint32_t va)
 {
     cri_census(va);
+    jsrf_robo_log(va);
     static int init = -1; static uint32_t mgr; static const char *last_name; static uint32_t last_va;
     if (init < 0) { const char *e = getenv("JSRF_WATCH_SNDMGR"); mgr = e ? (uint32_t)strtoul(e, 0, 0) : 0; init = 1; }
     if (mgr) {
@@ -3425,8 +3603,6 @@ void sub_0006C680(void)
  * switch on +0x60). JSRF_SPOT_LOG=1: each spot the first time it updates --
  * its id (+0x58), state, the player's position then, and the floats of its
  * first 0xC0 bytes, to find where spots are -- and every change of state. */
-static float s_player_pos[3];
-static uint32_t s_player_va;
 /* A spot's descriptor: the graffiti manager at 0x2314B0 keeps them in a hash
  * table at +8 (bucket id & 0xFF, chained through +0x104, matched on +0x9C).
  * Its +0xA4 holds 3 bits per part (+0x98 parts): the design sprayed there, 7
