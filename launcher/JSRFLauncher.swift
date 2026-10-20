@@ -235,7 +235,11 @@ final class Launcher: NSObject, NSApplicationDelegate {
         panel.canChooseDirectories = true
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = false
-        panel.allowedFileTypes = ["iso", "xiso"]
+        // Not allowedFileTypes: with a file-type filter set, macOS lets the
+        // panel choose only such files -- "Use This" on a folder opens it, and
+        // inside it the button stays grey, so no folder can be picked at all.
+        // The delegate below greys out everything but folders and disc images.
+        panel.delegate = self
         panel.treatsFilePackagesAsDirectories = true
 
         guard panel.runModal() == .OK, let picked = panel.url else {
@@ -406,6 +410,18 @@ final class Launcher: NSObject, NSApplicationDelegate {
         }
     }
 
+}
+
+extension Launcher: NSOpenSavePanelDelegate {
+    /// What the game picker lets through: any folder (the extracted files,
+    /// or the folder holding them) and .iso/.xiso images; other files grey.
+    func panel(_ sender: Any, shouldEnable url: URL) -> Bool {
+        if (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+            return true
+        }
+        let ext = url.pathExtension.lowercased()
+        return ext == "iso" || ext == "xiso"
+    }
 }
 
 let app = NSApplication.shared
