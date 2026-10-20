@@ -137,6 +137,27 @@ enum Game {
             .appendingPathComponent("Contents/MacOS/jsrf_recomp")
     }
 
+    /// Whether the folder holds the release the engine is made from: the
+    /// engine's own check (`--check-game`, port/xbe_check.c), so there is one
+    /// copy of it. nil means yes, or that it could not be asked -- then the
+    /// engine checks again at startup and stops with the same explanation in
+    /// its log. A string is what to tell the player.
+    static func otherRelease(_ folder: URL) -> String? {
+        let p = Process()
+        p.executableURL = binary
+        p.arguments = ["--check-game", folder.path]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 3 else { return nil }
+        let text = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return text.isEmpty ? "These files are not the USA release of the game." : text
+    }
+
     /// The flags the port needs. Kept here rather than in a shell script so
     /// there is one place they are true, and overridable from `defaults` for
     /// anyone who wants to experiment without a rebuild:
@@ -326,6 +347,22 @@ final class Launcher: NSObject, NSApplicationDelegate {
     /// intact. This is the usual shape of a wrapper that has a question to ask
     /// before the real program starts.
     private func start(_ folder: URL) {
+        // Another release of the game (European, Japanese) loads and then
+        // crashes a few seconds in: the code is the USA release's. Say so
+        // and offer the picker again rather than start it.
+        if let why = Game.otherRelease(folder) {
+            NSApp.activate(ignoringOtherApps: true)
+            let a = NSAlert()
+            a.alertStyle = .warning
+            a.messageText = "This isn't the USA release of Jet Set Radio Future"
+            a.informativeText = why
+            a.addButton(withTitle: "Choose Other Files…")
+            a.addButton(withTitle: "Quit")
+            GameFolder.forget()
+            if a.runModal() == .alertFirstButtonReturn { ask(reason: nil) } else { NSApp.terminate(nil) }
+            return
+        }
+
         // Write the log where the game lives.
         //
         // logRoot prefers the folder beside the .app, which is right in

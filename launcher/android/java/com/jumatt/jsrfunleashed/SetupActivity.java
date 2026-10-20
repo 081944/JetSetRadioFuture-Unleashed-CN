@@ -32,6 +32,7 @@ public class SetupActivity extends Activity {
 
     static native String nativeVersion();
     static native boolean nativeProbe(String path);
+    static native String nativeCheckGame(String dir);
     native String nativeUnpack(String iso, String dest);
 
     private static final int PICK_ISO = 1;
@@ -67,6 +68,15 @@ public class SetupActivity extends Activity {
     }
 
     private void startGame() {
+        // Another release of the game (European, Japanese) starts and then
+        // crashes a few seconds in: the engine is the USA release's code.
+        String other = nativeCheckGame(gameDir().getAbsolutePath());
+        if (other != null) {
+            if (mStatus == null) showSetup();
+            status("This isn't the USA release of Jet Set Radio Future.\n\n" + other
+                   + "\n\nReplace the files in " + gameDir().getAbsolutePath() + " with the USA release's.");
+            return;
+        }
         startActivity(new Intent(this, JsrfActivity.class));
         finish();
     }

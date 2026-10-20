@@ -113,6 +113,15 @@ else
 fi
 GAME="$(cd "$GAME" 2>/dev/null && pwd)" || fail "That folder does not exist."
 is_game "$GAME" || fail "That folder has no default.xbe and Media in it. Pick the folder you extracted the game into."
+
+# The engine is the USA release's program, translated address for address:
+# the European and Japanese releases start and then crash a few seconds in.
+# Its own check (port/xbe_check.c) says what the files are; exit 3 = another release.
+why="$(LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$HERE/bin/jsrf_recomp" --check-game "$GAME" 2>/dev/null)"
+if [ $? -eq 3 ]; then
+    cfg_set game_dir ""
+    fail "$(printf "This isn't the USA release of Jet Set Radio Future.\n\n%s\n" "$why" | fold -s -w 72)"
+fi
 cfg_set game_dir "$GAME"
 
 SCALE="$(cfg_get scale)"; case "$SCALE" in [1-4]) ;; *) SCALE=2 ;; esac
@@ -135,7 +144,12 @@ export LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 cd "$GAME" || exit 1
 "$HERE/bin/jsrf_recomp" "$GAME" > "$LOG" 2>&1
 status=$?
-if [ "$status" -ne 0 ]; then
+if [ "$status" -eq 3 ]; then
+    # The engine's own check stopped it: not the USA release (the log says which).
+    cfg_set game_dir ""
+    say "$(printf "This isn't the USA release of Jet Set Radio Future.\n\n%s\n" \
+              "$(sed -n 's/^\[XBE\] //p' "$LOG")" | fold -s -w 72)"
+elif [ "$status" -ne 0 ]; then
     say "JSRF Unleashed stopped unexpectedly (exit $status).
 
 The log is at:

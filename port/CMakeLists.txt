@@ -94,6 +94,7 @@ if(ANDROID)
     add_library(jsrf_recomp SHARED
         main.c
         recomp_manual.c
+        xbe_check.c
         android/jsrf_android.c
         ios/xiso.c
         ${JSRF_GEN_SOURCES}
@@ -103,6 +104,7 @@ else()
     add_executable(jsrf_recomp
         main.c
         recomp_manual.c
+        xbe_check.c
         ${JSRF_GEN_SOURCES}
     )
 endif()

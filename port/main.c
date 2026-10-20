@@ -62,6 +62,7 @@
 #endif /* !_WIN32 */
 #include "win32_compat.h"
 #include "recomp_icall_feedback.h"
+#include "xbe_check.h"
 #include "apu.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -710,6 +711,30 @@ static int host_main(void)
     }
     printf("XBE loaded: %zu bytes\n", xbe_size);
 
+    /* Only the USA release's program fits the translated code (xbe_check.c).
+     * Another release's would run until the first pointer into the wrong
+     * bytes; stop here and say what the files are instead. Exit code 3 tells
+     * the launchers that the files, not the engine, are the problem.
+     * JSRF_ANY_XBE=1 runs it anyway. */
+    {
+        char why[512];
+        const char *any = getenv("JSRF_ANY_XBE");
+        if (jsrf_xbe_check((const unsigned char *)xbe_data, xbe_size, why, sizeof why) != JSRF_XBE_OK) {
+            if (any && atoi(any)) {
+                fprintf(stderr, "[XBE] %s\n  (%s)\n[XBE] JSRF_ANY_XBE is set: running it anyway.\n",
+                        why, jsrf_xbe_detail());
+            } else {
+                fprintf(stderr, "[XBE] %s\n[XBE] %s\n", why, JSRF_XBE_OTHER_ADVICE);
+                fprintf(stderr, "  (%s)\n", jsrf_xbe_detail());
+                printf("Not the USA release's default.xbe -- stopping (exit 3).\n");
+                free(xbe_data);
+                return 3;
+            }
+        } else {
+            printf("[XBE] the USA release's program (section layout as built from)\n");
+        }
+    }
+
     /* Step 2: Initialize Xbox memory layout */
     printf("Initializing Xbox memory layout...\n");
     if (getenv("JSRF_RAM_MB")) {
@@ -1015,6 +1040,17 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "--version")) {
         printf("%s\n", JSRF_VERSION);
         return 0;
+    }
+    /* --check-game <folder>: is it the release this engine runs? Prints why
+     * not and exits 0 (yes), 2 (no default.xbe) or 3 (another release, or
+     * not the game) -- for the launchers, before they start anything. */
+    if (argc > 2 && !strcmp(argv[1], "--check-game")) {
+        char why[512];
+        int r = jsrf_xbe_check_folder(argv[2], why, sizeof why);
+        if (r == JSRF_XBE_OK) printf("ok\n");
+        else if (r == JSRF_XBE_OTHER) printf("%s\n\n%s\n", why, JSRF_XBE_OTHER_ADVICE);
+        else printf("%s\n", why);
+        return r;
     }
     g_argv = argv;
 #if defined(__APPLE__) && TARGET_OS_IPHONE

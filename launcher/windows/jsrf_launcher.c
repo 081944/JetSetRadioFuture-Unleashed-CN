@@ -38,6 +38,7 @@
 #include <string.h>
 
 #include "xiso.h"
+#include "xbe_check.h"
 
 #define APP L"JSRF Unleashed"
 
@@ -404,6 +405,36 @@ static void rotate_logs(const wchar_t *log, const wchar_t *dir)
     }
 }
 
+/* ---- is it the USA release? ---------------------------------------------------
+ *
+ * The engine is the USA release's program translated address for address;
+ * the European and Japanese releases are built differently, start, and crash
+ * a few seconds in. port/xbe_check.c compares default.xbe's section table
+ * with the USA build's. Returns 0 if these are the USA release's files (or
+ * the file cannot be read: the engine checks again), else says what they are
+ * and returns 1. */
+static int other_release(const wchar_t *game)
+{
+    wchar_t p[MAX_PATH * 2], text[2048], w[1024];
+    unsigned char head[16384];
+    char why[512];
+    size_t got;
+    FILE *f;
+
+    join(p, MAX_PATH * 2, game, L"default.xbe");
+    f = _wfopen(p, L"rb");
+    if (!f) return 0;
+    got = fread(head, 1, sizeof head, f);
+    fclose(f);
+    if (jsrf_xbe_check(head, got, why, sizeof why) != JSRF_XBE_OTHER) return 0;
+    from_utf8(why, w, 1024);
+    _snwprintf(text, 2048, L"This isn't the USA release of Jet Set Radio Future.\n\n%ls\n\n%hs",
+               w, JSRF_XBE_OTHER_ADVICE);
+    text[2047] = 0;
+    say(text, MB_ICONWARNING);
+    return 1;
+}
+
 /* ---- the run ---------------------------------------------------------------- */
 
 static const wchar_t *const k_env[][2] = {
@@ -470,7 +501,15 @@ static int run(const wchar_t *game, int scale, int fullscreen)
     WaitForSingleObject(pi.hProcess, INFINITE);
     GetExitCodeProcess(pi.hProcess, &code);
     CloseHandle(pi.hProcess);
-    if (code != 0) {
+    if (code == JSRF_XBE_OTHER) {
+        /* The engine's own check (if this launcher's could not read the file):
+         * its log says what the files are. Ask for the folder next time. */
+        cfg_set("game_dir", "");
+        _snwprintf(msg, 2048, L"This isn't the USA release of Jet Set Radio Future.\n\n%hs\n\n"
+                              L"The log says which release it is:\n%ls", JSRF_XBE_OTHER_ADVICE, log);
+        msg[2047] = 0;
+        say(msg, MB_ICONWARNING);
+    } else if (code != 0) {
         _snwprintf(msg, 2048, L"JSRF Unleashed stopped unexpectedly (exit %lu).\n\n"
                               L"The log is at:\n%ls\n\nIf you report the problem, please attach it.\n\n"
                               L"Show the log in its folder?", (unsigned long)code, log);
@@ -568,6 +607,10 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE prev, PWSTR cmdline, int show)
     if (!is_game(game))
         return fail(L"That folder has no default.xbe and Media in it. Pick the folder "
                     L"you extracted the game into (or the one with the disc image).");
+    if (other_release(game)) {
+        cfg_set("game_dir", "");                    /* ask again next time */
+        return 1;
+    }
     to_utf8(game, u8, sizeof u8);
     cfg_set("game_dir", u8);
     if (cfg_get("scale", val, sizeof val)) {

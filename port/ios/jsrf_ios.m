@@ -45,6 +45,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include "xiso.h"
+#include "../xbe_check.h"
 
 /* ---- what the runtime asks for ------------------------------------------ */
 
@@ -697,6 +698,20 @@ static void draw_circle(CGPoint c, CGFloat r, CGFloat fill, CGFloat line)
     if (self.started || self.unpacking) return;
     game = find_game();
     if (!game) { [self showSetup]; return; }
+    {
+        /* Another release of the game (European, Japanese) starts and then
+         * crashes a few seconds in: the engine is the USA release's code. */
+        char why[512];
+        if (jsrf_xbe_check_folder(game.fileSystemRepresentation, why, sizeof why) == JSRF_XBE_OTHER) {
+            fprintf(stderr, "[IOS] %s\n", why);
+            [self showSetup];
+            [self alert:@"This isn't the USA release of Jet Set Radio Future"
+                   text:[NSString stringWithFormat:@"%s\n\n%s\n\nThe files are in Files: On My "
+                         "iPhone > JSRF Unleashed: replace them with the USA release's.", why,
+                         JSRF_XBE_OTHER_ADVICE]];
+            return;
+        }
+    }
     self.setup.hidden = YES;
     g_open = 1;                       /* the renderer may present from now on */
     if (!start_engine(game)) {
@@ -713,6 +728,12 @@ static void draw_circle(CGPoint c, CGFloat r, CGFloat fill, CGFloat line)
 - (void)engineStopped:(int)rc
 {
     [UIApplication sharedApplication].idleTimerDisabled = NO;
+    if (rc == 3) {                    /* the engine's own check: not the USA release */
+        [self alert:@"This isn't the USA release of Jet Set Radio Future"
+               text:[NSString stringWithFormat:@"%s\n\nIts log says which release the files are: "
+                     "Files: On My iPhone > JSRF Unleashed > Logs > last-run.log.", JSRF_XBE_OTHER_ADVICE]];
+        return;
+    }
     [self alert:@"The game stopped"
            text:[NSString stringWithFormat:@"The engine could not run the game (code %d). Its log "
                  "is in Files: On My iPhone > JSRF Unleashed > Logs > last-run.log.%@", rc,

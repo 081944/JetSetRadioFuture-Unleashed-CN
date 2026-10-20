@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #include <android/log.h>
 #include "xiso.h"
+#include "../xbe_check.h"
 
 #ifndef JSRF_VERSION
 #define JSRF_VERSION "dev"
@@ -290,6 +291,23 @@ Java_com_jumatt_jsrfunleashed_SetupActivity_nativeProbe(JNIEnv *env, jclass cls,
     (void)cls;
     if (p) (*env)->ReleaseStringUTFChars(env, path, p);
     return r ? JNI_TRUE : JNI_FALSE;
+}
+
+/* Whether <dir>/default.xbe is the USA release's program (port/xbe_check.c):
+ * null if it is (or cannot be read -- the engine checks again), else what to
+ * tell the player. Another release starts and then crashes a few seconds in. */
+JNIEXPORT jstring JNICALL
+Java_com_jumatt_jsrfunleashed_SetupActivity_nativeCheckGame(JNIEnv *env, jclass cls, jstring dir)
+{
+    const char *d = (*env)->GetStringUTFChars(env, dir, NULL);
+    char why[512], text[1100];
+    int r = d ? jsrf_xbe_check_folder(d, why, sizeof why) : JSRF_XBE_OK;
+    (void)cls;
+    if (d) (*env)->ReleaseStringUTFChars(env, dir, d);
+    if (r != JSRF_XBE_OTHER) return NULL;
+    __android_log_print(ANDROID_LOG_WARN, TAG, "%s", why);
+    snprintf(text, sizeof text, "%s\n\n%s", why, JSRF_XBE_OTHER_ADVICE);
+    return (*env)->NewStringUTF(env, text);
 }
 
 struct unpack_ctx { JNIEnv *env; jobject self; jmethodID progress; };
