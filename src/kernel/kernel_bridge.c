@@ -2134,6 +2134,10 @@ static void bridge_HalReadSMCTrayState(void)
  * Returns 1 if the routine was found and called.
  */
 static int kernel_run_dpc_locked(uint32_t dpc_va, uint32_t arg1, uint32_t arg2);
+/* An interrupt, DPC or synchronize routine is running on this thread. The
+ * console switches no threads until it returns, so neither does the guest
+ * lock's time slice (xbox_guest_lock_yield_now). */
+static RECOMP_TLS int t_in_callback;
 static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
 {
     int r;
@@ -2174,7 +2178,9 @@ static int kernel_run_dpc_locked(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    t_in_callback++;
     fn();
+    t_in_callback--;
     return 1;
 }
 
@@ -2214,7 +2220,9 @@ static void bridge_KeSynchronizeExecution(void)
      * the dummy return address and the argument, so g_esp needs no fixup. */
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    t_in_callback++;
     fn();
+    t_in_callback--;
     /* g_eax is whatever the routine returned, which is this call's result. */
 }
 
@@ -2324,7 +2332,9 @@ static int kernel_raise_interrupt_locked(uint32_t vector)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = kint;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    t_in_callback++;
     fn();
+    t_in_callback--;
     return (int)(g_eax & 1u);
 }
 
@@ -6232,6 +6242,17 @@ static void lock_holder_where(void)
  * yield to decide whether standing back is worth anything. */
 static volatile int g_lock_waiters;
 static volatile long long     g_lock_since;
+/* Whose time slice is running, and since when. Unlike g_lock_since it does
+ * not restart when the same thread takes the lock back after a kernel call,
+ * only when the lock changes hands or xbox_guest_lock_yield_now has offered
+ * it. Written and read only under the lock. */
+static unsigned long g_slice_owner;
+static long long     g_slice_since;
+/* For the [LOCK] report: slices that ended in a hand-over, and slice ends
+ * put off because the holder was at DISPATCH_LEVEL or above or inside an
+ * interrupt, DPC or synchronize routine. */
+static unsigned long g_slice_handoffs;
+static unsigned long g_slice_held_raised;
 
 /* Per-thread queueing statistics, kept in a small fixed table so that
  * reporting them needs no allocation and no lock of its own. */
@@ -6352,6 +6373,10 @@ void xbox_guest_lock_acquire(void)
     t_guest_holds = 1;
     t_guest_since = (long long)GetTickCount64();
     g_lock_owner = GetCurrentThreadId();
+    if (g_slice_owner != g_lock_owner) {
+        g_slice_owner = g_lock_owner;
+        g_slice_since = t_guest_since;
+    }
 #ifdef __APPLE__
     g_lock_owner_pt = pthread_self();
 #endif
@@ -6432,6 +6457,11 @@ void xbox_guest_lock_stats(void)
                 g_lock_wait_ms[i]);
         g_lock_takes[i] = 0; g_lock_hold_ms[i] = 0; g_lock_wait_ms[i] = 0;
     }
+    fprintf(stderr, "        %lu time slices ended in a hand-over, %lu slice ends "
+                    "put off at raised IRQL or in an interrupt or DPC\n",
+            g_slice_handoffs, g_slice_held_raised);
+    g_slice_handoffs = 0;
+    g_slice_held_raised = 0;
     fflush(stderr);
 }
 void xbox_guest_lock_release(void)
@@ -6687,10 +6717,41 @@ void xbox_guest_lock_yield_now(void)
         }
     }
     if (!t_guest_holds) return;
-    { static long long slice = -1;
+    /* The slice runs from when this thread took the lock over from another,
+     * or last offered it -- not from its latest retake. A thread that drops
+     * the lock around a kernel call which returns at once takes it straight
+     * back, before any waiter has woken, and a slice restarted there never
+     * runs out. In game JSRF's main thread enters DirectSound's critical
+     * section thousands of times a second, so it held the lock most of the
+     * time and almost never handed it over, and the timer thread, which
+     * delivers the vertical blank and the APU interrupt, queued for it most
+     * of the time. RECOMP_SLICE_FROM_RETAKE=1 measures it the old way.
+     *
+     * Not at DISPATCH_LEVEL or above, and not inside an interrupt, DPC or
+     * synchronize routine: the console switches no threads there, and a
+     * driver raises IRQL to keep its own deferred routine out of what it is
+     * rewriting -- which the timer thread would run as soon as it had the
+     * lock. Measured from the same start, so a holder that only leaves raised
+     * IRQL late hands over at once; and past RECOMP_SLICE_RAISED_MS (50) it
+     * hands over anyway, for a spin at raised IRQL that waits on an
+     * interrupt only the timer thread can deliver. */
+    { static long long slice = -1, raised = -1;
+      static int from_retake = -1;
+      long long ran;
       if (slice < 0) { const char *e = getenv("RECOMP_SLICE_MS");
                        slice = e ? atoll(e) : 4; if (slice < 0) slice = 0; }
-      if ((long long)GetTickCount64() - t_guest_since < slice) return; }
+      if (from_retake < 0) from_retake = getenv("RECOMP_SLICE_FROM_RETAKE") ? 1 : 0;
+      ran = (long long)GetTickCount64() - (from_retake ? t_guest_since : g_slice_since);
+      if (ran < slice) return;
+      if (!from_retake) {
+          extern unsigned char xbox_KeCurrentIrql(void);
+          if (raised < 0) { const char *e = getenv("RECOMP_SLICE_RAISED_MS");
+                            raised = e ? atoll(e) : 50; }
+          if (ran < raised && (t_in_callback || xbox_KeCurrentIrql() >= DISPATCH_LEVEL)) {
+              g_slice_held_raised++;
+              return;
+          }
+      } }
     xbox_guest_lock_release();
     /*
      * Hand the lock over, rather than merely offering it.
@@ -6716,6 +6777,7 @@ void xbox_guest_lock_yield_now(void)
       if (handoff < 0) { const char *e = getenv("RECOMP_HANDOFF_US");
                          handoff = e ? atol(e) : 60; if (handoff < 0) handoff = 0; }
       if (handoff && g_lock_waiters > 0) {
+          __atomic_add_fetch(&g_slice_handoffs, 1, __ATOMIC_RELAXED);
           /* Sleep(0) yields only to equal-priority runnable threads, which a
            * thread blocked on the lock is not; Sleep(1) is the shortest wait
            * this shim guarantees actually leaves the CPU. */
@@ -6724,6 +6786,7 @@ void xbox_guest_lock_yield_now(void)
           SwitchToThread();
       } }
     xbox_guest_lock_acquire();
+    g_slice_since = t_guest_since;   /* offered: a new slice, taken over or not */
 }
 /* Give the guest lock up across a wait that is not a kernel call.
  *
