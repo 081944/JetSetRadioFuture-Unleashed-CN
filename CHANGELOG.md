@@ -10,6 +10,66 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.5.3 — 21 October 2026
+
+Fixes found by **spriteice**, who plays JSRF Unleashed on a ROG Xbox Ally X
+and went through the engine in
+[his fork](https://github.com/spriteice/JetSetRadioFuture-Unleashed/tree/TESTING).
+Thank you, spriteice! Each of these commits links the one of his it comes
+from, and says where it was adapted to this engine. Every platform is new
+in 0.5.3.
+
+- **The graffiti you pick now shows.** The texture cache knew a texture by
+  its address, size, format and 64 bytes sampled from it. The graffiti
+  picker loads each chosen design into the same 1024x1024 image, in place,
+  and when those 64 bytes did not change, the preview and the posters on
+  the walls kept the default graffiti. The whole content of the textures
+  being drawn is now compared as well, a megabyte of them at the end of each
+  frame, in turn, and a texture rewritten in place is uploaded again a few
+  frames later. (Comparing all of them every frame, as first written, took
+  0.6 ms a frame on a Mac; in turn, it costs nothing measurable.)
+- **Video memory no longer grows at every area.** The game frees an area's
+  textures when it leaves it, and the texture cache kept them on the GPU
+  until all 4,096 of its slots were full: on the Ally X, from 55 MB to
+  306 MB in a minute and a half. Textures whose memory the game has freed
+  are dropped once a frame (on a Mac in 99th Street the cache holds 179
+  textures, 57 MB), and a texture that changed is uploaded over its old
+  entry rather than beside it.
+- **The save folder is no longer 10 GB.** The engine backs the Xbox hard
+  disk with six image files in the save folder (Partition0.img to
+  Partition5.img), and made them the size of the console's partitions,
+  9.77 GB together. They were sparse, so on most disks they took almost no
+  space, but the folder showed as 10 GB in Explorer, in Finder and in the
+  iPhone's Files app, and a copy or a backup that does not keep holes, or an
+  exFAT or FAT32 drive, wrote all of it. They now hold only what the game
+  writes, about 120 KB, and start empty at each launch, which also shrinks
+  the old ones; nothing in them outlived a run anyway (the game formats its
+  cache partition at every start). The game's saves are elsewhere, in
+  `UDATA` in the game folder, and are not touched.
+- **Windows: two per-thread variables were shared by every thread.** MinGW,
+  which builds the Windows download, ignores `__declspec(thread)`: the
+  file path the kernel had just translated, which the cutscene player reads
+  back (another thread's open could replace it, and a cutscene not play),
+  and the game's IRQL. Both are thread-local now, as on the other platforms.
+- The game's IRQL is read from the register it is passed in (KfRaiseIrql
+  and KfLowerIrql are fastcall); it was the low byte of whatever the caller
+  had pushed last.
+- The guest lock's time slice runs from when the lock last changed hands,
+  not from the holder's latest retake after a kernel call, and for up to
+  50 ms it does not end at raised IRQL or inside an interrupt, DPC or
+  synchronize routine. `RECOMP_SLICE_FROM_RETAKE=1` measures it the old
+  way. On spriteice's build the timer thread, which delivers the vertical
+  blank and the APU interrupt, queued for the lock most of the time in
+  game; on a Mac in 99th Street it made no measurable difference, the slice
+  already running out once a frame.
+- A draw to a surface of another size under the same viewport now uses that
+  surface's size.
+- Tested on a Mac in 99th Street against 0.5.2 (Metal, 225 s each, New
+  Game and the left stick): the same frame rate and hitches, textures the
+  same share of the frame. Linux and Windows (under Wine): the game starts
+  and runs its title and attract demo, and the partition images stay small.
+  The Android and iPhone builds were built and checked, not run.
+
 ## 0.5.2 — 21 October 2026 — Windows only
 
 A second Windows-only fix for the sound, which still stuttered in 0.5.1 for
