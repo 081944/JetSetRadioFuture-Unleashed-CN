@@ -10,6 +10,32 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.5.2 — 21 October 2026 — Windows only
+
+A second Windows-only fix for the sound, which still stuttered in 0.5.1 for
+some players. The Mac, iPhone, Linux and Android downloads are 0.5.0's,
+unchanged: the 0.5.2 release carries them over, and they still say 0.5.0.
+
+- **Windows: the game's clock in 15.6 ms steps.** The engine's kernel timed
+  everything on Windows' GetTickCount64, which moves in steps of the system
+  tick, 15.6 ms, whatever timeBeginPeriod asks: the display interrupt that is
+  the game's frame clock, the game's own timers and DPCs, and the 4 ms slice
+  after which a game thread hands the guest lock to the next. On Windows
+  alone, then, all of those came in 15.6 ms steps. A player's 0.5.1 log shows
+  the frame clock slipping a whole step every 15 frames, a 30 ms frame four
+  times a second: a 60 Hz clock read off a 64 Hz tick. The 4 ms slice became
+  15.6 ms, so the ADX server thread that refills the music waited about four
+  times as long for its turn, and the music ran dry.
+- On Windows the kernel's GetTickCount and GetTickCount64 are now the
+  performance counter in milliseconds, as they are CLOCK_MONOTONIC on the
+  other platforms. The engine no longer imports either.
+- The game asks Windows 11 not to throttle it when its window is covered or
+  minimised, neither its speed nor its timer resolution (on Windows 10, the
+  speed alone): the Windows side of the Mac's App Nap opt-out.
+- 0.5.1's fix (every game thread at normal priority on Windows) is kept.
+- Tested under Wine, where the game starts and runs its title screen as
+  before; the stutter itself needs a real Windows PC to show.
+
 ## 0.5.1 — 21 October 2026 — Windows only
 
 A Windows-only fix. The Mac, iPhone, Linux and Android downloads are
