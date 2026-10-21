@@ -718,6 +718,30 @@ static struct {
     uint32_t csync;     /* constants stamped before this it already has; 0 none */
     char    *dis;       /* disassembly, kept only when a dump is armed */
 } g_pcache[PROG_CACHE];
+
+/*
+ * Hitches.
+ *
+ * A player who reports "micro-stuttering" is describing frames that took two
+ * or three times the period, every now and then -- which the averages in the
+ * pacing report (and RECOMP_GL_PROFILE's per-second shares) cannot show. So
+ * the renderer notes, per frame, the work that comes in lumps: programs built
+ * (a GLSL compile and link, or a Metal library, is milliseconds each, and a
+ * new effect or object brings several at once), and textures decoded and
+ * uploaded. A frame half again the period or longer is written to the log
+ * with those, and with what is left over -- the game itself, its loading and
+ * its sound, which the renderer does not see. The first two hundred are
+ * written, then one in fifty.
+ */
+static struct {
+    unsigned compiles, tex_new;
+    double   compile_s, compile_worst, tex_s;
+    uint32_t draws0;
+} g_hf;                                         /* this frame */
+static struct {
+    unsigned long long hitches, logged, compiles;
+    double   compile_s, compile_worst;
+} g_ht;                                         /* the whole run */
 /*
  * Internal resolution.
  *
@@ -2224,7 +2248,13 @@ static uint32_t build_program(const char *vsrc, const char *fsrc, const char *wh
     if (z01 < 0)   z01   = getenv("RECOMP_GL_Z01") ? 1 : 0;
     if (zview) f2 = splice_define(fsrc, "#define NV2A_ZVIEW_ON 1\n");
     if (z01)   v2 = splice_define(vsrc, "#define NV2A_Z01 1\n");
-    prog = G->prog_new(v2 ? v2 : vsrc, f2 ? f2 : fsrc, what);
+    { double t0 = mono_now(), dt;
+      prog = G->prog_new(v2 ? v2 : vsrc, f2 ? f2 : fsrc, what);
+      dt = mono_now() - t0;
+      g_hf.compiles++; g_hf.compile_s += dt;
+      if (dt > g_hf.compile_worst) g_hf.compile_worst = dt;
+      g_ht.compiles++; g_ht.compile_s += dt;
+      if (dt > g_ht.compile_worst) g_ht.compile_worst = dt; }
     free(v2); free(f2);
     return prog;
 }
@@ -2865,8 +2895,10 @@ static uint32_t surface_texture_for(const TexStage *t, float *sx, float *sy, int
 static uint32_t upload_texture(const TexStage *t)
 {
     uint32_t r; PROF_T0();
+    double t0 = mono_now();
     g_prof.n_tex_lookup++;
     r = upload_texture_inner(t);
+    g_hf.tex_s += mono_now() - t0;
     PROF_ADD(tex);
     return r;
 }
@@ -3221,6 +3253,7 @@ static uint32_t upload_texture_inner(const TexStage *t)
     if (!tex) return 0;
 
     g_prof.n_tex_upload++;
+    g_hf.tex_new++;
     g_tcache[slot].used = 1;
     g_tcache[slot].offset = t->offset; g_tcache[slot].format = t->color;
     g_tcache[slot].w = w; g_tcache[slot].h = h; g_tcache[slot].pitch = t->pitch;
@@ -8645,8 +8678,23 @@ static void frame_pace(void)
               if (g_pace_st.last > 0.0) {
                   double ms = (t - g_pace_st.last) * 1000.0;
                   g_pace_st.iv[ms < 14.0 ? 0 : ms < 19.5 ? 1 : ms < 30.0 ? 2 : ms < 45.0 ? 3 : 4]++;
+                  if (ms >= period * 1500.0) {
+                      g_ht.hitches++;
+                      if (g_ht.logged < 200 || g_ht.hitches % 50 == 0) {
+                          double other = ms - 1000.0 * (g_hf.compile_s + g_hf.tex_s);
+                          g_ht.logged++;
+                          fprintf(stderr, "[HITCH] frame %u: %.1f ms flip to flip, %u draws | "
+                                  "%u programs built in %.1f ms (worst %.1f) | %u textures new, "
+                                  "%.1f ms in textures | %.1f ms the rest\n",
+                                  S.frames, ms, S.draws - g_hf.draws0, g_hf.compiles,
+                                  1000.0 * g_hf.compile_s, 1000.0 * g_hf.compile_worst,
+                                  g_hf.tex_new, 1000.0 * g_hf.tex_s, other < 0.0 ? 0.0 : other);
+                      }
+                  }
               }
-              g_pace_st.last = t; }
+              g_pace_st.last = t;
+              memset(&g_hf, 0, sizeof g_hf);
+              g_hf.draws0 = S.draws; }
         }
 }
 
@@ -9933,6 +9981,11 @@ void nv2a_gl_report(void)
                 (unsigned long long)g_pace_st.iv[2], (unsigned long long)g_pace_st.iv[3],
                 (unsigned long long)g_pace_st.iv[4], (unsigned long long)n);
     }
+    if (g_ht.compiles)
+        fprintf(stderr, "  [HITCH] %llu frames half again the period or longer; %llu programs "
+                "built in %.0f ms in all (%.1f ms each, worst %.1f)\n",
+                g_ht.hitches, g_ht.compiles, 1000.0 * g_ht.compile_s,
+                1000.0 * g_ht.compile_s / (double)g_ht.compiles, 1000.0 * g_ht.compile_worst);
     fprintf(stderr,
         "  [GL] %u draws, %u triangles, %u clears, %u presents, "
         "%u programs compiled\n"
