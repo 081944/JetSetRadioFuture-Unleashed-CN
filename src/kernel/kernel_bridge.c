@@ -1335,17 +1335,19 @@ static void bridge_ExAllocatePoolWithTag(void)
     g_eax = xbox_va;
 }
 
-/* ── KfRaiseIrql / KfLowerIrql (ordinals 160, 161) ────── */
+/* ── KfRaiseIrql / KfLowerIrql (ordinals 160, 161, fastcall: level in cl)
+ * Not STACK_ARG(0), for the reason ObfDereferenceObject gives: the level never
+ * reaches the stack. Read from there, a thread's IRQL became the low byte of
+ * whatever its caller pushed last -- after any DirectSound call, a saved esi --
+ * so it nearly always sat at DISPATCH_LEVEL or above. */
 static void bridge_KfRaiseIrql(void)
 {
-    uint32_t new_irql = STACK_ARG(0);
-    g_eax = (uint32_t)xbox_KfRaiseIrql((UCHAR)new_irql);
+    g_eax = (uint32_t)xbox_KfRaiseIrql((UCHAR)g_ecx);
 }
 
 static void bridge_KfLowerIrql(void)
 {
-    uint32_t new_irql = STACK_ARG(0);
-    xbox_KfLowerIrql((UCHAR)new_irql);
+    xbox_KfLowerIrql((UCHAR)g_ecx);
     g_eax = 0;
 }
 
