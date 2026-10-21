@@ -6316,7 +6316,7 @@ void xbox_guest_lock_acquire(void)
      * to decide without measuring both.
      */
     if (!xbox_guest_lock_idle_takes_lock()
-     && GetThreadPriority(GetCurrentThread()) <= THREAD_PRIORITY_IDLE) {
+     && xbox_thread_guest_priority(GetCurrentThread()) <= THREAD_PRIORITY_IDLE) {
         t_guest_idle = 1;
         return;
     }
