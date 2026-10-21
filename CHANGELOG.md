@@ -10,6 +10,35 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.5.1 — 21 October 2026 — Windows only
+
+A Windows-only fix. The Mac, iPhone, Linux and Android downloads are
+0.5.0's, unchanged: the 0.5.1 release carries them over, and they still say
+0.5.0.
+
+- **Windows: sound that stutters when the PC is busy.** The game gives each
+  of its threads a priority, as Xbox games do, and on Windows those were
+  applied to real Windows threads; on the Mac and Linux, SetThreadPriority
+  is the engine's own and only remembers the number. The game puts CRI's ADX
+  worker, the thread that reads and decodes the music stream, at the lowest
+  priority, idle. On the console that thread runs whenever the others wait,
+  half of every frame; on a PC it runs only when no normal-priority thread
+  anywhere wants its core (the game's own threads, a browser, a chat app),
+  so under load it starved and the music ran dry. The game's other requests
+  were applied too: highest and above normal for three threads, and one
+  thread raising itself to time-critical and back about fifty times a
+  second.
+- Every game thread now runs at normal priority on Windows, as on the other
+  platforms, and the game reads back the priorities it set.
+  `RECOMP_THREAD_PRIORITIES=1` applies them as before.
+- The APU's frame thread, which makes the sound 5 ms at a time and sleeps
+  in between, runs at the highest priority below time-critical on Windows,
+  so that a busy moment delays the picture rather than the sound (SDL's
+  device thread, which plays what it makes, was at time-critical already).
+- Tested under Wine, where the game starts and runs its title screen as
+  before; Wine does not apply thread priorities, so the stutter itself could
+  not be reproduced there. The game's requests were logged on Linux.
+
 ## 0.5.0 — 21 October 2026
 
 - **Less stutter: new textures appear about six times faster.** The first
