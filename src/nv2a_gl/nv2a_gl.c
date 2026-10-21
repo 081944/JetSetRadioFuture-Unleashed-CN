@@ -3013,20 +3013,31 @@ static uint32_t upload_texture_inner(const TexStage *t)
          * texture stays undefined, and every surface samples black. That is
          * a whole-screen failure caused by a driver capability, which is not
          * a trade worth making for an upload that happens once per texture
-         * and is cached afterwards. */
-        uint32_t x, y;
+         * and is cached afterwards.
+         *
+         * A block at a time: decoded per texel, every block was decoded
+         * sixteen times -- 4 ms a texture, and the 49 a new area brings at
+         * once were a 200 ms stall in the middle of play. */
+        uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4, bb = d3d8_format_dxt_block_bytes(t->color);
+        uint32_t bx, by, k;
 
         rgba = (uint8_t *)malloc((size_t)w * h * 4);
         if (!rgba) return 0;
-        for (y = 0; y < h; y++)
-            for (x = 0; x < w; x++) {
-                uint32_t argb = 0xFF000000u;
-                d3d8_dxt_decode_texel(src, t->color, x, y, w, &argb);
-                if (g_upload_bias_bg) argb ^= 0x00008080u;
-                rgba[((size_t)y * w + x) * 4 + 0] = (uint8_t)(argb >> 16);
-                rgba[((size_t)y * w + x) * 4 + 1] = (uint8_t)(argb >> 8);
-                rgba[((size_t)y * w + x) * 4 + 2] = (uint8_t)argb;
-                rgba[((size_t)y * w + x) * 4 + 3] = (uint8_t)(argb >> 24);
+        for (by = 0; by < bh; by++)
+            for (bx = 0; bx < bw; bx++) {
+                uint32_t px[16];
+                d3d8_dxt_decode_block(src + ((size_t)by * bw + bx) * bb, t->color, px);
+                for (k = 0; k < 16; k++) {
+                    uint32_t x = bx * 4 + (k & 3u), y = by * 4 + (k >> 2), argb = px[k];
+                    uint8_t *o;
+                    if (x >= w || y >= h) continue;
+                    if (g_upload_bias_bg) argb ^= 0x00008080u;
+                    o = rgba + ((size_t)y * w + x) * 4;
+                    o[0] = (uint8_t)(argb >> 16);
+                    o[1] = (uint8_t)(argb >> 8);
+                    o[2] = (uint8_t)argb;
+                    o[3] = (uint8_t)(argb >> 24);
+                }
             }
         tex_alpha_census(rgba, w, h, t->color, 1);
     } else {
@@ -3050,14 +3061,25 @@ static uint32_t upload_texture_inner(const TexStage *t)
             }
             return 0;
         }
+        /* Where each column and each row lands in a swizzled image, worked
+         * out once: swizzle_offset(x, y) is offx[x] | offy[y], and working
+         * it out per texel was most of the time a swizzled upload took. */
+        static uint32_t offx[4096], offy[4096];
+        int swz = fmt_is_swz(t->color);
+        if (swz) {
+            uint32_t mx, my;
+            xbox_swizzle_masks(w, h, &mx, &my);
+            for (x = 0; x < w; x++) offx[x] = swizzle_deposit(x, mx);
+            for (y = 0; y < h; y++) offy[y] = swizzle_deposit(y, my);
+        }
         rgba = (uint8_t *)malloc((size_t)w * h * 4);
         if (!rgba) return 0;
         for (y = 0; y < h; y++) {
             for (x = 0; x < w; x++) {
                 const uint8_t *p;
                 uint32_t argb;
-                if (fmt_is_swz(t->color))
-                    p = src + (size_t)swizzle_offset(x, y, w, h) * bpp;
+                if (swz)
+                    p = src + (size_t)(offx[x] | offy[y]) * bpp;
                 else
                     p = src + (size_t)y * (t->pitch ? t->pitch : w * bpp)
                             + (size_t)x * bpp;
