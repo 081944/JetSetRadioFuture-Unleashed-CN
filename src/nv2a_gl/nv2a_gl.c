@@ -736,6 +736,7 @@ static struct {
 static struct {
     unsigned compiles, tex_new;
     double   compile_s, compile_worst, tex_s;
+    double   pso_ms0;                           /* the backend's pipeline time at the frame's start */
     uint32_t draws0;
 } g_hf;                                         /* this frame */
 static struct {
@@ -8681,20 +8682,24 @@ static void frame_pace(void)
                   if (ms >= period * 1500.0) {
                       g_ht.hitches++;
                       if (g_ht.logged < 200 || g_ht.hitches % 50 == 0) {
-                          double other = ms - 1000.0 * (g_hf.compile_s + g_hf.tex_s);
+                          double pso = G->pipeline_ms ? G->pipeline_ms() - g_hf.pso_ms0 : 0.0;
+                          double other = ms - 1000.0 * (g_hf.compile_s + g_hf.tex_s) - pso;
+                          char pl[48] = "";
+                          if (G->pipeline_ms) snprintf(pl, sizeof pl, ", pipelines %.1f ms", pso);
                           g_ht.logged++;
                           fprintf(stderr, "[HITCH] frame %u: %.1f ms flip to flip, %u draws | "
-                                  "%u programs built in %.1f ms (worst %.1f) | %u textures new, "
+                                  "%u programs built in %.1f ms (worst %.1f)%s | %u textures new, "
                                   "%.1f ms in textures | %.1f ms the rest\n",
                                   S.frames, ms, S.draws - g_hf.draws0, g_hf.compiles,
-                                  1000.0 * g_hf.compile_s, 1000.0 * g_hf.compile_worst,
+                                  1000.0 * g_hf.compile_s, 1000.0 * g_hf.compile_worst, pl,
                                   g_hf.tex_new, 1000.0 * g_hf.tex_s, other < 0.0 ? 0.0 : other);
                       }
                   }
               }
               g_pace_st.last = t;
               memset(&g_hf, 0, sizeof g_hf);
-              g_hf.draws0 = S.draws; }
+              g_hf.draws0 = S.draws;
+              if (G->pipeline_ms) g_hf.pso_ms0 = G->pipeline_ms(); }
         }
 }
 

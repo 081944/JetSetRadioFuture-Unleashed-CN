@@ -365,6 +365,11 @@ typedef struct Nv2aGfx {
      * skipped. 0 if the backend cannot address part of this one, and the
      * front half uploads the whole array instead. */
     int      (*uniform_f_part)(int id, int first, const float *v, int n);
+
+    /* Milliseconds spent so far making pipelines at draw time -- the part
+     * of building a program that a backend does lazily (Metal's pipeline
+     * states) and prog_new does not cover. NULL where there is none. */
+    double   (*pipeline_ms)(void);
 } Nv2aGfx;
 
 /* The implementations. Each returns NULL where it cannot run (no Metal

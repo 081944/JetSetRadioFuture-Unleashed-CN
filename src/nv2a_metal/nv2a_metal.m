@@ -1659,6 +1659,8 @@ static void mtl_report(void)
     }
 }
 
+static double mtl_pipeline_ms(void) { return g_ms_pso; }
+
 static const Nv2aGfx g_metal = {
     "metal", NV2A_LANG_MSL, 0,
     mtl_init,
@@ -1669,6 +1671,9 @@ static const Nv2aGfx g_metal = {
     mtl_uniform_f, mtl_uniform_i,
     mtl_texture, mtl_state, mtl_state_invalidate,
     mtl_vertices, mtl_draw, mtl_clear, mtl_present, mtl_report,
+    NULL, NULL, NULL, NULL, NULL,       /* kept vertex buffers: not here */
+    NULL,                               /* uniform_f_part */
+    mtl_pipeline_ms,
 };
 
 const Nv2aGfx *nv2a_gfx_metal(void) { return &g_metal; }
