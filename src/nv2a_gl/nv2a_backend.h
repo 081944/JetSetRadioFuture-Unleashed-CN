@@ -370,6 +370,16 @@ typedef struct Nv2aGfx {
      * of building a program that a backend does lazily (Metal's pipeline
      * states) and prog_new does not cover. NULL where there is none. */
     double   (*pipeline_ms)(void);
+
+    /* The shader cache (nv2a_shader_cache.h): open it in `dir` for `tag`
+     * and get ready the programs earlier runs built -- in the background,
+     * from saved binaries, or queued for cache_idle. */
+    void     (*cache_open)(const char *dir, const char *tag);
+    /* A frame with little to draw (a loading screen, a menu): spend about
+     * `budget_ms` building queued programs. Returns how many are still
+     * queued, 0 when there is nothing left to do. NULL where the backend
+     * builds them on a thread of its own. */
+    int      (*cache_idle)(double budget_ms);
 } Nv2aGfx;
 
 /* The implementations. Each returns NULL where it cannot run (no Metal

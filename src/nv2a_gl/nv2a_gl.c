@@ -31,6 +31,7 @@
 #include "nv2a_vsh.h"
 #include "nv2a_psh.h"
 #include "nv2a_backend.h"
+#include "nv2a_shader_cache.h"
 
 /*
  * Two ways to get a 3.3 core context.
@@ -736,6 +737,7 @@ static struct {
 static struct {
     unsigned compiles, tex_new;
     double   compile_s, compile_worst, tex_s;
+    double   idle_s;                            /* building ahead for the shader cache */
     double   pso_ms0;                           /* the backend's pipeline time at the frame's start */
     uint32_t draws0;
 } g_hf;                                         /* this frame */
@@ -8683,9 +8685,12 @@ static void frame_pace(void)
                       g_ht.hitches++;
                       if (g_ht.logged < 200 || g_ht.hitches % 50 == 0) {
                           double pso = G->pipeline_ms ? G->pipeline_ms() - g_hf.pso_ms0 : 0.0;
-                          double other = ms - 1000.0 * (g_hf.compile_s + g_hf.tex_s) - pso;
-                          char pl[48] = "";
+                          double other = ms - 1000.0 * (g_hf.compile_s + g_hf.tex_s + g_hf.idle_s) - pso;
+                          char pl[96] = "";
                           if (G->pipeline_ms) snprintf(pl, sizeof pl, ", pipelines %.1f ms", pso);
+                          if (g_hf.idle_s > 0.0)
+                              snprintf(pl + strlen(pl), sizeof pl - strlen(pl), ", %.1f ms building ahead",
+                                       1000.0 * g_hf.idle_s);
                           g_ht.logged++;
                           fprintf(stderr, "[HITCH] frame %u: %.1f ms flip to flip, %u draws | "
                                   "%u programs built in %.1f ms (worst %.1f)%s | %u textures new, "
@@ -8701,6 +8706,28 @@ static void frame_pace(void)
               g_hf.draws0 = S.draws;
               if (G->pipeline_ms) g_hf.pso_ms0 = G->pipeline_ms(); }
         }
+}
+
+/* A frame with little in it -- a logo, a loading screen, a menu -- is where
+ * the shader cache builds what earlier runs needed (cache_idle), a few
+ * milliseconds at a time, so that the game finds it built. It is done in the
+ * frame's slack, before frame_pace waits out the rest of the period, and with
+ * the guest lock given up as frame_pace gives it up, so that a loader running
+ * behind a loading screen carries on meanwhile. */
+static void cache_idle_frame(void)
+{
+    static uint32_t last_draws;
+    static int more = 1;
+    uint32_t nd = S.draws - last_draws;
+    last_draws = S.draws;
+    if (!more || !G || !G->cache_idle) return;
+    if (nd < 150) {
+        double t0 = mono_now();
+        int held = xbox_guest_lock_drop ? xbox_guest_lock_drop() : 0;
+        more = G->cache_idle(6.0) > 0;
+        if (held && xbox_guest_lock_retake) xbox_guest_lock_retake(held);
+        g_hf.idle_s += mono_now() - t0;
+    }
 }
 
 static void present(int is_frame)
@@ -8757,7 +8784,7 @@ static void present(int is_frame)
         }
     }
 
-    if (is_frame) { PROF_T0(); frame_pace(); PROF_ADD(pace); }
+    if (is_frame) { PROF_T0(); cache_idle_frame(); frame_pace(); PROF_ADD(pace); }
 
     /* Put the finished frame on screen: the surface the title has set up
      * when it flips, which is what the window showed while surfaces were
@@ -10051,6 +10078,37 @@ const Nv2aGfx *nv2a_gfx_metal(void) { return NULL; }
  * backend that changed halfway through a frame would leave its surfaces and
  * programs behind in the other one.
  */
+/* The shader cache (nv2a_shader_cache.h), in <JSRF_SAVE_DIR>/shaders: every
+ * launcher sets the save folder, and a run without one has no cache. Its files
+ * are named for the backend and for the translator -- a hash of a reference
+ * pair of shaders generated now -- so that what an older engine built is
+ * never loaded, only left behind. RECOMP_SHADER_CACHE=0 turns it off. */
+static void shader_cache_start(void)
+{
+    const char *save = getenv("JSRF_SAVE_DIR"), *off = getenv("RECOMP_SHADER_CACHE");
+    char dir[1024], tag[96];
+    char *v, *f;
+    uint64_t fp = 0;
+    Nv2aVshFixed f0;
+    Nv2aPshState p0;
+    int msl;
+    if (!G || !G->cache_open || (off && !atoi(off)) || !save || !*save) return;
+    msl = (G->lang == NV2A_LANG_MSL);
+    snprintf(dir, sizeof dir, "%s/shaders", save);
+    v = (char *)malloc(96 * 1024);
+    f = (char *)malloc(96 * 1024);
+    memset(&f0, 0, sizeof f0);
+    f0.inputs_read = 1;
+    memset(&p0, 0, sizeof p0);
+    if (v && f && (msl ? nv2a_vsh_emit_ff_msl(&f0, v, 96 * 1024) : nv2a_vsh_emit_ff_glsl(&f0, v, 96 * 1024))
+              && (msl ? nv2a_psh_emit_msl(&p0, f, 96 * 1024) : nv2a_psh_emit_glsl(&p0, f, 96 * 1024)))
+        fp = nv2a_sc_key(v, f);
+    free(v);
+    free(f);
+    snprintf(tag, sizeof tag, "%s-%08X", G->name, (unsigned)(fp ^ (fp >> 32)));
+    G->cache_open(dir, tag);
+}
+
 static int gfx_init(uint32_t w, uint32_t h)
 {
     const char *v = getenv("RECOMP_BACKEND");
@@ -10075,6 +10133,7 @@ static int gfx_init(uint32_t w, uint32_t h)
             G = m;
             g_is_gl = 0;
             fprintf(stderr, "  [GL] backend: %s\n", G->name);
+            shader_cache_start();
             return 1;
         }
         fprintf(stderr, "  [GL] Metal backend unavailable%s\n",
@@ -10090,6 +10149,7 @@ static int gfx_init(uint32_t w, uint32_t h)
     }
     if (!gl_init(w, h)) return 0;     /* the context, then the device */
     fprintf(stderr, "  [GL] backend: %s\n", G->name);
+    shader_cache_start();
     return 1;
 }
 
