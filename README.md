@@ -363,11 +363,12 @@ records the rest (SDL2, libepoxy). How the Mac and iPhone renderer works is in
 [getting-started guide](docs/GETTING_STARTED.md). The version comes from the
 git tag the tree is at.
 
-The downloads up to 0.5.3 were built from code that an earlier version of
-these tools generated, with two tables of functions its discovery pass had
-missed (`recomp_seeded.c` and `recomp_holes.c`, see `port/recomp_manual.c`).
-Today's tools find those functions themselves, and a build whose generated
-code has neither file gets empty tables in their place.
+The downloads are still built from code that an earlier version of these
+tools generated, until code generated as above has been played through, with
+two tables of functions its discovery pass had missed (`recomp_seeded.c` and
+`recomp_holes.c`, see `port/recomp_manual.c`). Today's tools find those
+functions themselves, and a build whose generated code has neither file gets
+empty tables in their place.
 
 ## Legality
 
