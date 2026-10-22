@@ -2565,7 +2565,7 @@ static void kernel_apu_tick(void)
     extern int mcpx_apu_irq_pending_global(void) __attribute__((weak));
     static int off = -1;
     static unsigned declined, backoff;
-    int claimed;
+    int claimed, forced;
 
     if (off < 0) off = getenv("RECOMP_APU_NO_IRQ") ? 1 : 0;
     if (off || !mcpx_apu_irq_pending_global) return;
@@ -2611,13 +2611,21 @@ static void kernel_apu_tick(void)
     { static long hz = -1; static long long next;
       if (hz < 0) { const char *e = getenv("RECOMP_APU_FORCE_HZ");
                     hz = e ? atol(e) : 0; }
+      forced = hz > 0;
       if (hz > 0) {
           long long now = (long long)GetTickCount64();
           if (now < next) return;
           next = now + (1000 / hz > 0 ? 1000 / hz : 1);
       } else if (!mcpx_apu_irq_pending_global()) return; }
 
-    claimed = kernel_raise_interrupt(APU_VECTOR);
+    /* Looked at again once this thread holds the lock: the line is level-
+     * triggered, and the thread that held the lock may have taken it on
+     * itself in the meantime (xbox_GuestCpuPreempt, recomp_guest_spin_yield). */
+    xbox_guest_lock_acquire();
+    claimed = forced || mcpx_apu_irq_pending_global()
+            ? kernel_raise_interrupt_locked(APU_VECTOR) : -2;
+    xbox_guest_lock_release();
+    if (claimed == -2) return;
     raised++;
     if (claimed > 0) g_apu_claimed++;
     if (raised <= 3 || (claimed <= 0 && declined < 3)) {
@@ -6242,8 +6250,17 @@ static void lock_holder_where(void)
 }
 #endif
 /* How many guest threads are queueing for the lock right now. Used by the
- * yield to decide whether standing back is worth anything. */
-static volatile int g_lock_waiters;
+ * yield to decide whether standing back is worth anything, and read by every
+ * loop back edge in code lifted with --back-edge-yield (RECOMP_BACK_EDGE,
+ * under the toolkit's name): while it is zero a back edge costs a load and a
+ * branch. */
+int32_t g_xbox_guest_cpu_preempt;
+/* The holder's latest loop back edge and its IRQL there, for the [LOCK]
+ * report. */
+static volatile uint32_t g_lock_owner_edge;
+static volatile unsigned g_lock_owner_irql;
+/* Interrupts delivered from inside a spin rather than on the timer thread. */
+static unsigned long g_spin_isrs;
 static volatile long long     g_lock_since;
 /* Whose time slice is running, and since when. Unlike g_lock_since it does
  * not restart when the same thread takes the lock back after a kernel call,
@@ -6363,9 +6380,9 @@ void xbox_guest_lock_acquire(void)
     { long long t0 = 0;
       int watch = lock_watch();
       if (watch) t0 = (long long)GetTickCount64();
-      __atomic_add_fetch(&g_lock_waiters, 1, __ATOMIC_RELAXED);
+      __atomic_add_fetch(&g_xbox_guest_cpu_preempt, 1, __ATOMIC_RELAXED);
       EnterCriticalSection(&g_guest_lock);
-      __atomic_sub_fetch(&g_lock_waiters, 1, __ATOMIC_RELAXED);
+      __atomic_sub_fetch(&g_xbox_guest_cpu_preempt, 1, __ATOMIC_RELAXED);
       if (watch) {
           long long w = (long long)GetTickCount64() - t0;
           unsigned slot = lock_slot();
@@ -6376,6 +6393,7 @@ void xbox_guest_lock_acquire(void)
     t_guest_holds = 1;
     t_guest_since = (long long)GetTickCount64();
     g_lock_owner = GetCurrentThreadId();
+    g_lock_owner_edge = 0;
     if (g_slice_owner != g_lock_owner) {
         g_slice_owner = g_lock_owner;
         g_slice_since = t_guest_since;
@@ -6431,6 +6449,18 @@ void xbox_guest_lock_report(void)
     fprintf(stderr, "  [LOCK] thread %lu has held the guest lock for %lld ms"
                     " (critical-section handoffs %lu, free releases %lu)\n",
             owner, now - since, g_cs_handoffs, g_cs_free_releases);
+    if (g_lock_owner_edge) {
+        extern void mcpx_apu_debug_line(char *, unsigned long) __attribute__((weak));
+        fprintf(stderr, "  [LOCK] its latest loop back edge: guest 0x%08X at "
+                        "IRQL %u; APU interrupts taken on a spinning thread: "
+                        "%lu\n", g_lock_owner_edge, g_lock_owner_irql,
+                g_spin_isrs);
+        if (mcpx_apu_debug_line) {
+            char line[320];
+            mcpx_apu_debug_line(line, sizeof line);
+            fprintf(stderr, "  [LOCK] APU: %s\n", line);
+        }
+    }
     { extern void xbox_kernel_thread_report(void);
       xbox_kernel_thread_report(); }
 #ifdef __APPLE__
@@ -6514,8 +6544,6 @@ void xbox_guest_lock_release(void)
  * another round of reading disassembly and guessing. Incremented from the
  * generated bodies; see the headers on those functions. */
 unsigned long g_spin_witness[SPIN_WITNESS_N];
-/* Interrupts delivered from inside a spin rather than on the timer thread. */
-static unsigned long g_spin_isrs;
 static const char *const g_spin_witness_name[SPIN_WITNESS_N] = {
     "sub_001A2681 (DirectSound voice service, root of the chain)",
     "sub_001A2E2E (the only code that clears bit 0x8000)",
@@ -6779,7 +6807,8 @@ void xbox_guest_lock_yield_now(void)
     { static long handoff = -1;
       if (handoff < 0) { const char *e = getenv("RECOMP_HANDOFF_US");
                          handoff = e ? atol(e) : 60; if (handoff < 0) handoff = 0; }
-      if (handoff && g_lock_waiters > 0) {
+      if (handoff && __atomic_load_n(&g_xbox_guest_cpu_preempt,
+                                     __ATOMIC_RELAXED) > 0) {
           __atomic_add_fetch(&g_slice_handoffs, 1, __ATOMIC_RELAXED);
           /* Sleep(0) yields only to equal-priority runnable threads, which a
            * thread blocked on the lock is not; Sleep(1) is the shortest wait
@@ -6790,6 +6819,65 @@ void xbox_guest_lock_yield_now(void)
       } }
     xbox_guest_lock_acquire();
     g_slice_since = t_guest_since;   /* offered: a new slice, taken over or not */
+}
+/* Run a device's interrupt handler on this thread, between two instructions
+ * of whatever it is running, with the lifted registers saved around it.
+ * recomp_guest_spin_yield above says why this thread and why the registers. */
+static int kernel_raise_interrupt_here(uint32_t vector)
+{
+    uint32_t s_eax = g_eax, s_ecx = g_ecx, s_edx = g_edx;
+    uint32_t s_ebx = g_ebx, s_esi = g_esi, s_edi = g_edi;
+    uint32_t s_esp = g_esp, s_seh = g_seh_ebp;
+    int r = kernel_raise_interrupt_locked(vector);
+    g_eax = s_eax; g_ecx = s_ecx; g_edx = s_edx;
+    g_ebx = s_ebx; g_esi = s_esi; g_edi = s_edi;
+    g_esp = s_esp; g_seh_ebp = s_seh;
+    g_spin_isrs++;
+    return r;
+}
+/* The same offer at a loop back edge, in code lifted with --back-edge-yield
+ * (a build from source; the release builds' generated code has no back-edge
+ * calls), while some guest thread queues for the lock.
+ *
+ * In that code the function-entry hook (RECOMP_TRACE_ENTER) is emitted only
+ * for traced functions, so a busy thread kept the lock until its next
+ * blocking kernel call -- forever, in a loop that makes none. JSRF does that
+ * after a save is picked: the main thread held the lock for over twenty
+ * seconds with no kernel call, and the timer thread, which needs it to
+ * deliver the vblank and APU interrupts, stopped with it. Counted like the
+ * entry hook, so a hot loop pays a call and an increment while someone waits.
+ *
+ * At DISPATCH_LEVEL, or inside an interrupt or DPC, the console switches no
+ * threads, and DirectSound counts on that. But DISPATCH_LEVEL does not mask a
+ * device interrupt, and DirectSound counts on that too: its stop wait
+ * (0x001A308E, the load-game hang) spins at raised IRQL until the APU's
+ * handler retires the voice. So a pending APU interrupt is taken here, on
+ * this thread, at any IRQL (kernel_raise_interrupt_here), as
+ * recomp_guest_spin_yield does for the hand-edited spin of the release
+ * builds; only the thread switch waits for IRQL to drop.
+ *
+ * The slice check's own raised-IRQL rule (hand over anyway after
+ * RECOMP_SLICE_RAISED_MS) never sees a back edge, deliberately: every
+ * raised-IRQL loop has back edges, and a hand-over there lets the timer
+ * thread run a DPC partway through what the holder raised IRQL to protect.
+ *
+ * From spriteice's fork (46ffe5b, dad7b40, 5b333cf). */
+void xbox_GuestCpuPreempt(uint32_t va)
+{
+    extern unsigned g_recomp_tick;
+    extern unsigned char xbox_KeCurrentIrql(void);
+    extern int mcpx_apu_irq_pending_global(void) __attribute__((weak));
+    if (!t_guest_holds || t_in_callback) return;
+    g_lock_owner_edge = va;
+    if ((++g_recomp_tick & 0xFFu) != 0u) return;
+    g_lock_owner_irql = xbox_KeCurrentIrql();
+    if (mcpx_apu_irq_pending_global && xbox_GetConnectedInterrupt(APU_VECTOR)
+        && mcpx_apu_irq_pending_global())
+        kernel_raise_interrupt_here(APU_VECTOR);
+    if (g_lock_owner_irql < DISPATCH_LEVEL)
+        xbox_guest_lock_yield_now();
+    else
+        g_slice_held_raised++;
 }
 /* Give the guest lock up across a wait that is not a kernel call.
  *
