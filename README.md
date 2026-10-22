@@ -278,36 +278,96 @@ work this stands on.
 
 ## Building from source
 
-The generated code — hundreds of thousands of lines of C translated from the
-game's executable — is not in this repository and will not be: it is derived
-from SEGA's binary. You produce it on your own machine, from your own
-`default.xbe`, with the pipeline in [`tools/recomp`](tools/recomp) — the
-[getting-started guide](docs/GETTING_STARTED.md) walks through it (it is written
-for the toolkit in general), and `--exclude-manual port/recomp_manual.c` tells
-it about the hand-written overrides in [`port/`](port). Put the result in
-`port/recomp/gen`, then:
+The generated code — over a million lines of C translated from the game's
+executable — is not in this repository and will not be: it is derived from
+SEGA's binary. You make it on your own machine, from your own `default.xbe`
+(the standalone USA disc's, as for the downloads), with the tools in
+[`tools/`](tools), then build the engine around it. The tools run wherever
+Python does, and every platform builds from the same generated code.
 
-```sh
-cmake -S port -B build -DCMAKE_BUILD_TYPE=Release    # on Linux add -DNV2A_GL_CONTEXT=sdl
-cmake --build build
-launcher/package_mac.sh build/jsrf_recomp             # macOS: the app, zipped
-```
+1. **Get the source and Python.** You need git, CMake, a C compiler and
+   Python 3.10 or later, with one Python package,
+   [capstone](https://www.capstone-engine.org):
 
-On Linux, [`launcher/linux/package.sh`](launcher/linux/package.sh) packages the
-build and records how the release one is made. The Windows build is
-cross-compiled on Linux with [llvm-mingw](https://github.com/mstorsjo/llvm-mingw)
-and the toolchain file
+   ```sh
+   git clone https://github.com/JuMatt/JetSetRadioFuture-Unleashed.git
+   cd JetSetRadioFuture-Unleashed
+   python3 -m venv .venv
+   . .venv/bin/activate
+   pip install capstone
+   ```
+
+   On Linux, `bash tools/linux/install_deps.sh` installs the rest (Debian,
+   Ubuntu, Arch, Fedora; it asks for your password, because it installs
+   packages with `sudo`). On a Mac, Xcode's command-line tools
+   (`xcode-select --install`) and CMake are all it takes. If you open a new
+   terminal later, run `. .venv/bin/activate` again first.
+
+2. **Add your game's executable.** Copy `default.xbe` into a folder called
+   `game_files`, or take it straight from a disc image:
+
+   ```sh
+   mkdir -p game_files
+   python3 -m tools.xiso get /path/to/game.iso default.xbe -o game_files/
+   ```
+
+3. **Translate it to C.** A few minutes; the result goes in `port/recomp/gen`,
+   which git ignores (it is made from the game, so it stays on your machine):
+
+   ```sh
+   python3 -m tools.xbe_parser game_files/default.xbe --json game_files/default_analysis.json
+   python3 -m tools.disasm game_files/default.xbe
+   python3 -m tools.func_id game_files/default.xbe
+   python3 -m tools.abi_analysis game_files/default.xbe
+   python3 -m tools.recomp game_files/default.xbe --all --split 1000 --back-edge-yield \
+       --exclude-manual port/recomp_manual.c --gen-dir port/recomp/gen
+   ```
+
+   The last command should report `9333/9342 functions (0 failed)`: the other
+   nine are written by hand, in [`port/recomp_manual.c`](port/recomp_manual.c).
+
+4. **Build the engine and package it.** On Linux:
+
+   ```sh
+   cmake -S port -B build -DCMAKE_BUILD_TYPE=Release -DNV2A_GL_CONTEXT=sdl
+   cmake --build build -j"$(nproc)"
+   launcher/linux/package.sh build/jsrf_recomp "$(pkg-config --variable=libdir sdl2)/libSDL2-2.0.so.0"
+   ```
+
+   That makes `JSRF-Unleashed-linux-x86_64.tar.gz`, which works like the
+   download (see [Installing on Linux](#installing-on-linux)). It uses your
+   system's SDL2, so it is for the machine that built it; the release recipe
+   at the top of [`launcher/linux/package.sh`](launcher/linux/package.sh) makes
+   one that runs elsewhere too. On a Mac:
+
+   ```sh
+   cmake -S port -B build -DCMAKE_BUILD_TYPE=Release
+   cmake --build build -j"$(sysctl -n hw.ncpu)"
+   launcher/package_mac.sh build/jsrf_recomp
+   ```
+
+   which makes the app, zipped.
+
+The other platforms take the same `port/recomp/gen`. For Android, see
+[launcher/android/README.md](launcher/android/README.md): the NDK, SDL 2.32's
+source and [`launcher/android/build_apk.sh`](launcher/android/build_apk.sh)
+make the `.apk`, with no Gradle. For iPhone and iPad, see
+[docs/ios.md](docs/ios.md) (Xcode's iOS SDK, the same CMake project,
+[`launcher/ios/package_ios.sh`](launcher/ios/package_ios.sh) for the `.ipa`).
+The Windows build is cross-compiled on Linux with
+[llvm-mingw](https://github.com/mstorsjo/llvm-mingw) and the toolchain file
 [`launcher/windows/llvm-mingw.cmake`](launcher/windows/llvm-mingw.cmake);
 [`launcher/windows/package.sh`](launcher/windows/package.sh) packages it and
-records the rest (SDL2, libepoxy). For iPhone and iPad, see
-[docs/ios.md](docs/ios.md) (Xcode's iOS SDK, the same CMake project,
-[`launcher/ios/package_ios.sh`](launcher/ios/package_ios.sh) for the `.ipa`); for
-Android, [launcher/android/README.md](launcher/android/README.md) (the NDK, SDL
-2.32's source, [`launcher/android/build_apk.sh`](launcher/android/build_apk.sh)
-for the `.apk`, no Gradle).
-How the Mac and iPhone renderer works is in
-[docs/metal-backend.md](docs/metal-backend.md). The version comes from the git
-tag the tree is at.
+records the rest (SDL2, libepoxy). How the Mac and iPhone renderer works is in
+[docs/metal-backend.md](docs/metal-backend.md), and the toolkit itself in the
+[getting-started guide](docs/GETTING_STARTED.md). The version comes from the
+git tag the tree is at.
+
+The downloads up to 0.5.3 were built from code that an earlier version of
+these tools generated, with two tables of functions its discovery pass had
+missed (`recomp_seeded.c` and `recomp_holes.c`, see `port/recomp_manual.c`).
+Today's tools find those functions themselves, and a build whose generated
+code has neither file gets empty tables in their place.
 
 ## Legality
 
