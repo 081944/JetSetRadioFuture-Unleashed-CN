@@ -87,6 +87,23 @@ add_subdirectory("${JSRF_REPO}" "${CMAKE_BINARY_DIR}/xboxrecomp")
 
 file(GLOB JSRF_GEN_SOURCES CONFIGURE_DEPENDS "${JSRF_GEN_DIR}/*.c")
 
+# The release builds' generated code carries two tables of functions an
+# earlier discovery pass missed (recomp_seeded.c, recomp_holes.c; see
+# recomp_manual.c). Code generated with today's tools/recomp has neither:
+# empty ones stand in, so both kinds of generated code build.
+set(JSRF_TABLES_NONE "")
+if(NOT EXISTS "${JSRF_GEN_DIR}/recomp_seeded.c")
+    list(APPEND JSRF_TABLES_NONE JSRF_NO_SEEDED)
+endif()
+if(NOT EXISTS "${JSRF_GEN_DIR}/recomp_holes.c")
+    list(APPEND JSRF_TABLES_NONE JSRF_NO_HOLES)
+endif()
+if(JSRF_TABLES_NONE)
+    list(APPEND JSRF_GEN_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/recomp_tables_none.c")
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/recomp_tables_none.c"
+        PROPERTIES COMPILE_DEFINITIONS "${JSRF_TABLES_NONE}")
+endif()
+
 if(ANDROID)
     # Android: the engine is libmain.so, which SDL's Java side loads and whose
     # SDL_main it calls (main.c; android/jsrf_android.c sets the scene). The
