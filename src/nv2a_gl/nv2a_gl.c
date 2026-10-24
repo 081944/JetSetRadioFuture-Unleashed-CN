@@ -3960,6 +3960,16 @@ static void dump_fbo(uint32_t rt, const char *prefix, int *counter, int limit)
                   if (z >= 1.0f) { at1++; continue; }
                   h[(int)(z * 10.0f) % 10]++;
               }
+              /* And what a w-buffered frame's depths are in the title's own
+               * units (w = depth x 2^24): the spread of a sample of them. */
+              { static float smp[4096]; uint32_t ns = 0, step = np / 4096 + 1, a, b;
+                for (j = 0; j < np && ns < 4096; j += step) if (zb[j] < 1.0f) smp[ns++] = zb[j];
+                for (a = 1; a < ns; a++) { float v = smp[a]; for (b = a; b > 0 && smp[b-1] > v; b--) smp[b] = smp[b-1]; smp[b] = v; }
+                if (ns) fprintf(stderr, "  [GL] depth as w (x 2^24): 1%% %.2f, 10%% %.2f, median %.2f, "
+                                "90%% %.2f, 99%% %.2f (%u samples)\n",
+                                smp[ns / 100] * 16777216.0, smp[ns / 10] * 16777216.0,
+                                smp[ns / 2] * 16777216.0, smp[ns * 9 / 10] * 16777216.0,
+                                smp[ns * 99 / 100] * 16777216.0, ns); }
               snprintf(nm, sizeof nm, "%s%03d_z.bmp", prefix, *counter - 1);
               write_bmp(nm, buf, pw, ph);
               fprintf(stderr, "  [GL] wrote %s -- %u px at the far plane "
@@ -9403,6 +9413,12 @@ static void present(int is_frame)
                     : dump_3d ? S.draws_3d >= dump_3d
                     : S.flips >= dump_after)
                 && (S.flips % dump_every) == 0;
+        /* RECOMP_GL_DUMP_SECS=<s>: none before s seconds into the run --
+         * flips are no clock, a loading screen runs hundreds a second. */
+        { static double t0 = -1.0, after_s = -1.0;
+          if (t0 < 0.0) { const char *v = getenv("RECOMP_GL_DUMP_SECS");
+                          t0 = mono_now(); after_s = v ? atof(v) : 0.0; }
+          if (dump_due && after_s > 0.0 && mono_now() - t0 < after_s) dump_due = 0; }
 
         if (!dump_due && (!every || (S.flips % (uint32_t)every) != 0)) {
             S.flips++;
