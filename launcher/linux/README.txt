@@ -63,6 +63,9 @@ Keyboard (by key position, so W A S D on QWERTY is Z Q S D on AZERTY):
   F9                  resolution: the game is drawn at 1x to 4x the Xbox's
                       640x480 (2x by default), up to 2560x1920; remembered.
                       The game restarts to apply it, so save first.
+  F8                  anti-aliasing: SMAA (a quick pass over each finished
+                      frame) and MSAA 2x, 4x or 8x (every edge drawn with
+                      that many samples a pixel), either or both; remembered
 
 
 Where things are kept

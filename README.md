@@ -67,9 +67,10 @@ Each run writes `last-run.log` into the game folder (with a few older ones in
 It needs graphics drivers with OpenGL 3.3, which any GPU from the last ten
 years has. The **Video** menu at the top of the window sets the resolution,
 from 1× to 4× the Xbox's 640×480 (2× by default; the game restarts to apply
-it), widescreen 16:9 and full screen; the first two are remembered. The same
-are on **F9**, **F10** and **F11** (or Alt+Enter), which also work in full
-screen, where the menu is hidden.
+it), the anti-aliasing (SMAA, MSAA 2× to 8×, or both), widescreen 16:9 and
+full screen; all but full screen are remembered. The same are on **F9**,
+**F8**, **F10** and **F11** (or Alt+Enter), which also work in full screen,
+where the menu is hidden.
 Controllers work through SDL: Xbox, PlayStation, Switch Pro and many more.
 Saves are kept in the game folder, in `UDATA`, as on the Mac. The
 `README.txt` inside lists the options and where the settings and logs
@@ -145,7 +146,8 @@ A controller is the way to play (any one iOS supports: Xbox, PlayStation,
 MFi, Backbone and the like). Without one, the app shows on-screen controls,
 with Start and Back at the top. The ⚙ button has the picture (**16:9**, the
 default; **Fill the screen**, the game widened to the whole of an iPhone's
-screen; or the console's **4:3**), the on-screen controls and the resolution.
+screen; or the console's **4:3**), the on-screen controls, the resolution
+and the anti-aliasing (SMAA, MSAA, or both).
 Saves are kept inside the game's folder (in
 `UDATA`), so deleting or replacing that folder deletes them too; each run's log
 is in `Logs`.
@@ -194,8 +196,9 @@ OpenGL 3.3 drivers and an X11 or Wayland desktop; SDL2 is bundled. The
 and where settings, saves and logs are kept.
 
 On Linux the keyboard layout is the same as below; **F11** (or Alt+Return)
-toggles full screen, **F10** widescreen, and **F9** sets the resolution (1× to
-4×; the game restarts to apply it).
+toggles full screen, **F10** widescreen, **F9** sets the resolution (1× to
+4×; the game restarts to apply it) and **F8** the anti-aliasing (SMAA, MSAA,
+or both).
 
 ### Your game files
 
@@ -232,6 +235,11 @@ knows.
 **Video menu:**
 - **Resolution** — the internal resolution, 1× to 4× (2× by default). The
   game restarts to apply it.
+- **Anti-aliasing** — smooths the jagged edges, two ways that can be used
+  together. **SMAA** is a quick pass over each finished frame, on or off at
+  once. **MSAA** 2×, 4× or 8× draws every edge with that many samples a
+  pixel: cleaner, and more work for the GPU; on Metal the game restarts to
+  apply it. Both are off by default.
 - **Renderer** — Metal (the default) or OpenGL. The game restarts to apply it.
 - **Full Screen** — Ctrl ⌘ F.
 - **Widescreen (16:9)** — ⇧ ⌘ W. The game is shown at 16:9 with a wider

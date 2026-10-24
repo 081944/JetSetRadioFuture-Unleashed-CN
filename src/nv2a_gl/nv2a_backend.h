@@ -150,6 +150,11 @@ typedef struct {
     uint8_t mip;             /* 0 none (sample level 0), 1 nearest, 2 linear */
     uint8_t wrap_s, wrap_t;  /* 0 clamp to edge, 1 repeat, 2 mirrored repeat */
     uint8_t aniso;           /* 0 or 1: off */
+    /* With `mip`: how many levels tex_new's texels hold, level 0 first and
+     * each after it half the size of the one before (at least 1x1), packed
+     * one after another -- the title's own chain. 0 or 1: the base level
+     * only, and the device makes the rest of the chain itself. */
+    uint8_t levels;
 } Nv2aSampler;
 
 /* Primitive types, after the front half has expanded quads into triangles. */
@@ -380,6 +385,22 @@ typedef struct Nv2aGfx {
      * queued, 0 when there is nothing left to do. NULL where the backend
      * builds them on a thread of its own. */
     int      (*cache_idle)(double budget_ms);
+
+    /* SMAA (nv2a_smaa.h): target `rt`'s picture anti-aliased, by three
+     * passes over it into another target of the same size, which the backend
+     * keeps -- the one to put on screen instead. `rt` itself is left as it
+     * was, and is what comes back while the passes cannot run (not built
+     * yet, or they would not build). NULL where the backend has none. */
+    uint32_t (*target_smaa)(uint32_t rt);
+
+    /* Multisampling: the most samples a pixel a target can have here (1:
+     * none), and every target drawn with `n` from now on, what each holds
+     * carried across -- or, where the backend can only take a count before
+     * its first target (OpenGL ES, Metal), the count then and the one in use
+     * after. Returns the count in use, fewer than asked where the device
+     * refuses one. NULL where the backend has none. */
+    int      (*samples_max)(void);
+    int      (*samples)(int n);
 } Nv2aGfx;
 
 /* The implementations. Each returns NULL where it cannot run (no Metal
