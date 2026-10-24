@@ -964,6 +964,7 @@ static struct {
     uint32_t last_draw;     /* when this entry was last looked up */
     uint32_t tex;           /* the device's texture */
     uint32_t va, serial;    /* read from: where, and the allocation (contig_serial) */
+    uint32_t sampling;      /* how it is sampled (sampler_key): part of what it is */
     int      bias;          /* uploaded as a bump source (g_upload_bias_bg) */
     int      used;
 } g_tcache[TEX_CACHE];
@@ -3397,220 +3398,12 @@ static void tcache_verify(void)
         }
     }
 }
-static uint32_t upload_texture_inner(const TexStage *t)
+
+/* How a texture is sampled, from its stage's registers: filtering and
+ * wrapping, for `nlev` levels of the title's chain (tex_title_levels). */
+static void tex_sampler(const TexStage *t, uint32_t nlev, Nv2aSampler *out)
 {
-    uint32_t va = resolve(t->offset);
-    const uint8_t *src = guest(va);
-    uint32_t w = t->width, h = t->height, i, hash, key, bytes, nlev;
-    uint32_t tex;
-    uint8_t *rgba = NULL;
-    size_t rgba_bytes = 0;
     Nv2aSampler smp;
-    int slot = -1, stale = -1, tomb = -1;
-
-    if (!w || !h || w > 4096 || h > 4096) return 0;
-    nlev = tex_title_levels(t, w, h);
-
-    /* Same routing census as the vertex arrays, for textures: a texture at
-     * a heap VA below the arena mark is decoded from the window instead. */
-    { static int dc = -1; static uint64_t n[5]; static uint32_t said;
-      if (dc < 0) dc = getenv("RECOMP_GL_DMACENSUS") ? 1 : 0;
-      if (dc) {
-          uint32_t off = t->offset, mark = xbox_ContiguousAllocatedBytes(); int cls;
-          if (off & 0x80000000u)      cls = 0;
-          else if (off < GL_HEAP_BASE) cls = off < mark ? 1 : 4;
-          else                         cls = off < mark ? 2 : 3;
-          n[cls]++;
-          if (++said % 2000 == 0)
-              fprintf(stderr, "  [DMA] texture uploads by route: bit31 %llu, contiguous %llu, "
-                              "HEAP-BELOW-MARK %llu, heap-above-mark %llu, low-above-mark %llu\n",
-                      (unsigned long long)n[0], (unsigned long long)n[1],
-                      (unsigned long long)n[2], (unsigned long long)n[3],
-                      (unsigned long long)n[4]);
-      } }
-
-    /* Cache on where it came from and what it looks like: the sample, at every
-     * lookup, and the whole content once in a while (tcache_verify).
-     *
-     * A changed texture is uploaded over its old entry; a new entry would
-     * leave the old picture behind, never looked up again, until the table
-     * filled. The one exception is an old picture this frame has drawn: a
-     * title that puts two pictures through one place within a frame keeps an
-     * entry for each. */
-    bytes = tex_bytes(t->color, w, h);
-    hash = tex_sample(t->color, src, bytes, g_upload_bias_bg);
-    key = (t->offset ^ (w << 16) ^ (h << 4) ^ t->color) * 2246822519u;
-    for (i = 0; i < TEX_CACHE; i++) {
-        uint32_t k = (key + i) % TEX_CACHE;
-        if (g_tcache[k].used && g_tcache[k].offset == t->offset
-         && g_tcache[k].format == t->color && g_tcache[k].w == w
-         && g_tcache[k].h == h && g_tcache[k].bias == g_upload_bias_bg
-         && g_tcache[k].levels == nlev) {
-            if (g_tcache[k].hash != hash) {
-                /* The sample changed. Not this frame's: upload over it,
-                 * unless a later entry already holds the new picture. */
-                if (stale < 0 && g_tcache[k].drawn != S.flips) stale = (int)k;
-                continue;
-            }
-            g_tcache[k].drawn = S.flips;
-            g_tcache[k].last_draw = S.draws;
-            return g_tcache[k].tex;
-        }
-        if (!g_tcache[k].used) { slot = (int)k; break; }
-        if (!g_tcache[k].tex && tomb < 0) tomb = (int)k;   /* see tcache_drop */
-    }
-    if (stale >= 0) slot = stale;
-    else if (tomb >= 0) slot = tomb;
-    if (slot < 0) {
-        /* Full: evict, but never something this draw is still using. Four
-         * texture stages can be bound at once, so anything touched within the
-         * last few lookups is live. */
-        uint32_t best = key % TEX_CACHE, oldest = 0xFFFFFFFFu;
-        for (i = 0; i < 16; i++) {
-            uint32_t k = (key + i * 37u) % TEX_CACHE;
-            if (S.draws - g_tcache[k].last_draw < 8) continue;
-            if (g_tcache[k].last_draw < oldest) { oldest = g_tcache[k].last_draw;
-                                                  best = k; }
-        }
-        slot = (int)best;
-    }
-
-    /* RECOMP_GL_TEXLOG_SEC=<s>: every texture uploaded (a cache miss) from
-     * s seconds on -- where, what size and format -- to find the texture a
-     * newly appearing object is drawn with. */
-    { static int on = -1; static double from, t0; static int n;
-      if (on < 0) { const char *v = getenv("RECOMP_GL_TEXLOG_SEC");
-                    on = v ? 1 : 0; from = v ? atof(v) : 0; t0 = mono_now(); }
-      if (on && n < 400 && mono_now() - t0 >= from) {
-          n++;
-          fprintf(stderr, "[TEXUP] draw %u flip %u: %08X %ux%u fmt %02X pitch %u (draw uses prog %s)\n",
-                  S.draws, S.flips, t->offset, w, h, t->color, t->pitch,
-                  S.xf_mode == NV2A_XF_MODE_FIXED ? "ff" : "vp");
-      } }
-    /* Until the new texture exists the slot holds nothing. */
-    tcache_drop((uint32_t)slot);
-
-    /* Level 0, and the rest of the title's chain after it when it has one
-     * (tex_title_levels): each level decoded as the base is, from where the
-     * last one ended, into one buffer level after level. */
-    {
-        uint32_t l, wl = w, hl = h;
-        size_t so = 0, dof = 0;
-        for (l = 0; l < nlev; l++) {
-            rgba_bytes += (size_t)wl * hl * 4;
-            wl = wl > 1 ? wl / 2 : 1;
-            hl = hl > 1 ? hl / 2 : 1;
-        }
-        rgba = (uint8_t *)malloc(rgba_bytes);
-        if (!rgba) return 0;
-        for (l = 0, wl = w, hl = h; l < nlev; l++) {
-            if (!decode_level(t->color, src + so, wl, hl, t->pitch, rgba + dof)) {
-                /* Say so: a texture in a format this cannot decode draws as
-                 * nothing (or black), and it is otherwise invisible in every
-                 * log. Once per distinct format and size, then a count. */
-                static uint32_t seen[32]; static int nseen; static unsigned long total;
-                uint32_t k = (t->color << 16) ^ (w << 4) ^ h; int q, found = 0;
-                total++;
-                for (q = 0; q < nseen; q++) if (seen[q] == k) { found = 1; break; }
-                if (!found && nseen < 32) {
-                    seen[nseen++] = k;
-                    fprintf(stderr, "  [GL] TEXTURE FORMAT %02X NOT DECODED: %ux%u at %08X "
-                            "(pitch %u, draw %u; %lu such uploads so far)\n",
-                            t->color, w, h, t->offset, t->pitch, S.draws, total);
-                }
-                free(rgba);
-                return 0;
-            }
-            so  += tex_bytes(t->color, wl, hl);
-            dof += (size_t)wl * hl * 4;
-            wl = wl > 1 ? wl / 2 : 1;
-            hl = hl > 1 ? hl / 2 : 1;
-        }
-        tex_alpha_census(rgba, w, h, t->color, fmt_is_dxt(t->color));
-        /* How much of the city has a chain, once a while: uploads with one,
-         * and the levels they carried. */
-        { static unsigned long n, with, lv;
-          n++;
-          if (nlev > 1) { with++; lv += nlev; }
-          if (n == 200 || n % 2000 == 0)
-              fprintf(stderr, "  [GL] mipmaps: %lu of %lu textures uploaded with the title's own "
-                              "chain (%.1f levels each)\n", with, n, with ? (double)lv / with : 0.0); }
-    }
-    /* RECOMP_GL_DUMP_TEX=<prefix>: every texture as uploaded. A frame that
-     * shades to black is either sampling the wrong place or sampling a black
-     * texture, and nothing short of looking at the texture separates them. */
-    {
-        static int shots;
-        static const char *pfx; static int init; static uint32_t after3d;
-        if (!init) { init = 1; pfx = getenv("RECOMP_GL_DUMP_TEX");
-                     { const char *a = getenv("RECOMP_GL_DUMP_TEX_3D");
-                       after3d = a ? (uint32_t)strtoul(a, 0, 0) : 0; } }
-        /* RECOMP_GL_DUMP_TEX_OFF=<hex>: only the texture at this address. A
-         * scene uploads hundreds, and the one worth looking at is usually a
-         * particular address that showed up in a draw dump. */
-        { static uint32_t only[8]; static int oinit, nonly;
-          int hit = 0, q;
-          if (!oinit) { const char *o = getenv("RECOMP_GL_DUMP_TEX_OFF");
-                        oinit = 1;
-                        /* A comma-separated list now: "0250F000,02512000". */
-                        while (o && *o && nonly < 8) {
-                            char *e; only[nonly++] = (uint32_t)strtoul(o, &e, 16);
-                            o = (*e == ',') ? e + 1 : NULL;
-                        } }
-          for (q = 0; q < nonly; q++) if (t->offset == only[q]) hit = 1;
-        if (pfx && shots < 24 && S.draws_3d >= after3d
-            && (!nonly || hit)) {
-            uint8_t *back = (uint8_t *)malloc((size_t)w * h * 4);
-            if (back) {
-                char nm[128]; FILE *f; uint32_t x, y, row, sz, nz = 0;
-                uint8_t hdr[54];
-                /* What is being uploaded, as BGRA: the same bytes the
-                 * device gets, without asking it for them back. */
-                for (x = 0; x < w * h; x++) {
-                    back[x*4+0] = rgba[x*4+2]; back[x*4+1] = rgba[x*4+1];
-                    back[x*4+2] = rgba[x*4+0]; back[x*4+3] = rgba[x*4+3];
-                }
-                for (x = 0; x < w * h; x++)
-                    if (back[x*4] | back[x*4+1] | back[x*4+2]) nz++;
-                snprintf(nm, sizeof nm, "%s%02d_%08X_f%02X_%ux%u.bmp",
-                         pfx, shots++, t->offset, t->color, w, h);
-                f = fopen(nm, "wb");
-                if (f) {
-                    row = (w * 3 + 3) & ~3u; sz = 54 + row * h;
-                    memset(hdr, 0, sizeof hdr);
-                    hdr[0]='B'; hdr[1]='M'; memcpy(hdr+2,&sz,4);
-                    { uint32_t o=54; memcpy(hdr+10,&o,4); }
-                    { uint32_t n=40; memcpy(hdr+14,&n,4); }
-                    memcpy(hdr+18,&w,4); memcpy(hdr+22,&h,4);
-                    hdr[26]=1; hdr[28]=24;
-                    fwrite(hdr,1,sizeof hdr,f);
-                    for (y = 0; y < h; y++) {
-                        const uint8_t *r = back + (size_t)(h-1-y) * w * 4;
-                        uint8_t pad[3] = {0,0,0};
-                        for (x = 0; x < w; x++) fwrite(r + x*4, 1, 3, f);
-                        fwrite(pad, 1, row - w*3, f);
-                    }
-                    fclose(f);
-                    fprintf(stderr, "  [GL] texture %s (%u non-black)\n", nm, nz);
-                }
-                /* And its alpha, as grey: a texture that decodes with alpha
-                 * one everywhere draws opaque where the title meant soft. */
-                { char na[144]; snprintf(na, sizeof na, "%s_a.bmp", nm);
-                  f = fopen(na, "wb");
-                  if (f) {
-                      fwrite(hdr, 1, sizeof hdr, f);
-                      for (y = 0; y < h; y++) {
-                          const uint8_t *r = back + (size_t)(h-1-y) * w * 4;
-                          uint8_t pad[3] = {0,0,0}, px[3];
-                          for (x = 0; x < w; x++) { px[0] = px[1] = px[2] = r[x*4+3]; fwrite(px, 1, 3, f); }
-                          fwrite(pad, 1, row - w*3, f);
-                      }
-                      fclose(f);
-                  } }
-                free(back);
-            }
-        } }
-    }
     /*
      * Filtering, as the title asked for it.
      *
@@ -3716,7 +3509,259 @@ static uint32_t upload_texture_inner(const TexStage *t)
     { static const uint8_t wrap_of[8] = { 0, 1, 2, 0, 0, 0, 0, 0 };
       smp.wrap_s = wrap_of[t->addr & 7u];
       smp.wrap_t = wrap_of[(t->addr >> 8) & 7u]; }
+    *out = smp;
+}
 
+/*
+ * The sampler as one number, for the texture cache to tell two apart.
+ *
+ * A device texture is made with its sampling (Nv2aSampler) and keeps it, so
+ * the cache has to treat one picture sampled two ways as two textures. It did
+ * not: whichever draw uploaded a texture first fixed its wrapping and filtering
+ * for every draw after it. The characters are shaded through one shared
+ * texture of tone ramps -- a coordinate from the light on the surface picks
+ * the tone -- which some of their materials address clamped and some wrapped.
+ * A ramp read past its end then came back from the far side of the picture
+ * where the title asked for its edge, or the other way round, depending on
+ * which material happened to be drawn first in the session: a face or an arm
+ * in another material's tones.
+ */
+static uint32_t sampler_key(const Nv2aSampler *s)
+{
+    return (uint32_t)s->min_linear | (uint32_t)s->mag_linear << 1 | (uint32_t)(s->mip & 3) << 2
+         | (uint32_t)(s->wrap_s & 3) << 4 | (uint32_t)(s->wrap_t & 3) << 6 | (uint32_t)s->aniso << 8
+         | (uint32_t)s->levels << 16;
+}
+
+static uint32_t upload_texture_inner(const TexStage *t)
+{
+    uint32_t va = resolve(t->offset);
+    const uint8_t *src = guest(va);
+    uint32_t w = t->width, h = t->height, i, hash, key, bytes, nlev, sampling;
+    int other_sampling = 0;
+    uint32_t tex;
+    uint8_t *rgba = NULL;
+    size_t rgba_bytes = 0;
+    Nv2aSampler smp;
+    int slot = -1, stale = -1, tomb = -1;
+
+    if (!w || !h || w > 4096 || h > 4096) return 0;
+    nlev = tex_title_levels(t, w, h);
+    tex_sampler(t, nlev, &smp);
+    sampling = sampler_key(&smp);
+    /* RECOMP_GL_TEX_ONESAMPLER=1: one texture however it is sampled -- the
+     * first draw's sampling for all -- as before, to compare (=ab: every
+     * other displayed frame, from textures of their own). */
+    { static int one = -1;
+      if (one < 0) { const char *v = getenv("RECOMP_GL_TEX_ONESAMPLER");
+                     one = !v ? 0 : (*v == 'a' || *v == 'A') ? 2 : 1; }
+      if (one == 1 || (one == 2 && (S.frames & 1u))) sampling = 0x80000000u; }
+
+    /* Same routing census as the vertex arrays, for textures: a texture at
+     * a heap VA below the arena mark is decoded from the window instead. */
+    { static int dc = -1; static uint64_t n[5]; static uint32_t said;
+      if (dc < 0) dc = getenv("RECOMP_GL_DMACENSUS") ? 1 : 0;
+      if (dc) {
+          uint32_t off = t->offset, mark = xbox_ContiguousAllocatedBytes(); int cls;
+          if (off & 0x80000000u)      cls = 0;
+          else if (off < GL_HEAP_BASE) cls = off < mark ? 1 : 4;
+          else                         cls = off < mark ? 2 : 3;
+          n[cls]++;
+          if (++said % 2000 == 0)
+              fprintf(stderr, "  [DMA] texture uploads by route: bit31 %llu, contiguous %llu, "
+                              "HEAP-BELOW-MARK %llu, heap-above-mark %llu, low-above-mark %llu\n",
+                      (unsigned long long)n[0], (unsigned long long)n[1],
+                      (unsigned long long)n[2], (unsigned long long)n[3],
+                      (unsigned long long)n[4]);
+      } }
+
+    /* Cache on where it came from and what it looks like: the sample, at every
+     * lookup, and the whole content once in a while (tcache_verify).
+     *
+     * A changed texture is uploaded over its old entry; a new entry would
+     * leave the old picture behind, never looked up again, until the table
+     * filled. The one exception is an old picture this frame has drawn: a
+     * title that puts two pictures through one place within a frame keeps an
+     * entry for each. */
+    bytes = tex_bytes(t->color, w, h);
+    hash = tex_sample(t->color, src, bytes, g_upload_bias_bg);
+    key = (t->offset ^ (w << 16) ^ (h << 4) ^ t->color) * 2246822519u;
+    for (i = 0; i < TEX_CACHE; i++) {
+        uint32_t k = (key + i) % TEX_CACHE;
+        if (g_tcache[k].used && g_tcache[k].offset == t->offset
+         && g_tcache[k].format == t->color && g_tcache[k].w == w
+         && g_tcache[k].h == h && g_tcache[k].bias == g_upload_bias_bg
+         && g_tcache[k].levels == nlev && g_tcache[k].sampling == sampling) {
+            if (g_tcache[k].hash != hash) {
+                /* The sample changed. Not this frame's: upload over it,
+                 * unless a later entry already holds the new picture. */
+                if (stale < 0 && g_tcache[k].drawn != S.flips) stale = (int)k;
+                continue;
+            }
+            g_tcache[k].drawn = S.flips;
+            g_tcache[k].last_draw = S.draws;
+            return g_tcache[k].tex;
+        }
+        if (g_tcache[k].used && g_tcache[k].offset == t->offset && g_tcache[k].format == t->color
+         && g_tcache[k].w == w && g_tcache[k].h == h && g_tcache[k].sampling != sampling)
+            other_sampling = 1;
+        if (!g_tcache[k].used) { slot = (int)k; break; }
+        if (!g_tcache[k].tex && tomb < 0) tomb = (int)k;   /* see tcache_drop */
+    }
+    if (stale >= 0) slot = stale;
+    else if (tomb >= 0) slot = tomb;
+    if (slot < 0) {
+        /* Full: evict, but never something this draw is still using. Four
+         * texture stages can be bound at once, so anything touched within the
+         * last few lookups is live. */
+        uint32_t best = key % TEX_CACHE, oldest = 0xFFFFFFFFu;
+        for (i = 0; i < 16; i++) {
+            uint32_t k = (key + i * 37u) % TEX_CACHE;
+            if (S.draws - g_tcache[k].last_draw < 8) continue;
+            if (g_tcache[k].last_draw < oldest) { oldest = g_tcache[k].last_draw;
+                                                  best = k; }
+        }
+        slot = (int)best;
+    }
+
+    /* RECOMP_GL_TEXLOG_SEC=<s>: every texture uploaded (a cache miss) from
+     * s seconds on -- where, what size and format -- to find the texture a
+     * newly appearing object is drawn with. */
+    { static int on = -1; static double from, t0; static int n;
+      if (on < 0) { const char *v = getenv("RECOMP_GL_TEXLOG_SEC");
+                    on = v ? 1 : 0; from = v ? atof(v) : 0; t0 = mono_now(); }
+      if (on && n < 400 && mono_now() - t0 >= from) {
+          n++;
+          fprintf(stderr, "[TEXUP] draw %u flip %u: %08X %ux%u fmt %02X pitch %u (draw uses prog %s)\n",
+                  S.draws, S.flips, t->offset, w, h, t->color, t->pitch,
+                  S.xf_mode == NV2A_XF_MODE_FIXED ? "ff" : "vp");
+      } }
+    /* Until the new texture exists the slot holds nothing. */
+    tcache_drop((uint32_t)slot);
+
+    /* Level 0, and the rest of the title's chain after it when it has one
+     * (tex_title_levels): each level decoded as the base is, from where the
+     * last one ended, into one buffer level after level. */
+    {
+        uint32_t l, wl = w, hl = h;
+        size_t so = 0, dof = 0;
+        for (l = 0; l < nlev; l++) {
+            rgba_bytes += (size_t)wl * hl * 4;
+            wl = wl > 1 ? wl / 2 : 1;
+            hl = hl > 1 ? hl / 2 : 1;
+        }
+        rgba = (uint8_t *)malloc(rgba_bytes);
+        if (!rgba) return 0;
+        for (l = 0, wl = w, hl = h; l < nlev; l++) {
+            if (!decode_level(t->color, src + so, wl, hl, t->pitch, rgba + dof)) {
+                /* Say so: a texture in a format this cannot decode draws as
+                 * nothing (or black), and it is otherwise invisible in every
+                 * log. Once per distinct format and size, then a count. */
+                static uint32_t seen[32]; static int nseen; static unsigned long total;
+                uint32_t k = (t->color << 16) ^ (w << 4) ^ h; int q, found = 0;
+                total++;
+                for (q = 0; q < nseen; q++) if (seen[q] == k) { found = 1; break; }
+                if (!found && nseen < 32) {
+                    seen[nseen++] = k;
+                    fprintf(stderr, "  [GL] TEXTURE FORMAT %02X NOT DECODED: %ux%u at %08X "
+                            "(pitch %u, draw %u; %lu such uploads so far)\n",
+                            t->color, w, h, t->offset, t->pitch, S.draws, total);
+                }
+                free(rgba);
+                return 0;
+            }
+            so  += tex_bytes(t->color, wl, hl);
+            dof += (size_t)wl * hl * 4;
+            wl = wl > 1 ? wl / 2 : 1;
+            hl = hl > 1 ? hl / 2 : 1;
+        }
+        tex_alpha_census(rgba, w, h, t->color, fmt_is_dxt(t->color));
+        /* How much of the city has a chain, once a while: uploads with one,
+         * and the levels they carried. */
+        { static unsigned long n, with, lv, twice;
+          n++;
+          if (nlev > 1) { with++; lv += nlev; }
+          if (other_sampling) twice++;
+          if (n == 200 || n % 2000 == 0)
+              fprintf(stderr, "  [GL] mipmaps: %lu of %lu textures uploaded with the title's own "
+                              "chain (%.1f levels each); %lu a second time, sampled another way\n",
+                      with, n, with ? (double)lv / with : 0.0, twice); }
+    }
+    /* RECOMP_GL_DUMP_TEX=<prefix>: every texture as uploaded. A frame that
+     * shades to black is either sampling the wrong place or sampling a black
+     * texture, and nothing short of looking at the texture separates them. */
+    {
+        static int shots;
+        static const char *pfx; static int init; static uint32_t after3d;
+        if (!init) { init = 1; pfx = getenv("RECOMP_GL_DUMP_TEX");
+                     { const char *a = getenv("RECOMP_GL_DUMP_TEX_3D");
+                       after3d = a ? (uint32_t)strtoul(a, 0, 0) : 0; } }
+        /* RECOMP_GL_DUMP_TEX_OFF=<hex>: only the texture at this address. A
+         * scene uploads hundreds, and the one worth looking at is usually a
+         * particular address that showed up in a draw dump. */
+        { static uint32_t only[8]; static int oinit, nonly;
+          int hit = 0, q;
+          if (!oinit) { const char *o = getenv("RECOMP_GL_DUMP_TEX_OFF");
+                        oinit = 1;
+                        /* A comma-separated list now: "0250F000,02512000". */
+                        while (o && *o && nonly < 8) {
+                            char *e; only[nonly++] = (uint32_t)strtoul(o, &e, 16);
+                            o = (*e == ',') ? e + 1 : NULL;
+                        } }
+          for (q = 0; q < nonly; q++) if (t->offset == only[q]) hit = 1;
+        if (pfx && shots < 24 && S.draws_3d >= after3d
+            && (!nonly || hit)) {
+            uint8_t *back = (uint8_t *)malloc((size_t)w * h * 4);
+            if (back) {
+                char nm[128]; FILE *f; uint32_t x, y, row, sz, nz = 0;
+                uint8_t hdr[54];
+                /* What is being uploaded, as BGRA: the same bytes the
+                 * device gets, without asking it for them back. */
+                for (x = 0; x < w * h; x++) {
+                    back[x*4+0] = rgba[x*4+2]; back[x*4+1] = rgba[x*4+1];
+                    back[x*4+2] = rgba[x*4+0]; back[x*4+3] = rgba[x*4+3];
+                }
+                for (x = 0; x < w * h; x++)
+                    if (back[x*4] | back[x*4+1] | back[x*4+2]) nz++;
+                snprintf(nm, sizeof nm, "%s%02d_%08X_f%02X_%ux%u.bmp",
+                         pfx, shots++, t->offset, t->color, w, h);
+                f = fopen(nm, "wb");
+                if (f) {
+                    row = (w * 3 + 3) & ~3u; sz = 54 + row * h;
+                    memset(hdr, 0, sizeof hdr);
+                    hdr[0]='B'; hdr[1]='M'; memcpy(hdr+2,&sz,4);
+                    { uint32_t o=54; memcpy(hdr+10,&o,4); }
+                    { uint32_t n=40; memcpy(hdr+14,&n,4); }
+                    memcpy(hdr+18,&w,4); memcpy(hdr+22,&h,4);
+                    hdr[26]=1; hdr[28]=24;
+                    fwrite(hdr,1,sizeof hdr,f);
+                    for (y = 0; y < h; y++) {
+                        const uint8_t *r = back + (size_t)(h-1-y) * w * 4;
+                        uint8_t pad[3] = {0,0,0};
+                        for (x = 0; x < w; x++) fwrite(r + x*4, 1, 3, f);
+                        fwrite(pad, 1, row - w*3, f);
+                    }
+                    fclose(f);
+                    fprintf(stderr, "  [GL] texture %s (%u non-black)\n", nm, nz);
+                }
+                /* And its alpha, as grey: a texture that decodes with alpha
+                 * one everywhere draws opaque where the title meant soft. */
+                { char na[144]; snprintf(na, sizeof na, "%s_a.bmp", nm);
+                  f = fopen(na, "wb");
+                  if (f) {
+                      fwrite(hdr, 1, sizeof hdr, f);
+                      for (y = 0; y < h; y++) {
+                          const uint8_t *r = back + (size_t)(h-1-y) * w * 4;
+                          uint8_t pad[3] = {0,0,0}, px[3];
+                          for (x = 0; x < w; x++) { px[0] = px[1] = px[2] = r[x*4+3]; fwrite(px, 1, 3, f); }
+                          fwrite(pad, 1, row - w*3, f);
+                      }
+                      fclose(f);
+                  } }
+                free(back);
+            }
+        } }
+    }
     tex = G->tex_new(w, h, rgba, &smp);
     free(rgba);
     if (!tex) return 0;
@@ -3729,6 +3774,7 @@ static uint32_t upload_texture_inner(const TexStage *t)
     g_tcache[slot].offset = t->offset; g_tcache[slot].format = t->color;
     g_tcache[slot].w = w; g_tcache[slot].h = h; g_tcache[slot].pitch = t->pitch;
     g_tcache[slot].levels = nlev;
+    g_tcache[slot].sampling = sampling;
     g_tcache[slot].hash = hash; g_tcache[slot].tex = tex;
     g_tcache[slot].bias = g_upload_bias_bg;
     g_tcache[slot].va = va; g_tcache[slot].serial = contig_serial(va);
