@@ -131,6 +131,7 @@ typedef struct {
     id<MTLFunction> vf, ff;
     uint64_t        uses;      /* bit per Nv2aUniformId the source reads */
     uint64_t        skey;      /* the shader cache's key for its sources, 0 none */
+    uint32_t        sid;       /* the renderer's key for the state it was made from, 0 none */
     uint32_t        gen;       /* changes each time the slot is reused */
     int             used;
 } MtlProg;
@@ -885,6 +886,11 @@ static uint32_t mtl_prog_new(const char *vsrc, const char *fsrc, const char *wha
         g_prog[i].ff = ff;
     }
     g_prog[i].skey = key;
+    {   /* the state it was translated from, to file its blend recipes under
+         * (the shader seed: nv2a_gl.c) */
+        extern uint32_t nv2a_seed_building_id(void);
+        g_prog[i].sid = nv2a_seed_building_id();
+    }
     g_prog[i].uses = uniforms_used(vsrc, fsrc);
     g_prog[i].gen = ++g_prog_gen;
     g_prog[i].used = 1;
@@ -1139,6 +1145,10 @@ static id<MTLRenderPipelineState> pso_for(uint32_t prog)
         if (e->key == key) return e->pso;
         if (!e->key) break;
     }
+    /* The first use of this pair this run: kept with the state the program was
+     * made from, so that a later start -- here, or anywhere the engine's list
+     * of states goes -- can build the pipeline before it is needed. */
+    if (p->sid) nv2a_sc_state_recipe(p->sid, recipe);
     {
         int ahead = 0;
         pso = p->skey ? warm_pso_get(p->skey, recipe, &ahead) : nil;

@@ -698,6 +698,16 @@ static int host_main(void)
 
     printf("=== JSRF Unleashed %s -- Jet Set Radio Future, statically recompiled ===\n",
            JSRF_VERSION);
+    {
+        /* The shaders the game draws with, collected by playing it, for the
+         * renderer to build ahead (src/nv2a_gl/nv2a_gl.c, seed_import; the
+         * bytes are port/shader_seed.dat, made into shader_seed.c by
+         * port/CMakeLists.txt). */
+        extern const unsigned char jsrf_shader_seed[];
+        extern const size_t jsrf_shader_seed_len;
+        extern void nv2a_set_shader_seed(const void *data, size_t len);
+        nv2a_set_shader_seed(jsrf_shader_seed, jsrf_shader_seed_len);
+    }
     printf("Loading XBE...\n");
 
     /* Install VEH handler (first handler in chain) */

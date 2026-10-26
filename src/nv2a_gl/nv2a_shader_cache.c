@@ -479,3 +479,212 @@ void nv2a_sc_stats(int *programs, int *binaries, int *added)
     if (added) *added = C.added;
     unlock();
 }
+
+/* ---- states: what each program was translated from ---------------------------
+ *
+ * See nv2a_shader_cache.h. One file, states-v1.dat, beside the programs files
+ * and shared by every backend, of three kinds of record:
+ *
+ *   "JVS1" vid, kind, len, bytes   a vertex half: the program's microcode (kind 1)
+ *                                  or the fixed-function description (kind 2),
+ *                                  once however many programs use it;
+ *   "JPS1" id, vid, len, bytes     a program: its key in the renderer's table, its
+ *                                  vertex half, and its combiner state;
+ *   "JLB1" id, recipe              a blend recipe it was drawn with (Metal's).
+ *
+ * The list carried in the engine (nv2a_sc_states_add_blob) is the same
+ * records, read but never written. */
+#define MAGIC_VS  0x3153564Au   /* "JVS1" */
+#define MAGIC_PS  0x3153504Au   /* "JPS1" */
+#define MAGIC_BL  0x31424C4Au   /* "JLB1" */
+#define MAX_STATE (8u << 10)
+
+typedef struct { uint32_t vid, len; int kind; unsigned char *data; } SVs;
+typedef struct { uint32_t id, vid, len; unsigned char *psh; } SPs;
+typedef struct { uint32_t id, recipe; } SBl;
+
+static struct {
+    int   open, bad, local;            /* local: programs that came from this machine's file */
+    char  file[1200];
+    FILE *f;
+    SVs  *vs; int nvs, capvs;
+    SPs  *ps; int nps, capps;
+    SBl  *bl; int nbl, capbl;
+} ST;
+
+static int st_vs_find(uint32_t vid)
+{
+    int i;
+    for (i = 0; i < ST.nvs; i++) if (ST.vs[i].vid == vid) return i;
+    return -1;
+}
+static int st_ps_find(uint32_t id)
+{
+    int i;
+    for (i = 0; i < ST.nps; i++) if (ST.ps[i].id == id) return i;
+    return -1;
+}
+static int st_bl_find(uint32_t id, uint32_t recipe)
+{
+    int i;
+    for (i = 0; i < ST.nbl; i++) if (ST.bl[i].id == id && ST.bl[i].recipe == recipe) return i;
+    return -1;
+}
+static int st_vs_put(uint32_t vid, int kind, const void *data, uint32_t len)
+{
+    unsigned char *d;
+    int i = st_vs_find(vid);
+    if (i >= 0) return i;
+    if (!grow((void **)&ST.vs, &ST.capvs, ST.nvs, sizeof *ST.vs) || !(d = (unsigned char *)malloc(len ? len : 1)))
+        return -1;
+    memcpy(d, data, len);
+    ST.vs[ST.nvs].vid = vid; ST.vs[ST.nvs].kind = kind; ST.vs[ST.nvs].len = len; ST.vs[ST.nvs].data = d;
+    return ST.nvs++;
+}
+static int st_ps_put(uint32_t id, uint32_t vid, const void *psh, uint32_t len)
+{
+    unsigned char *d;
+    int i = st_ps_find(id);
+    if (i >= 0) return i;
+    if (!grow((void **)&ST.ps, &ST.capps, ST.nps, sizeof *ST.ps) || !(d = (unsigned char *)malloc(len ? len : 1)))
+        return -1;
+    memcpy(d, psh, len);
+    ST.ps[ST.nps].id = id; ST.ps[ST.nps].vid = vid; ST.ps[ST.nps].len = len; ST.ps[ST.nps].psh = d;
+    return ST.nps++;
+}
+static int st_bl_put(uint32_t id, uint32_t recipe)
+{
+    int i = st_bl_find(id, recipe);
+    if (i >= 0) return i;
+    if (!grow((void **)&ST.bl, &ST.capbl, ST.nbl, sizeof *ST.bl)) return -1;
+    ST.bl[ST.nbl].id = id; ST.bl[ST.nbl].recipe = recipe;
+    return ST.nbl++;
+}
+
+/* Records from p[0..n): the length that was whole records. */
+static size_t st_parse(const unsigned char *p, size_t n)
+{
+    size_t at = 0;
+    for (;;) {
+        uint32_t magic, a, b, len;
+        if (n - at < 4) break;
+        memcpy(&magic, p + at, 4);
+        if (magic == MAGIC_BL) {
+            if (n - at < 12) break;
+            memcpy(&a, p + at + 4, 4); memcpy(&b, p + at + 8, 4);
+            if (st_bl_put(a, b) < 0) break;
+            at += 12;
+        } else if (magic == MAGIC_VS || magic == MAGIC_PS) {
+            if (n - at < 16) break;
+            memcpy(&a, p + at + 4, 4); memcpy(&b, p + at + 8, 4); memcpy(&len, p + at + 12, 4);
+            if (len > MAX_STATE || n - at - 16 < len) break;
+            if (magic == MAGIC_VS ? st_vs_put(a, (int)b, p + at + 16, len) < 0
+                                  : st_ps_put(a, b, p + at + 16, len) < 0) break;
+            at += 16 + len;
+        } else {
+            break;
+        }
+    }
+    return at;
+}
+
+static void st_write(uint32_t magic, uint32_t a, uint32_t b, const void *data, uint32_t len, int with_len)
+{
+    if (!ST.f || ST.bad) return;
+    if (fwrite(&magic, 4, 1, ST.f) != 1 || fwrite(&a, 4, 1, ST.f) != 1 || fwrite(&b, 4, 1, ST.f) != 1 ||
+        (with_len && (fwrite(&len, 4, 1, ST.f) != 1 || (len && fwrite(data, 1, len, ST.f) != len))) ||
+        fflush(ST.f))
+        ST.bad = 1;
+}
+
+int nv2a_sc_states_open(const char *dir)
+{
+    FILE *f;
+    unsigned char *buf = NULL;
+    long end = 0;
+    size_t good = 0;
+    lock();
+    if (ST.open) { unlock(); return 1; }
+    sc_mkdir(dir);
+    snprintf(ST.file, sizeof ST.file, "%s/states-v1.dat", dir);
+    if ((f = sc_fopen(ST.file, "rb")) != NULL) {
+        if (!fseek(f, 0, SEEK_END)) end = ftell(f);
+        rewind(f);
+        if (end > 0 && end < (64L << 20) && (buf = (unsigned char *)malloc((size_t)end)) != NULL &&
+            fread(buf, 1, (size_t)end, f) == (size_t)end)
+            good = st_parse(buf, (size_t)end);
+        fclose(f);
+        free(buf);
+        if (end > (long)good) {
+            fprintf(stderr, "  [SHADERS] %s: %ld damaged bytes at the end dropped\n", ST.file, end - (long)good);
+            sc_truncate(ST.file, (long)good);
+        }
+    }
+    ST.local = ST.nps;
+    ST.f = sc_fopen(ST.file, "ab");
+    ST.open = 1;
+    unlock();
+    return ST.f != NULL;
+}
+
+void nv2a_sc_states_add_blob(const void *data, size_t len)
+{
+    size_t good;
+    if (!data || !len) return;
+    lock();
+    good = st_parse((const unsigned char *)data, len);
+    unlock();
+    if (good != len)
+        fprintf(stderr, "  [SHADERS] the engine's list of shaders is damaged after %lu of %lu bytes\n",
+                (unsigned long)good, (unsigned long)len);
+}
+
+int nv2a_sc_states_count(void) { int n; lock(); n = ST.nps; unlock(); return n; }
+int nv2a_sc_states_local(void) { int n; lock(); n = ST.local; unlock(); return n; }
+
+int nv2a_sc_state_get(int i, uint32_t *id, int *kind, const void **vdata, uint32_t *vlen,
+                      const void **psh, uint32_t *pshlen)
+{
+    int ok = 0, v;
+    lock();
+    if (i >= 0 && i < ST.nps && (v = st_vs_find(ST.ps[i].vid)) >= 0) {
+        *id = ST.ps[i].id; *kind = ST.vs[v].kind;
+        *vdata = ST.vs[v].data; *vlen = ST.vs[v].len;
+        *psh = ST.ps[i].psh; *pshlen = ST.ps[i].len;
+        ok = 1;
+    }
+    unlock();
+    return ok;
+}
+
+int nv2a_sc_state_recipes(uint32_t id, uint32_t *out, int max)
+{
+    int i, n = 0;
+    lock();
+    for (i = 0; i < ST.nbl && n < max; i++) if (ST.bl[i].id == id) out[n++] = ST.bl[i].recipe;
+    unlock();
+    return n;
+}
+
+void nv2a_sc_state_note(uint32_t id, int kind, const void *vdata, uint32_t vlen, const void *psh, uint32_t pshlen)
+{
+    uint32_t vid;
+    if (!ST.open || !id || !vdata || !psh || vlen > MAX_STATE || pshlen > MAX_STATE) return;
+    vid = (uint32_t)fnv64(0xCBF29CE484222325ull ^ (uint64_t)kind, vdata, vlen);
+    lock();
+    if (st_ps_find(id) >= 0) { unlock(); return; }
+    if (st_vs_find(vid) < 0) {
+        if (st_vs_put(vid, kind, vdata, vlen) < 0) { unlock(); return; }
+        st_write(MAGIC_VS, vid, (uint32_t)kind, vdata, vlen, 1);
+    }
+    if (st_ps_put(id, vid, psh, pshlen) >= 0) st_write(MAGIC_PS, id, vid, psh, pshlen, 1);
+    unlock();
+}
+
+void nv2a_sc_state_recipe(uint32_t id, uint32_t recipe)
+{
+    if (!ST.open || !id) return;
+    lock();
+    if (st_bl_find(id, recipe) < 0 && st_bl_put(id, recipe) >= 0) st_write(MAGIC_BL, id, recipe, NULL, 0, 0);
+    unlock();
+}

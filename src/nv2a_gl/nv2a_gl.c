@@ -2768,6 +2768,13 @@ static void dump_msl_pair(uint32_t hash, const char *vsrc, const char *fsrc)
     if (f) { fputs(fsrc, f); fclose(f); }
 }
 
+/* The program being built right now, by its key in g_pcache -- for a backend
+ * to file the blend recipes it draws it with under (the shader seed, at
+ * shader_cache_start). 0 outside a build. */
+static uint32_t g_seed_building;
+uint32_t nv2a_seed_building_id(void);
+uint32_t nv2a_seed_building_id(void) { return g_seed_building; }
+
 static int ff_program_for_current(void)
 {
     Nv2aVshFixed f;
@@ -2807,10 +2814,14 @@ static int ff_program_for_current(void)
         free(fsrc); free(vsrc); S.shader_fails++; return -1;
     }
     if (msl && getenv("RECOMP_GL_DUMP_MSL")) dump_msl_pair(hash, vsrc, fsrc);
+    g_seed_building = hash;
     prog = build_program(vsrc, fsrc, "fixed-function transform + combiners");
+    g_seed_building = 0;
     free(vsrc);
     free(fsrc);
     if (!prog) { S.shader_fails++; return -1; }
+    /* What it was made from, for the next start, here or anywhere. */
+    nv2a_sc_state_note(hash, 2, &f, (uint32_t)sizeof f, &S.psh, (uint32_t)sizeof S.psh);
     if (g_pcache[slot].used && g_pcache[slot].prog) G->prog_free(g_pcache[slot].prog);
     free(g_pcache[slot].dis);
     memset(&g_pcache[slot], 0, sizeof g_pcache[slot]);
@@ -2996,8 +3007,12 @@ static int program_for_current(void)
                 S.psh.tex_alpha_only[3], S.psh.alpha_test, S.psh.alpha_func,
                 S.psh.alpha_ref, fsrc ? fsrc : "(solid)");
       } }
+    g_seed_building = fsrc ? hash : 0;
     prog = build_program(vsrc, fsrc ? fsrc : frag_solid(),
                          "translated vertex program + combiners");
+    g_seed_building = 0;
+    if (prog && fsrc)   /* what it was made from (a diagnostic's solid colour: not) */
+        nv2a_sc_state_note(hash, 1, S.prog + start * 4, (uint32_t)len * 16u, &S.psh, (uint32_t)sizeof S.psh);
     free(vsrc);
     free(fsrc);
     if (!prog) { S.shader_fails++; return -1; }
@@ -11514,6 +11529,133 @@ const Nv2aGfx *nv2a_gfx_metal(void) { return NULL; }
  * backend that changed halfway through a frame would leave its surfaces and
  * programs behind in the other one.
  */
+/* ---- the shader seed ------------------------------------------------------
+ *
+ * The shader cache (below) keeps each program as the text it was built from,
+ * in this backend's language and for this translator only. So on a first
+ * start -- a new player, a new device, or a release whose translator changed
+ * -- every shader is built the moment the game first needs it, the game waits
+ * for each, and the first minute of every area stutters: a phone takes tens
+ * of milliseconds over a shader a Mac builds in one.
+ *
+ * So what each program was translated from is kept as well (the "states" of
+ * nv2a_shader_cache.h: its combiner state, and its vertex program's microcode
+ * or fixed-function description, with the blend recipes it was drawn with),
+ * which is the same on every platform and for every translator. The engine
+ * carries a list of them made by playing through the game (port/shader_seed.dat,
+ * handed over by nv2a_set_shader_seed), and each machine keeps its own. At
+ * start, every state that this backend's cache does not have yet is translated
+ * and added to it -- once per list and translator, as states-<tag>.done says --
+ * and the backend builds them ahead, as it does the programs of earlier runs:
+ * Metal on two threads in the background from the start, OpenGL a few
+ * milliseconds at a time on frames with little in them. Nothing waits for
+ * them; a program still missing when the game asks is built then, as before.
+ * JSRF_SHADER_SEED=<file> adds a list from a file (tests). */
+static const void *g_seed_data;
+static size_t      g_seed_len;
+void nv2a_set_shader_seed(const void *data, size_t len);
+void nv2a_set_shader_seed(const void *data, size_t len) { g_seed_data = data; g_seed_len = len; }
+
+static uint32_t seed_fnv(uint32_t h, const void *p, size_t n)
+{
+    const unsigned char *b = (const unsigned char *)p;
+    while (n--) { h ^= *b++; h *= 16777619u; }
+    return h;
+}
+
+static void seed_import(const char *dir, const char *tag, int msl)
+{
+    char mark[1200], want[64], have[96] = "";
+    FILE *mf;
+    unsigned char *extra = NULL;
+    size_t extra_len = 0;
+    uint32_t fp = 2166136261u;
+    int n, nlocal, done_local = -1, i, before = 0, after = 0, tried = 0, failed = 0;
+    double t0 = mono_now();
+    char *v, *f;
+
+    nv2a_sc_states_open(dir);
+    nlocal = nv2a_sc_states_local();
+    { const char *e = getenv("JSRF_SHADER_SEED");
+      FILE *sf = (e && *e) ? fopen(e, "rb") : NULL;
+      if (sf) {
+          long end = (!fseek(sf, 0, SEEK_END)) ? ftell(sf) : -1;
+          rewind(sf);
+          if (end > 0 && end < (64L << 20) && (extra = (unsigned char *)malloc((size_t)end)) != NULL &&
+              fread(extra, 1, (size_t)end, sf) == (size_t)end) extra_len = (size_t)end;
+          fclose(sf);
+      } }
+    if (g_seed_data && g_seed_len) {
+        nv2a_sc_states_add_blob(g_seed_data, g_seed_len);
+        fp = seed_fnv(fp, g_seed_data, g_seed_len);
+    }
+    if (extra_len) {
+        nv2a_sc_states_add_blob(extra, extra_len);
+        fp = seed_fnv(fp, extra, extra_len);
+    }
+    free(extra);
+    n = nv2a_sc_states_count();
+    snprintf(want, sizeof want, "%08X:%lu", (unsigned)fp, (unsigned long)(g_seed_len + extra_len));
+    snprintf(mark, sizeof mark, "%s/states-%s.done", dir, tag);
+    if ((mf = fopen(mark, "r")) != NULL) {
+        if (fgets(have, sizeof have, mf)) {
+            char w[64]; int d;
+            if (sscanf(have, "%63s %d", w, &d) == 2 && !strcmp(w, want)) done_local = d;
+        }
+        fclose(mf);
+    }
+    /* The machine's own come first (0..nlocal), the carried list's after. With
+     * the same list translated already, only the machine's newer ones. */
+    if (done_local > nlocal) done_local = -1;
+    if (done_local == nlocal) {
+        fprintf(stderr, "  [SHADERS] states: %d (%d from this machine), translated for %s already\n",
+                n, nlocal, tag);
+        return;
+    }
+    if (!nv2a_sc_open(dir, tag)) return;
+    v = (char *)malloc(96 * 1024);
+    f = (char *)malloc(96 * 1024);
+    nv2a_sc_stats(&before, NULL, NULL);
+    for (i = (done_local >= 0 ? done_local : 0); v && f && i < (done_local >= 0 ? nlocal : n); i++) {
+        uint32_t id, vlen, plen, rc[64];
+        const void *vd, *pd;
+        int kind, ok = 0, k, nr;
+        Nv2aPshState ps;
+        if (!nv2a_sc_state_get(i, &id, &kind, &vd, &vlen, &pd, &plen)) continue;
+        tried++;
+        if (plen != sizeof ps) { failed++; continue; }        /* another engine's layout */
+        memcpy(&ps, pd, sizeof ps);
+        if (kind == 1 && vlen && vlen % 16 == 0 && vlen <= NV2A_VSH_MAX_INSNS * 16u) {
+            Nv2aVshProgram vp;
+            if (nv2a_vsh_decode((const uint32_t *)vd, (int)(vlen / 16), &vp) > 0 && (vp.outputs_written & 1u))
+                ok = msl ? nv2a_vsh_emit_msl(&vp, v, 96 * 1024) : nv2a_vsh_emit_glsl(&vp, v, 96 * 1024);
+        } else if (kind == 2 && vlen == sizeof(Nv2aVshFixed)) {
+            Nv2aVshFixed ff;
+            memcpy(&ff, vd, sizeof ff);
+            ok = msl ? nv2a_vsh_emit_ff_msl(&ff, v, 96 * 1024) : nv2a_vsh_emit_ff_glsl(&ff, v, 96 * 1024);
+        }
+        if (ok) ok = msl ? nv2a_psh_emit_msl(&ps, f, 96 * 1024) : nv2a_psh_emit_glsl(&ps, f, 96 * 1024);
+        if (!ok) { failed++; continue; }
+        {
+            uint64_t key = nv2a_sc_key(v, f);
+            nv2a_sc_add(key, v, f);
+            nr = nv2a_sc_state_recipes(id, rc, 64);
+            for (k = 0; k < nr; k++) nv2a_sc_recipe_add(key, rc[k]);
+        }
+    }
+    free(v);
+    free(f);
+    nv2a_sc_stats(&after, NULL, NULL);
+    if ((mf = fopen(mark, "w")) != NULL) {
+        fprintf(mf, "%s %d\n", want, nlocal);
+        fclose(mf);
+    }
+    fprintf(stderr, "  [SHADERS] states: %d (%d from this machine, the rest carried in the engine); "
+            "%d translated for %s in %.0f ms: %d programs new to its cache%s\n",
+            n, nlocal, tried, tag, (mono_now() - t0) * 1000.0, after - before,
+            failed ? " (some could not be: another engine's)" : "");
+}
+
 /* The shader cache (nv2a_shader_cache.h), in <JSRF_SAVE_DIR>/shaders: every
  * launcher sets the save folder, and a run without one has no cache. Its files
  * are named for the backend and for the translator -- a hash of a reference
@@ -11542,6 +11684,7 @@ static void shader_cache_start(void)
     free(v);
     free(f);
     snprintf(tag, sizeof tag, "%s-%08X", G->name, (unsigned)(fp ^ (fp >> 32)));
+    seed_import(dir, tag, msl);
     G->cache_open(dir, tag);
 }
 
