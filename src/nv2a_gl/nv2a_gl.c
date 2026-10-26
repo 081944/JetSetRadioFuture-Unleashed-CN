@@ -4125,6 +4125,45 @@ static void dump_fbo(uint32_t rt, const char *prefix, int *counter, int limit)
  * sidesteps having to reproduce the hardware's per-attribute strides on the
  * GL side. It costs a little bandwidth and removes a whole class of bug. */
 /*
+ * A surface with no alpha channel keeps none.
+ *
+ * Most of this title's surfaces are R5G6B5 -- the frame, and the copies of it
+ * the boost dash's heat haze is made from -- and the console stores no alpha
+ * for them at all: a blend that writes alpha writes nothing, and a texture
+ * read of the surface afterwards gives alpha 1. The targets here are RGBA,
+ * so the alpha a blend wrote stayed in them: where a shadow had been laid
+ * over the scene (black at half alpha, blended), on glass, under a spray of
+ * particles, the copy came back partly transparent, and the haze -- the copy
+ * blended over a distorted second copy by its alpha -- showed through there
+ * and nowhere else. So for those formats the alpha channel is never written
+ * (clears put 1 there), as it is never stored on the console.
+ * RECOMP_GL_SURF_ALPHA=1: write it as before.
+ */
+static int surf_has_alpha(uint32_t fmt)
+{
+    switch (fmt & 0xF) {
+    case 0:                    /* not set yet: leave it alone */
+    case 6: case 7:            /* X1A7R8G8B8 */
+    case 8:                    /* A8R8G8B8 */
+        return 1;
+    default:                   /* X1R5G5B5, R5G6B5, X8R8G8B8, B8, G8B8 */
+        return 0;
+    }
+}
+
+static uint32_t surf_color_mask(void)
+{
+    static int keep = -1;
+    uint32_t cm = S.color_mask ? S.color_mask : 0x01010101u;   /* 0: never set, all */
+    if (keep < 0) keep = getenv("RECOMP_GL_SURF_ALPHA") ? 1 : 0;
+    if (keep || surf_has_alpha(S.surf_format)) return S.color_mask;
+    cm &= ~0x01000000u;
+    /* The backends read 0 as "never set", so a mask that is left with no
+     * channel at all says so with a bit no channel uses. */
+    return cm ? cm : 0x80000000u;
+}
+
+/*
  * Bind the surface the title has set up, at the moment it is used.
  *
  * It used to be bound as each surface method arrived. D3D's SetRenderTarget
@@ -6150,7 +6189,7 @@ static void do_draw_body(void)
         rs.blend_dst    = S.blend_dst;
         rs.alpha_test   = S.alpha_test;
         rs.cull_enable  = S.cull_enable;
-        rs.color_mask   = S.color_mask;
+        rs.color_mask   = surf_color_mask();
         rs.zclamp       = S.zminmax;
         rs.w_buffer     = S.psh.w_buffer;
         rs.cull_face    = S.cull_face;
@@ -9281,7 +9320,8 @@ static void do_clear(uint32_t param)
             break;
         }
         default:                   /* the 32-bit formats */
-            a = ((S.clear_color >> 24) & 0xFF) / 255.0f;
+            /* X8R8G8B8 has no alpha either: see surf_has_alpha. */
+            a = surf_has_alpha(S.surf_format) ? ((S.clear_color >> 24) & 0xFF) / 255.0f : 1.0f;
             r = ((S.clear_color >> 16) & 0xFF) / 255.0f;
             g = ((S.clear_color >> 8)  & 0xFF) / 255.0f;
             b = ( S.clear_color        & 0xFF) / 255.0f;
