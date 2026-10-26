@@ -11562,7 +11562,8 @@ const Nv2aGfx *nv2a_gfx_metal(void) { return NULL; }
  * Metal on two threads in the background from the start, OpenGL a few
  * milliseconds at a time on frames with little in them. Nothing waits for
  * them; a program still missing when the game asks is built then, as before.
- * JSRF_SHADER_SEED=<file> adds a list from a file (tests). */
+ * JSRF_SHADER_SEED=<file> adds a list from a file (tests); RECOMP_SHADER_SEED=0
+ * leaves the engine's own out (this machine's are still used). */
 static const void *g_seed_data;
 static size_t      g_seed_len;
 void nv2a_set_shader_seed(const void *data, size_t len);
@@ -11597,6 +11598,8 @@ static void seed_import(const char *dir, const char *tag, int msl)
               fread(extra, 1, (size_t)end, sf) == (size_t)end) extra_len = (size_t)end;
           fclose(sf);
       } }
+    { const char *e = getenv("RECOMP_SHADER_SEED");
+      if (e && *e && !atoi(e)) g_seed_len = 0; }
     if (g_seed_data && g_seed_len) {
         nv2a_sc_states_add_blob(g_seed_data, g_seed_len);
         fp = seed_fnv(fp, g_seed_data, g_seed_len);
