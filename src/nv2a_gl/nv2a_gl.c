@@ -4849,6 +4849,48 @@ static void batch_size_note(int inl, uint32_t n)
     }
 }
 
+/* Draws that never reach the backend, and why -- printed with the census
+ * below. A missing piece of the world is either never sent, or sent and
+ * dropped here, or drawn and hidden; this says whether it is the second. */
+enum { DROP_PRIM, DROP_POINTS, DROP_NOVSIZE, DROP_EMPTY, DROP_NOPOS,
+       DROP_NOPROG, DROP_SHORT, DROP_NOMEM, DROP_LOST, DROP_N };
+static unsigned long g_drop[DROP_N];
+
+/* RECOMP_GL_PRIMLOG=<s>: draws and vertices by primitive type (the
+ * NV097_SET_BEGIN_END numbers: 1 points, 2 lines, 3 line loop, 4 line strip,
+ * 5 triangles, 6 strip, 7 fan, 8 quads, 9 quad strip, 10 polygon), fixed-
+ * function and programmable apart, every s seconds -- what a scene is drawn
+ * with, when something in it is missing. */
+static void prim_note(int inl)
+{
+    static int on = -1; static double every, next;
+    static unsigned long draws[2][11], verts[2][11];
+    uint32_t n = inl ? S.inline_count : S.idx_count, p = S.prim;
+    int k, i;
+    if (on < 0) { const char *v = getenv("RECOMP_GL_PRIMLOG");
+                  on = v ? 1 : 0; every = v ? atof(v) : 0.0; if (every <= 0) every = 10.0;
+                  next = mono_now() + every; }
+    if (!on || p > 10) return;
+    k = (S.xf_mode == NV2A_XF_MODE_FIXED) ? 0 : 1;
+    draws[k][p]++; verts[k][p] += n;
+    if (mono_now() >= next) {
+        next = mono_now() + every;
+        for (k = 0; k < 2; k++) {
+            fprintf(stderr, "[PRIMS] %s:", k ? "programs" : "fixed-function");
+            for (i = 1; i <= 10; i++)
+                if (draws[k][i]) fprintf(stderr, " p%d %lu draws %lu verts;", i, draws[k][i], verts[k][i]);
+            fprintf(stderr, "\n");
+        }
+        fprintf(stderr, "[PRIMS] not drawn: %lu unknown primitive, %lu points, %lu inline without "
+                        "attributes, %lu empty, %lu no position, %lu no program, %lu too short, "
+                        "%lu no memory, %lu surface lost\n",
+                g_drop[DROP_PRIM], g_drop[DROP_POINTS], g_drop[DROP_NOVSIZE], g_drop[DROP_EMPTY],
+                g_drop[DROP_NOPOS], g_drop[DROP_NOPROG], g_drop[DROP_SHORT], g_drop[DROP_NOMEM],
+                g_drop[DROP_LOST]);
+        fflush(stderr);
+    }
+}
+
 /*
  * RECOMP_GL_POINTLOG=<s>: the point lists the title draws -- which are not
  * drawn (see do_draw_body) -- a line each for the first few, with the point
@@ -4975,11 +5017,12 @@ static void do_draw_body(void)
     surface_sync();
 
     mode = nv2a_prim(S.prim, &fan_expand);
+    prim_note(inl);
     if (mode == NV2A_PRIM_POINTS) points_note(inl);
     /* Points included: this tested a GLenum against zero, and GL_POINTS is
      * zero, so point lists have never been drawn. Kept that way here so the
      * two backends agree; drawing them is a change to make on purpose. */
-    if (!mode || mode == NV2A_PRIM_POINTS) return;
+    if (!mode || mode == NV2A_PRIM_POINTS) { g_drop[mode ? DROP_POINTS : DROP_PRIM]++; return; }
 
     /* Indices: an explicit list, a DRAW_ARRAYS range, or the implicit
      * 0..n-1 of an inline batch. */
@@ -4997,7 +5040,7 @@ static void do_draw_body(void)
             S.attr[i].offset = vsize;
             vsize += bytes;
         }
-        if (!vsize) return;
+        if (!vsize) { g_drop[DROP_NOVSIZE]++; return; }
         for (i = 0; i < NUM_ATTRS; i++)
             if (S.attr[i].size) S.attr[i].stride = vsize;
         n = S.inline_count * 4 / vsize;
@@ -5010,7 +5053,7 @@ static void do_draw_body(void)
         n = S.idx_count;
     }
     batch_size_note(inl, n);
-    if (n < 1) return;
+    if (n < 1) { g_drop[DROP_EMPTY]++; return; }
 
     /* The attributes this draw fetched from arrays keep its last vertex's
      * values (see sticky_attrs). Done before anything below can drop the
@@ -5062,7 +5105,7 @@ static void do_draw_body(void)
           }
       } }
 
-    if (!S.attr[0].size) { S.skipped_no_pos++; return; }
+    if (!S.attr[0].size) { S.skipped_no_pos++; g_drop[DROP_NOPOS]++; return; }
     /* RECOMP_GL_NO_TEX1: drop every draw that has a second texture stage.
      * JSRF paints its cel shading as a second blended pass over the same
      * geometry, so this shows what is underneath -- which separates "the base
@@ -5113,7 +5156,7 @@ static void do_draw_body(void)
           && (sk == 1 || (S.frames & 1u))) return; }
 
     slot = program_for_current();
-    if (slot < 0) return;
+    if (slot < 0) { g_drop[DROP_NOPROG]++; return; }
 
     /* RECOMP_GL_ONLY_A0=1 draws only the batches that pick their transform
      * out of the constant palette; =0 draws only the rest.
@@ -5140,7 +5183,7 @@ static void do_draw_body(void)
     out_n = n;
     if (fan_expand == 1) out_n = (n / 4) * 6;
     if (fan_expand == 2) out_n = (n >= 4) ? ((n - 2) / 2) * 6 : 0;
-    if (!out_n) return;
+    if (!out_n) { g_drop[DROP_SHORT]++; return; }
 
     /*
      * The vertex layout, cut down to what this draw actually needs.
@@ -5308,7 +5351,7 @@ static void do_draw_body(void)
             vbuf_cap = out_n * stride_floats + 4096;
             free(vbuf);
             vbuf = (float *)malloc(vbuf_cap * sizeof(float));
-            if (!vbuf) { vbuf_cap = 0; return; }
+            if (!vbuf) { vbuf_cap = 0; g_drop[DROP_NOMEM]++; return; }
         }
         for (k = 0; k < out_n; k++) {
             uint32_t src_i;
@@ -7443,6 +7486,8 @@ static void do_draw_body(void)
         if (vc_vb && !vc_seq) G->draw_indexed(mode, out_n, vc_i32);
         else                  G->draw(mode, out_n);
         PROF_ADD(draw);
+    } else if (g_surf_lost) {
+        g_drop[DROP_LOST]++;
     }
     xray_done: ;
     /*
@@ -9917,6 +9962,18 @@ static void present(int is_frame)
           if (t0 < 0.0) { const char *v = getenv("RECOMP_GL_DUMP_SECS");
                           t0 = mono_now(); after_s = v ? atof(v) : 0.0; }
           if (dump_due && after_s > 0.0 && mono_now() - t0 < after_s) dump_due = 0; }
+        /* RECOMP_GL_DUMP_SHOWN: a shot that falls on the end of a pass rather
+         * than of a frame is kept for the next frame. Flips count passes, and
+         * a scene that ends k passes a frame puts its frames on one residue
+         * mod k: an interval that k divides could fall on a pass every time,
+         * and every shot was spent writing nothing. */
+        { static int so = -1, owed;
+          int shows = is_frame && g_present_slot >= 0 && g_surf[g_present_slot].used;
+          if (so < 0) so = getenv("RECOMP_GL_DUMP_SHOWN") ? 1 : 0;
+          if (so) {
+              if (dump_due && !shows) { owed = 1; dump_due = 0; }
+              else if (owed && shows && pfx && dump_shots < dump_max()) { owed = 0; dump_due = 1; }
+          } }
         /* RECOMP_GL_DUMP_PAIRS=1: each dump and the frame straight after it --
          * with RECOMP_GL_TEXGEN=ab, the same moment with and without. */
         { static int pairs = -1, second;
