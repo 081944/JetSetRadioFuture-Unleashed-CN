@@ -682,14 +682,15 @@ static void framebuffer_probe_tick(void)
  * is not -- and the acknowledgement de-asserts PMC_INTR_0's PCRTC bit, which
  * is what the handler's own spin loop is waiting for.
  */
-static void vblank_intr_tick(volatile uint32_t *regs)
+/* 1 if it completed a vblank the title had acknowledged. */
+static int vblank_intr_tick(volatile uint32_t *regs)
 {
     volatile uint32_t *pcrtc = (volatile uint32_t *)((char *)regs + 0x600100);
     volatile uint32_t *pmc   = (volatile uint32_t *)((char *)regs + 0x000100);
     uint32_t v = *pcrtc;
 
     if (v & NV2A_VBLANK_PENDING_TAG)
-        return;                       /* raised, not yet acknowledged */
+        return 0;                     /* raised, not yet acknowledged */
 
     /* Acknowledged (or never raised): complete it. A PGRAPH software method
      * still with the title keeps its bit (see kernel_pgraph_tick). */
@@ -699,6 +700,7 @@ static void vblank_intr_tick(volatile uint32_t *regs)
         extern int xbox_nv2a_swm_in_flight(void);
         *pmc = xbox_nv2a_swm_in_flight() ? (*pmc & (1u << 12)) : 0;
     }
+    return v != 0;
 }
 
 /* The same, for code that keeps this thread away from its loop.
@@ -713,15 +715,69 @@ static void vblank_intr_tick(volatile uint32_t *regs)
  * lock was held for most of each second and a vblank in four was lost.
  * frame_pace() calls this between short sleeps so the wait is under a
  * millisecond. */
+static volatile long long s_ack_top_ms;   /* the ack thread last at the top of its loop */
 void xbox_nv2a_vblank_service(void)
 {
     if (g_nv2a_memory) vblank_intr_tick((volatile uint32_t *)g_nv2a_memory);
+    s_ack_top_ms = (long long)GetTickCount64();
+}
+
+/*
+ * The keeper: what must not wait for the picture.
+ *
+ * The ack thread is also the GPU -- it runs the pushbuffer -- and while it is
+ * inside one (a shader being compiled, a frame of eight hundred draws on a
+ * phone) it is not at the top of its loop, where two things that have nothing
+ * to do with drawing were done: ending the title's vblank handler's spin
+ * (vblank_intr_tick; the handler holds the guest lock at raised IRQL until
+ * then) and moving KeTickCount. So every long frame stopped every guest
+ * thread for as long as it lasted, the ADX thread that streams the music and
+ * the voices among them: a 200 ms shader build was 200 ms in which the music
+ * ring was not refilled, and the sound stuttered with the picture.
+ *
+ * This thread does those two whenever the ack thread has been away for more
+ * than 2 ms, and nothing else: GET, the fences and the busy bits still say
+ * where the GPU really is. A wait of 100 ms or more is written to the log, the
+ * first fifty times. RECOMP_ACK_KEEPER=0 turns it off.
+ */
+static HANDLE g_nv2a_keeper_thread = NULL;
+static DWORD WINAPI nv2a_keeper_thread(LPVOID param)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)param;
+    long long away_from = 0, last_top = 0;
+    unsigned long ended = 0, said = 0;
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        long long now = (long long)GetTickCount64(), top = s_ack_top_ms;
+        if (top != last_top) {                 /* the ack thread came round again */
+            if (away_from && top - away_from >= 100 && said < 50) {
+                said++;
+                fprintf(stderr, "  [NV2A] the GPU thread was busy for %lld ms; the title's vblank "
+                        "wait ended %lu times meanwhile, without it\n", top - away_from, ended);
+            }
+            away_from = 0;
+            ended = 0;
+            last_top = top;
+        }
+        if (top && now - top > 2) {
+            if (!away_from) away_from = top;
+            ended += (unsigned long)vblank_intr_tick(regs);
+            *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
+                                   + g_memory_offset) = GetTickCount();
+        }
+#if defined(_WIN32)
+        Sleep(1);                           /* 1-2 ms at the 1 ms timer main.c asks for */
+#else
+        { struct timespec ts = { 0, 2000000L }; nanosleep(&ts, NULL); }
+#endif
+    }
+    return 0;
 }
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        s_ack_top_ms = (long long)GetTickCount64();
         vblank_intr_tick(regs);
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
@@ -920,6 +976,9 @@ static void xbox_Nv2aAckStart(void)
     if (g_nv2a_ack_thread) {
         fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
                 sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
+        { const char *e = getenv("RECOMP_ACK_KEEPER");
+          if (!e || atoi(e))
+              g_nv2a_keeper_thread = CreateThread(NULL, 0, nv2a_keeper_thread, g_nv2a_memory, 0, NULL); }
     }
 }
 
@@ -2318,6 +2377,11 @@ void xbox_MemoryLayoutShutdown(void)
         WaitForSingleObject(g_nv2a_ack_thread, 1000);
         CloseHandle(g_nv2a_ack_thread);
         g_nv2a_ack_thread = NULL;
+    }
+    if (g_nv2a_keeper_thread) {           /* stops with the ack thread's flag */
+        WaitForSingleObject(g_nv2a_keeper_thread, 1000);
+        CloseHandle(g_nv2a_keeper_thread);
+        g_nv2a_keeper_thread = NULL;
     }
     if (g_nv2a_memory) {
         VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);
