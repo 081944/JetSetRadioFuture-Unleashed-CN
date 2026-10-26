@@ -558,12 +558,30 @@ static void nv_window_shape_for_mode(void)
     }
 }
 
+/* Controls > Camera on the Right Stick, stored as the "rstickCamera" default:
+ * on unless turned off. The right stick turns the camera around the skater
+ * (recomp_manual.c, rcam_apply), which asks this every frame, so a change
+ * applies at once. RECOMP_RSTICK_CAMERA in the environment wins there. */
+static volatile int g_rstick_cam = -1;
+int nv_window_pref_rstick_camera(void);
+int nv_window_pref_rstick_camera(void)
+{
+    if (g_rstick_cam < 0) {
+        @autoreleasepool {
+            id v = [[NSUserDefaults standardUserDefaults] objectForKey:@"rstickCamera"];
+            g_rstick_cam = v ? ([v boolValue] ? 1 : 0) : 1;
+        }
+    }
+    return g_rstick_cam;
+}
+
 @interface NvMenuTarget : NSObject
 - (void)pickScale:(id)sender;
 - (void)pickRenderer:(id)sender;
 - (void)toggleWidescreen:(id)sender;
 - (void)toggleSmaa:(id)sender;
 - (void)pickMsaa:(id)sender;
+- (void)toggleRstickCamera:(id)sender;
 - (void)showKeys:(id)sender;
 - (void)showPad:(id)sender;
 @end
@@ -680,6 +698,10 @@ static void nv_window_shape_for_mode(void)
  * it applies), and no more samples than the device offers. */
 - (BOOL)validateMenuItem:(NSMenuItem *)item
 {
+    if ([item action] == @selector(toggleRstickCamera:)) {
+        [item setState:nv_window_pref_rstick_camera() ? NSControlStateValueOn : NSControlStateValueOff];
+        return YES;
+    }
     if ([item action] == @selector(toggleSmaa:)) {
         [item setState:nv2a_smaa() ? NSControlStateValueOn : NSControlStateValueOff];
         return YES;
@@ -692,6 +714,15 @@ static void nv_window_shape_for_mode(void)
         return !max || [item tag] <= max;
     }
     return YES;
+}
+- (void)toggleRstickCamera:(id)sender
+{
+    int on = !nv_window_pref_rstick_camera();
+    g_rstick_cam = on;
+    [[NSUserDefaults standardUserDefaults] setBool:(on ? YES : NO) forKey:@"rstickCamera"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    [(NSMenuItem *)sender setState:on ? NSControlStateValueOn : NSControlStateValueOff];
+    fprintf(stderr, "[WIN] camera on the right stick %s\n", on ? "on" : "off");
 }
 - (void)toggleWidescreen:(id)sender
 {
@@ -727,6 +758,9 @@ static void nv_window_shape_for_mode(void)
          "Options / Menu\t\tStart\n"
          "Create / View\t\tBack\n"
          "Sticks, stick clicks\tthe same\n\n"
+         "The right stick turns the camera around your skater (not in the "
+         "original game; Controls > Camera on the Right Stick turns it off). "
+         "Let go and it drifts back behind; the L trigger puts it back at once.\n\n"
          "The keyboard keeps working alongside it. No vibration yet.";
     [a runModal];
 }
@@ -925,6 +959,16 @@ static void build_menu(void)
                                                  keyEquivalent:@""];
             [pad setTarget:g_menu_target];
             [ctl addItem:pad];
+        }
+        {
+            /* Not in the original game: see nv_window_pref_rstick_camera. */
+            NSMenuItem *rc = [[NSMenuItem alloc] initWithTitle:@"Camera on the Right Stick"
+                                                       action:@selector(toggleRstickCamera:)
+                                                keyEquivalent:@""];
+            [rc setTarget:g_menu_target];
+            [rc setState:nv_window_pref_rstick_camera() ? NSControlStateValueOn : NSControlStateValueOff];
+            [ctl addItem:[NSMenuItem separatorItem]];
+            [ctl addItem:rc];
         }
         [ctlItem setSubmenu:ctl];
         [bar addItem:ctlItem];
