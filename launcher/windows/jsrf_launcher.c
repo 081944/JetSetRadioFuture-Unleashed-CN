@@ -12,14 +12,16 @@
  *   JSRF Unleashed.exe --choose           ask where the game is again
  *   JSRF Unleashed.exe --scale N          internal resolution, 1 to 6 times 640x480
  *                                         (default 2; 6 is for a 4K screen); remembered
- *   JSRF Unleashed.exe --fullscreen       start full screen
+ *   JSRF Unleashed.exe --fullscreen       start full screen this time
+ *   JSRF Unleashed.exe --windowed         start in a window this time
  *   JSRF Unleashed.exe --portable         keep everything in this folder from now on
  *   JSRF Unleashed.exe --version          which version this is
  *
  * Settings, the cache, logs and unpacked disc images live in
  * %LOCALAPPDATA%\JSRF Unleashed -- or, portable, in the launcher's own folder
  * (see "portable" below). In game: F11 (or Alt+Enter) full screen, F10
- * widescreen 16:9.
+ * widescreen 16:9. The game starts the way it was left, in full screen or in
+ * a window; --fullscreen and --windowed choose for one start.
  */
 #define WIN32_LEAN_AND_MEAN
 #ifndef UNICODE
@@ -586,6 +588,8 @@ static const wchar_t *const k_env[][2] = {
     { L"RECOMP_GL_CURTAIN", L"skip" }, { L"RECOMP_MUTE", L"0" }, { L"RECOMP_WINDOW", L"1" },
 };
 
+/* fullscreen: 1 or 0 for this start (--fullscreen, --windowed), -1 to leave it
+ * to the engine, which starts the way the game was left. */
 static int run(const wchar_t *game, int scale, int fullscreen)
 {
     wchar_t engine[MAX_PATH * 2], cmd[MAX_PATH * 6], log[MAX_PATH * 2], logs[MAX_PATH * 2],
@@ -611,7 +615,7 @@ static int run(const wchar_t *game, int scale, int fullscreen)
         SetEnvironmentVariableW(k_env[i][0], k_env[i][1]);
     _snwprintf(sc, 8, L"%d", scale);
     SetEnvironmentVariableW(L"RECOMP_GL_SCALE", sc);
-    if (fullscreen) SetEnvironmentVariableW(L"RECOMP_FULLSCREEN", L"1");
+    if (fullscreen >= 0) SetEnvironmentVariableW(L"RECOMP_FULLSCREEN", fullscreen ? L"1" : L"0");
     SetEnvironmentVariableW(L"JSRF_GAME_DIR", game);
     SetEnvironmentVariableW(L"JSRF_SAVE_DIR", save);
     SetEnvironmentVariableW(L"JSRF_SETTINGS_FILE", g_cfg);
@@ -670,7 +674,7 @@ static int run(const wchar_t *game, int scale, int fullscreen)
 
 int WINAPI wWinMain(HINSTANCE hi, HINSTANCE prev, PWSTR cmdline, int show)
 {
-    int argc = 0, i, choose = 0, fullscreen = 0, scale = 2, portable = 0;
+    int argc = 0, i, choose = 0, fullscreen = -1, scale = 2, portable = 0;
     wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     wchar_t game[MAX_PATH * 2] = L"", arg[MAX_PATH * 2] = L"", *slash;
     char val[64];
@@ -691,6 +695,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE prev, PWSTR cmdline, int show)
     for (i = 1; i < argc; i++) {
         if (!wcscmp(argv[i], L"--choose")) choose = 1;
         else if (!wcscmp(argv[i], L"--fullscreen")) fullscreen = 1;
+        else if (!wcscmp(argv[i], L"--windowed")) fullscreen = 0;
         else if (!wcscmp(argv[i], L"--portable")) ;
         else if (!wcscmp(argv[i], L"--scale") && i + 1 < argc) {
             int s = _wtoi(argv[++i]);

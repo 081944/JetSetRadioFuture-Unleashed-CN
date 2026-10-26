@@ -1205,6 +1205,7 @@ static void pres_start(void);        /* the presenter, below */
 #endif
 #if defined(_WIN32)
 static void sdl_menu_init(void);     /* the menu bar, below */
+static int  sdl_cfg_get(const char *key, int def);   /* the settings file, below */
 #endif
 
 static int gl_init(uint32_t w, uint32_t h)
@@ -1256,7 +1257,21 @@ static int gl_init(uint32_t w, uint32_t h)
         }
         if ((e = getenv("RECOMP_WINDOW_W")) && atoi(e) >= 320) ww = atoi(e);
         if ((e = getenv("RECOMP_WINDOW_H")) && atoi(e) >= 240) wh = atoi(e);
-        if ((e = getenv("RECOMP_FULLSCREEN")) && atoi(e)) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+        /* Full screen: RECOMP_FULLSCREEN when it is set -- the launcher's
+         * --fullscreen (1) and --windowed (0), and a restart at a new
+         * resolution, which says where the game was. Otherwise, on Windows,
+         * the way the game was left: F11, Alt+Enter and Video > Full screen
+         * keep fullscreen= in the settings (sdl_fullscreen_by_player). */
+        if ((e = getenv("RECOMP_FULLSCREEN")) && *e) {
+            if (atoi(e)) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+        }
+#if defined(_WIN32)
+        else if (sdl_cfg_get("fullscreen", 0)) {
+            flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+            fprintf(stderr, "[WIN] full screen, as the game was left (fullscreen=1 in the "
+                    "settings; --windowed starts in a window)\n");
+        }
+#endif
         g_window = SDL_CreateWindow("JSRF Unleashed",
                                     SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                     ww, wh, flags);
@@ -1477,6 +1492,18 @@ static void sdl_toggle_fullscreen(void)
     if (fs) sdl_menu_show(1);
     SDL_ShowCursor(fs ? SDL_ENABLE : SDL_DISABLE);
     fprintf(stderr, "[WIN] full screen %s\n", fs ? "off" : "on");
+}
+
+/* F11, Alt+Enter and Video > Full screen: the player's choice, which the next
+ * start keeps on Windows (gl_init) -- the window as it is after the switch,
+ * so a switch that did not happen is not kept. Not the switches around the
+ * F9 and F8 boxes, which leave full screen while a box is up and go back. */
+static void sdl_fullscreen_by_player(void)
+{
+    sdl_toggle_fullscreen();
+#if defined(_WIN32)
+    sdl_cfg_set("fullscreen", (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN_DESKTOP) ? 1 : 0);
+#endif
 }
 
 /* Widescreen asked for from another thread (the Android app's settings): done
@@ -1778,7 +1805,7 @@ static void sdl_menu_command(unsigned id)
     } else if (id == MENU_WIDE) {
         sdl_toggle_widescreen();
     } else if (id == MENU_FULL) {
-        sdl_toggle_fullscreen();
+        sdl_fullscreen_by_player();
     } else if (id == MENU_SMAA) {
         sdl_pick_smaa(!g_smaa_want);
     } else if (id >= MENU_MSAA1 && id < MENU_MSAA1 + 4) {
@@ -2229,7 +2256,7 @@ static void sdl_pump(void)
                 SDL_Scancode k = ev.key.keysym.scancode;
                 if (k == SDL_SCANCODE_F11
                  || (k == SDL_SCANCODE_RETURN && (ev.key.keysym.mod & KMOD_ALT))) {
-                    sdl_toggle_fullscreen();
+                    sdl_fullscreen_by_player();
                     break;
                 }
                 if (k == SDL_SCANCODE_F10) { sdl_toggle_widescreen(); break; }

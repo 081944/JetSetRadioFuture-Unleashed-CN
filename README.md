@@ -68,12 +68,15 @@ Each run writes `last-run.log` into the game folder (with a few older ones in
    it, which it offers to unpack once. It remembers the choice.
 
 It needs graphics drivers with OpenGL 3.3, which any GPU from the last ten
-years has. The **Video** menu at the top of the window sets the resolution,
-from 1× to 6× the Xbox's 640×480 (2× by default; 6×, 3840×2880, is for a 4K
-screen; the game restarts to apply it), the anti-aliasing (SMAA, MSAA 2× to 8×, or both), widescreen 16:9 and
-full screen; all but full screen are remembered. The same are on **F9**,
-**F8**, **F10** and **F11** (or Alt+Enter), which also work in full screen,
-where the menu is hidden.
+years has; on a laptop with two GPUs it asks for the dedicated one (NVIDIA or
+AMD). The **Video** menu at the top of the window sets the resolution, from
+1× to 6× the Xbox's 640×480 (2× by default; 6×, 3840×2880, is for a 4K
+screen; the game restarts to apply it), the anti-aliasing (SMAA, MSAA 2× to
+8×, or both), widescreen 16:9 and full screen, all of them remembered: the
+game starts the way it was left, in full screen or in a window
+(`--fullscreen` and `--windowed` choose for one start). The same are on
+**F9**, **F8**, **F10** and **F11** (or Alt+Enter), which also work in full
+screen, where the menu is hidden.
 Controllers work through SDL: Xbox, PlayStation, Switch Pro and many more.
 Saves are kept in the game folder, in `UDATA`, as on the Mac. The
 `README.txt` inside lists the options and where the settings and logs

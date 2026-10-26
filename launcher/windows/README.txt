@@ -16,7 +16,9 @@ What you need
 -------------
 - Windows 10 or 11, 64-bit.
 - Graphics drivers with OpenGL 3.3 (any GPU from the last ten years, with its
-  maker's driver -- the one Windows Update installs is usually fine).
+  maker's driver -- the one Windows Update installs is usually fine). On a
+  laptop with two GPUs the game asks for the dedicated one (NVIDIA or AMD);
+  last-run.log names the GPU it runs on.
 - Your game files: the folder with default.xbe, Media\ and the rest in it,
   extracted from your own disc -- or a disc image (.iso) of it, which the
   launcher unpacks once.
@@ -42,7 +44,8 @@ it from a command prompt:
                                      for a 4K screen; F9 in game does the same);
                                      remembered
   "JSRF Unleashed.exe" --portable    keep everything in this folder from now on
-  "JSRF Unleashed.exe" --fullscreen  starts full screen
+  "JSRF Unleashed.exe" --fullscreen  starts full screen this time
+  "JSRF Unleashed.exe" --windowed    starts in a window this time
   "JSRF Unleashed.exe" --choose      asks where the game is again
   "JSRF Unleashed.exe" --version     which version this is
 
@@ -61,7 +64,8 @@ Keyboard (by key position, so W A S D on QWERTY is Z Q S D on AZERTY):
   Enter        Start                        Esc         Back
   C / V        left / right stick click
 
-  F11 or Alt+Enter   full screen
+  F11 or Alt+Enter   full screen; remembered: the game starts the way you
+                     left it, in full screen or in a window
   F10                widescreen 16:9 (a wider view, not a stretch; the HUD
                      keeps its shape, the title screen stays 4:3); remembered
   F9                 resolution: the game is drawn at 1x to 6x the Xbox's
