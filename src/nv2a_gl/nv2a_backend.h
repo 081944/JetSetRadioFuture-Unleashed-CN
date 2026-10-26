@@ -202,6 +202,7 @@ typedef enum {
     NV2A_U_LTHALF,     NV2A_U_LTPOS,      NV2A_U_LTATT,      NV2A_U_LTRANGE,
     NV2A_U_LTSPOTDIR,  NV2A_U_LTEYE,      NV2A_U_LTSPECPOW,  NV2A_U_WIDESHIFT,
     NV2A_U_FOGMODE,    NV2A_U_FOGPARAM,   NV2A_U_FOGPLANE,  NV2A_U_VPRECT,
+    NV2A_U_ZREV,
     /* fragment stage */
     NV2A_U_DRAWTINT,   NV2A_U_FOGCOLOR,   NV2A_U_ALPHAFUNC,  NV2A_U_ALPHAREF,
     NV2A_U_TEX0,                              /* ..3: sampler units, GL only */
@@ -401,6 +402,12 @@ typedef struct Nv2aGfx {
      * refuses one. NULL where the backend has none. */
     int      (*samples_max)(void);
     int      (*samples)(int n);
+    /* Reversed depth (nv2a_vsh.c, depth_defines): a 32-bit floating-point
+     * depth buffer, and a clip volume with z from 0 to w. Asked once, before
+     * the first target and the first program; 1 if from now on that is how
+     * it is. NULL, or 0, where the device cannot -- an OpenGL without
+     * glClipControl. */
+    int      (*zrev)(int want);
 } Nv2aGfx;
 
 /* The implementations. Each returns NULL where it cannot run (no Metal

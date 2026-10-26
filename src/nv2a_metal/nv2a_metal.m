@@ -200,6 +200,7 @@ static struct {
 
 /* Clear load actions waiting for the next pass on the bound target. */
 static struct { unsigned mask; float rgba[4]; float depth; uint32_t stencil; } g_pending_clear;
+static int g_zrev;              /* reversed depth: see mtl_zrev */
 
 /* Counters for the report. */
 static uint64_t g_n_draws, g_n_passes, g_n_frames, g_n_quad_clears, g_n_load_clears;
@@ -598,7 +599,7 @@ static uint32_t target_new(uint32_t pw, uint32_t ph, int flat)
         if (dst) {
             rp.depthAttachment.texture = dst;
             rp.depthAttachment.loadAction = MTLLoadActionClear;
-            rp.depthAttachment.clearDepth = 1.0;
+            rp.depthAttachment.clearDepth = g_zrev ? 0.0 : 1.0;    /* the far plane */
             rp.depthAttachment.storeAction = MTLStoreActionStore;
             rp.stencilAttachment.texture = dst;
             rp.stencilAttachment.loadAction = MTLLoadActionClear;
@@ -763,6 +764,10 @@ static id<MTLFunction> compile_fn(const char *src, NSString *name, const char *w
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     o.fastMathEnabled = fast ? YES : NO;
 #pragma clang diagnostic pop
+    /* The position computed the same way in every program (see vsh_invariant
+     * in nv2a_vsh.c): what makes [[invariant]] mean anything. */
+    if (nv2a_vsh_msl_invariant && [o respondsToSelector:@selector(setPreserveInvariance:)])
+        o.preserveInvariance = YES;
     lib = [g_dev newLibraryWithSource:[NSString stringWithUTF8String:src] options:o error:&err];
     if (!lib) {
         fprintf(stderr, "  [MTL] %s (%s) failed to compile:\n%s\n", what,
@@ -1839,6 +1844,10 @@ static int mtl_init(void)
     int i;
     g_dev = MTLCreateSystemDefaultDevice();
     if (!g_dev) return 0;
+    { MTLCompileOptions *probe = [MTLCompileOptions new];
+      const char *v = getenv("RECOMP_GL_INVARIANT");
+      nv2a_vsh_msl_invariant = [probe respondsToSelector:@selector(setPreserveInvariance:)]
+                               && !(v && !atoi(v)); }
     g_queue = [g_dev newCommandQueue];
     if (!g_queue) return 0;
     g_inflight = dispatch_semaphore_create(MTL_FRAMES_IN_FLIGHT);
@@ -2133,6 +2142,17 @@ static uint32_t mtl_target_smaa(uint32_t h)
     return g_sm.out;
 }
 
+/* Reversed depth (nv2a_vsh.c, depth_defines): the depth buffer is already
+ * 32-bit floating point and the clip volume already runs z from 0 to w, so
+ * there is nothing to switch -- only a new target's depth starts at 0, the
+ * far plane, instead of 1. The comparisons and clear values are turned
+ * around by the front half. */
+static int mtl_zrev(int want)
+{
+    g_zrev = want ? 1 : 0;
+    return g_zrev;
+}
+
 static const Nv2aGfx g_metal = {
     "metal", NV2A_LANG_MSL, 0,
     mtl_init,
@@ -2149,6 +2169,7 @@ static const Nv2aGfx g_metal = {
     mtl_cache_open, NULL,       /* builds on a thread of its own */
     mtl_target_smaa,
     mtl_samples_max, mtl_samples,
+    mtl_zrev,
 };
 
 const Nv2aGfx *nv2a_gfx_metal(void) { return &g_metal; }

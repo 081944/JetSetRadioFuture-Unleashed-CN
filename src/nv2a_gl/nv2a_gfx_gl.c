@@ -23,6 +23,13 @@
 #  undef GL_GLEXT_PROTOTYPES
 #  include <GLES3/gl32.h>
 #  include <GLES2/gl2ext.h>
+#  include <SDL2/SDL.h>     /* SDL_GL_GetProcAddress, for EXT_clip_control: ES is always SDL's */
+#  ifndef GL_LOWER_LEFT_EXT
+#    define GL_LOWER_LEFT_EXT  0x8CA1
+#  endif
+#  ifndef GL_ZERO_TO_ONE_EXT
+#    define GL_ZERO_TO_ONE_EXT 0x935F
+#  endif
    /* The NDK's gl2ext.h predates EXT_depth_clamp (Mesa's has it). */
 #  ifndef GL_DEPTH_CLAMP_EXT
 #    define GL_DEPTH_CLAMP_EXT 0x864F
@@ -149,6 +156,69 @@ static void resolve(uint32_t h)
     g_resolves++;
 }
 
+/*
+ * Reversed depth (nv2a_vsh.c, depth_defines; the comparisons and clears are
+ * the front half's). Two things of the device's: a clip volume with z from 0
+ * to w, as the console's -- through OpenGL's own -1..1 the far end's
+ * precision would be lost again on the way to the buffer -- which takes
+ * glClipControl (OpenGL 4.5 or ARB_clip_control; OpenGL ES with
+ * EXT_clip_control); and a 32-bit floating-point depth buffer. A Mac's OpenGL
+ * (4.1) has no glClipControl and stays as it was.
+ */
+static GLenum g_depth_fmt = GL_DEPTH24_STENCIL8;
+
+#if !defined(NV2A_GLES) && !defined(NV2A_GL_USE_CGL) && !defined(__APPLE__) && !defined(_WIN32)
+/* The context's version and extensions, without a loader. */
+static int glx_version_at_least(int maj, int mnr)
+{
+    const char *v = (const char *)glGetString(GL_VERSION);
+    int a = 0, b = 0;
+    if (!v || sscanf(v, "%d.%d", &a, &b) != 2) return 0;
+    return a > maj || (a == maj && b >= mnr);
+}
+static int glx_has_ext(const char *name)
+{
+    GLint n = 0, i;
+    glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+    for (i = 0; i < n; i++) {
+        const char *e = (const char *)glGetStringi(GL_EXTENSIONS, (GLuint)i);
+        if (e && !strcmp(e, name)) return 1;
+    }
+    return 0;
+}
+#endif
+
+static int glx_zrev(int want)
+{
+    int ok = 0;
+    if (!want) return 0;
+    while (glGetError() != GL_NO_ERROR) ;
+#if defined(NV2A_GLES)
+    if (gles_has_ext("GL_EXT_clip_control")) {
+        typedef void (*ClipControlFn)(GLenum, GLenum);
+        ClipControlFn cc = (ClipControlFn)SDL_GL_GetProcAddress("glClipControlEXT");
+        if (cc) { cc(GL_LOWER_LEFT_EXT, GL_ZERO_TO_ONE_EXT); ok = 1; }
+    }
+#elif defined(NV2A_GL_USE_CGL) || defined(__APPLE__)
+    ok = 0;
+#elif defined(_WIN32)
+    if (epoxy_gl_version() >= 45 || epoxy_has_gl_extension("GL_ARB_clip_control")) {
+        glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
+        ok = 1;
+    }
+#else
+    if (glx_version_at_least(4, 5) || glx_has_ext("GL_ARB_clip_control")) {
+        glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
+        ok = 1;
+    }
+#endif
+    if (ok && glGetError() != GL_NO_ERROR) ok = 0;
+    if (ok) g_depth_fmt = GL_DEPTH32F_STENCIL8;
+    fprintf(stderr, "  [GL] glClipControl: %s\n", ok ? "yes -- depth reversed, 32-bit float"
+                                                     : "no -- depth kept as the console keeps it");
+    return ok;
+}
+
 static void ms_free(int i)
 {
     if (g_rt[i].msfbo) glDeleteFramebuffers(1, &g_rt[i].msfbo);
@@ -168,7 +238,7 @@ static int ms_new(int i, int n)
     glBindRenderbuffer(GL_RENDERBUFFER, g_rt[i].mscol);
     glRenderbufferStorageMultisample(GL_RENDERBUFFER, n, GL_RGBA8, pw, ph);
     glBindRenderbuffer(GL_RENDERBUFFER, g_rt[i].msds);
-    glRenderbufferStorageMultisample(GL_RENDERBUFFER, n, GL_DEPTH24_STENCIL8, pw, ph);
+    glRenderbufferStorageMultisample(GL_RENDERBUFFER, n, g_depth_fmt, pw, ph);
     glBindFramebuffer(GL_FRAMEBUFFER, g_rt[i].msfbo);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                               GL_RENDERBUFFER, g_rt[i].mscol);
@@ -203,7 +273,7 @@ static uint32_t target_new(uint32_t pw, uint32_t ph, int flat)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glBindRenderbuffer(GL_RENDERBUFFER, g_rt[i].rb);
     /* With a stencil: the title keeps its shadow counts there. */
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8,
+    glRenderbufferStorage(GL_RENDERBUFFER, g_depth_fmt,
                           (GLsizei)pw, (GLsizei)ph);
     glBindFramebuffer(GL_FRAMEBUFFER, g_rt[i].fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
@@ -508,7 +578,7 @@ static GLuint compile(GLenum stage, const char *src, const char *what)
 }
 
 /* Compile and link: a GL program object, or 0 having said why. */
-static GLuint glx_build(const char *vsrc, const char *fsrc, const char *what)
+static GLuint glx_build_once(const char *vsrc, const char *fsrc, const char *what)
 {
     GLuint vs, fs, prog;
     GLint ok = 0;
@@ -531,6 +601,29 @@ static GLuint glx_build(const char *vsrc, const char *fsrc, const char *what)
         fprintf(stderr, "  [GL] %s: link failed:\n%.*s\n", what, (int)n, log);
         glDeleteProgram(prog);
         return 0;
+    }
+    return prog;
+}
+
+/* ...and, should a driver refuse the invariant position the vertex programs
+ * declare (nv2a_vsh.c, vsh_invariant -- standard since GLSL 1.30 and GLSL ES
+ * 3.00, but a driver may still balk), the same program without it: a picture
+ * with a little z-fighting rather than none at all. */
+static GLuint glx_build(const char *vsrc, const char *fsrc, const char *what)
+{
+    static const char inv[] = "invariant gl_Position;\n";
+    const char *at;
+    GLuint prog = glx_build_once(vsrc, fsrc, what);
+    if (!prog && (at = strstr(vsrc, inv)) != NULL) {
+        size_t n = strlen(vsrc), k = (size_t)(at - vsrc);
+        char *alt = (char *)malloc(n + 1);
+        if (alt) {
+            memcpy(alt, vsrc, k);
+            memcpy(alt + k, at + sizeof inv - 1, n - k - (sizeof inv - 1) + 1);
+            fprintf(stderr, "  [GL] %s: building it again without the invariant position\n", what);
+            prog = glx_build_once(alt, fsrc, what);
+            free(alt);
+        }
     }
     return prog;
 }
@@ -1648,6 +1741,7 @@ static const Nv2aGfx g_gl = {
     glx_cache_open, glx_cache_idle,
     glx_target_smaa,
     glx_samples_max, glx_samples,
+    glx_zrev,
 };
 
 const Nv2aGfx *nv2a_gfx_gl(void) { return &g_gl; }

@@ -151,6 +151,15 @@ int nv2a_vsh_emit_msl(const Nv2aVshProgram *p, char *buf, int bufsize);
  * fragment emitter can repeat it verbatim rather than keeping its own copy. */
 const char *nv2a_msl_varying_struct(void);
 
+/* Set (before any program is emitted) by a Metal backend whose compiler
+ * honours [[invariant]] -- one that compiles with preserveInvariance. */
+extern int nv2a_vsh_msl_invariant;
+
+/* Reversed depth, and an OpenGL clip volume with z from 0 to w (see
+ * depth_defines in nv2a_vsh.c): set before the first program is emitted. */
+extern int nv2a_vsh_zrev;
+extern int nv2a_vsh_gl_clip_z01;
+
 /* Human-readable disassembly, for bring-up and for diffing against a
  * reference. Returns characters written. */
 int nv2a_vsh_disasm(const Nv2aVshProgram *p, char *buf, int bufsize);

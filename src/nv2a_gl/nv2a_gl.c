@@ -780,6 +780,11 @@ static struct {
     unsigned long long hitches, logged, compiles;
     double   compile_s, compile_worst;
 } g_ht;                                         /* the whole run */
+/* Reversed depth (zrev_start, below gfx_init's declaration). */
+static int g_zrev;
+static uint32_t zrev_func(uint32_t f);
+static void zrev_row(float out[4]);
+
 /*
  * Internal resolution.
  *
@@ -4078,6 +4083,7 @@ static void dump_fbo(uint32_t rt, const char *prefix, int *counter, int limit)
                   fprintf(stderr, "  [GL] depth readback: not on the %s backend\n", G->name);
                   return;
               }
+              if (g_zrev) for (i = 0; i < np; i++) zb[i] = 1.0f - zb[i];
               for (i = 0; i < np; i++) {
                   if (zb[i] < lo) lo = zb[i];
                   if (zb[i] < 1.0f && zb[i] > hi) hi = zb[i];
@@ -5835,6 +5841,11 @@ static void do_draw_body(void)
          * batch this title draws has a black specular colour. */
         uni1f(NV2A_U_LTSPECPOW, 16.0f);
     }
+    if (g_zrev && S.xf_mode == NV2A_XF_MODE_FIXED && uses(slot, NV2A_U_ZREV)) {
+        float r[4];
+        zrev_row(r);
+        G->uniform_f(NV2A_U_ZREV, r, 1);
+    }
     if (uses(slot, NV2A_U_FFMAT)) {
         G->uniform_f(NV2A_U_FFMAT, &S.u.ff_mat[0][0], 4);
         if (uses(slot, NV2A_U_FFVPOFF))
@@ -6183,6 +6194,8 @@ static void do_draw_body(void)
           { static int ge2le = -1;
             if (ge2le < 0) ge2le = getenv("RECOMP_GL_GEQUAL_AS_LEQUAL") ? 1 : 0;
             if (ge2le && rs.depth_func == 0x206) rs.depth_func = 0x203; }
+          /* Reversed depth: nearer is larger (zrev_start). */
+          if (g_zrev) rs.depth_func = zrev_func((uint32_t)rs.depth_func);
         }
         rs.blend_enable = S.blend_enable;
         rs.blend_src    = S.blend_src;
@@ -9333,6 +9346,9 @@ static void do_clear(uint32_t param)
     if (param & 0x01) {
         /* Z is the top 24 bits of the combined z/stencil clear value. */
         depth = (float)((double)(S.clear_zstencil >> 8) / 16777215.0);
+        /* Reversed depth keeps 1 - z (zrev_start); done in double, so that
+         * the far plane's 1 comes out exactly 0. */
+        if (g_zrev) depth = (float)(1.0 - (double)(S.clear_zstencil >> 8) / 16777215.0);
         mask |= 2u;
     }
     /* NV097_CLEAR_SURFACE_STENCIL, bit 1, is its own request: this used to
@@ -10030,6 +10046,74 @@ static void present(int is_frame)
  */
 static void ensure_ready(void);   /* defined just below */
 static int gfx_init(uint32_t w, uint32_t h);
+
+/*
+ * Reversed depth: the depth buffer holds 1 - z, in 32-bit floating point --
+ * floating point's precision where the far end of the scene needs it, which
+ * the console's 24-bit z (and z kept as z in a float) puts at the near end.
+ * The why is in nv2a_vsh.c (depth_defines); here, the parts that follow from
+ * it: the comparisons turned around, clears to 1 - z, and for the
+ * fixed-function batches the row that makes 1 - z from the position.
+ *
+ * On wherever the device can (Metal; OpenGL with glClipControl), unless
+ * RECOMP_GL_ZREV=0. Decided once, before the first target and program.
+ * (g_zrev is declared near the top.)
+ */
+
+static uint32_t zrev_func(uint32_t f)
+{
+    switch (f) {
+    case 0x201: return 0x204;          /* LESS     -> GREATER */
+    case 0x203: return 0x206;          /* LEQUAL   -> GEQUAL  */
+    case 0x204: return 0x201;          /* GREATER  -> LESS    */
+    case 0x206: return 0x203;          /* GEQUAL   -> LEQUAL  */
+    default:    return f;              /* NEVER, EQUAL, NOTEQUAL, ALWAYS */
+    }
+}
+
+/*
+ * 1 - z, times w, as one row of the fixed-function transform.
+ *
+ * The epilogue's z is (p.z / p.w - z0) / (z1 - z0), with p the composite
+ * matrix times the position and z0..z1 the screen-space range it maps to
+ * 0..1 (CLIP_MIN/MAX, or the viewport's z offset and scale). So
+ *
+ *     (1 - z) * p.w = (z1 * p.w - p.z) / (z1 - z0)
+ *                   = dot(position, (z1 * row_w - row_z) / (z1 - z0))
+ *
+ * -- a row worked out here in double precision, from the title's own
+ * single-precision rows, and one dot product on the GPU. Computed the long
+ * way there instead, 1 - z near the far plane would be the difference of two
+ * numbers close to 1, and every bit the reversal was for would be gone.
+ */
+static void zrev_row(float out[4])
+{
+    double z0, z1;
+    int k;
+    if (S.u.z_clip[1] > S.u.z_clip[0]) {
+        z0 = S.u.z_clip[0];
+        z1 = S.u.z_clip[1];
+    } else {
+        double sc = S.u.vp_scale[2] != 0.0f ? (double)S.u.vp_scale[2] : 1.0;
+        z0 = S.u.vp_off[2];
+        z1 = z0 + sc;
+    }
+    for (k = 0; k < 4; k++)
+        out[k] = (float)((z1 * (double)S.u.ff_mat[3][k] - (double)S.u.ff_mat[2][k]) / (z1 - z0));
+}
+
+static void zrev_start(void)
+{
+    const char *v = getenv("RECOMP_GL_ZREV");
+    int want = v ? atoi(v) != 0 : 1;
+    g_zrev = (want && G->zrev) ? (G->zrev(1) ? 1 : 0) : 0;
+    nv2a_vsh_zrev = g_zrev;
+    nv2a_vsh_gl_clip_z01 = g_zrev && G->lang == NV2A_LANG_GLSL;
+    fprintf(stderr, "  [GL] depth: %s\n",
+            g_zrev ? "reversed, 32-bit float"
+                   : want ? "as the console keeps it (this device cannot reverse it)"
+                          : "as the console keeps it (RECOMP_GL_ZREV=0)");
+}
 
 static void split_batch_if_state_moved(void)
 {
@@ -11414,6 +11498,7 @@ static int gfx_init(uint32_t w, uint32_t h)
             G = m;
             g_is_gl = 0;
             fprintf(stderr, "  [GL] backend: %s\n", G->name);
+            zrev_start();
             aa_start();
             shader_cache_start();
             return 1;
@@ -11431,6 +11516,7 @@ static int gfx_init(uint32_t w, uint32_t h)
     }
     if (!gl_init(w, h)) return 0;     /* the context, then the device */
     fprintf(stderr, "  [GL] backend: %s\n", G->name);
+    zrev_start();
     aa_start();
     shader_cache_start();
 #if defined(NV2A_GL_USE_SDL)

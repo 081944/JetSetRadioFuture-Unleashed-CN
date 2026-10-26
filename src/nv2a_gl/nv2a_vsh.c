@@ -361,9 +361,11 @@ static const char *GLSL_PRELUDE =
 NV2A_GLSL_VERSION
 "// NV2A vertex program, translated.\n"
 "// OpenGL's clip volume puts z in [-w, w]; the console's, like D3D's, in\n"
-"// [0, w]. The epilogue converts.\n"
-"#define NV2A_CLIP_Z01 0\n"
+"// [0, w]. The epilogue converts -- unless the device was switched to the\n"
+"// console's (glClipControl), which reversed depth needs: NV2A_CLIP_Z01,\n"
+"// defined after this with NV2A_ZREV (depth_defines).\n"
 "uniform vec4 c[192];\n"
+"uniform vec4 zRev;      // reversed depth: the fixed-function z row, see nv2a_gl.c\n"
 "uniform vec4 vpScale;   // NV097_SET_VIEWPORT_SCALE\n"
 "uniform vec2 zClip;        // NV097_SET_CLIP_MIN / _MAX\n"
 "uniform vec4 vpOff;     // NV097_SET_VIEWPORT_OFFSET\n"
@@ -441,6 +443,64 @@ NV2A_GLSL_VERSION
 "float nv_rcc(float x) { return nv_away0(1.0 / x); }\n";
 
 /*
+ * The position, computed the same way in every program.
+ *
+ * The console's transform unit gives the same vertex the same position every
+ * time the same transform is applied to it, and drawing in several passes
+ * relies on that: a second pass over the same polygons -- a decal over its
+ * wall, a highlight over its surface -- passes the depth test "less or equal"
+ * only because its depth comes out EXACTLY equal to the first pass's. A
+ * shader compiler owes no such thing: two shaders computing the same
+ * expression may round it differently (a fused multiply-add taken in one and
+ * not in the other), and on some graphics drivers the first pass then wins
+ * pixels back from the second in a speckle. GLSL's "invariant gl_Position"
+ * and Metal's [[invariant]] (with MTLCompileOptions.preserveInvariance) are
+ * that promise. RECOMP_GL_INVARIANT=0 leaves them out.
+ */
+static int vsh_invariant(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *v = getenv("RECOMP_GL_INVARIANT"); on = v ? atoi(v) != 0 : 1; }
+    return on;
+}
+static const char *GLSL_INVARIANT = "invariant gl_Position;\n";
+/* Set by the Metal backend when its compiler can keep the promise. */
+int nv2a_vsh_msl_invariant;
+
+/*
+ * Reversed depth (nv2a_gl.c, zrev_start): the depth buffer holds 1 - z, in
+ * 32-bit floating point, cleared to 0, its comparisons turned around.
+ *
+ * Why: the console's depth buffer is 24-bit integer, z = f/(f-n) (1 - n/w),
+ * and in this title's projection (n about 1, f about 5100) that leaves under
+ * two steps of depth per unit of distance at 3000 units -- a poster a unit in
+ * front of its wall, a window frame on its building, is one or two steps from
+ * it there. The console gets away with it, just; a GPU does not, because
+ * every step on the way here -- the divide, the depth range, the
+ * rasteriser's plane equation in single precision, the conversion to 24 bits
+ * -- rounds to a step or two of its own near z = 1. Distant graffiti, windows
+ * and signs flickered against what they sat on.
+ *
+ * Kept as 1 - z in a float, depth carries floating point's precision -- the
+ * finest near zero -- to the far end of the scene instead of the near end,
+ * where z itself has all of its. For the fixed-function batches (the city:
+ * the buildings, the roads, what is painted on them) the reversed z is made
+ * in one step, from the position, with a row folded out of the matrix's own z
+ * and w rows in double precision (zRev); a program's, from what it wrote.
+ *
+ * NV2A_CLIP_Z01: the device's clip volume runs z from 0 to w (Metal always;
+ * OpenGL with glClipControl, which reversed depth needs there). Set before
+ * the first program is emitted.
+ */
+int nv2a_vsh_zrev;
+int nv2a_vsh_gl_clip_z01;
+static void depth_defines(SB *sb, int msl)
+{
+    sb_add(sb, "#define NV2A_CLIP_Z01 %d\n#define NV2A_ZREV %d\n",
+           msl ? 1 : nv2a_vsh_gl_clip_z01 ? 1 : 0, nv2a_vsh_zrev ? 1 : 0);
+}
+
+/*
  * Screen space back to clip space.
  *
  * Shared by the translated programs and by the fixed-function emitter: the
@@ -494,7 +554,12 @@ static void emit_viewport_epilogue(SB *sb, int ff)
             "    ndc.z = ndc.z * 2.0 - 1.0;   // D3D depth [0,1] -> GL [-1,1]\n"
             "#endif\n"
             "    ndc.w = oPos.w;\n"
+            "#if NV2A_ZREV\n"
+            "    // 1 - z, times w, in one step from the position (depth_defines).\n"
+            "    gl_Position = vec4(ndc.xy * ndc.w, dot(v0, zRev), ndc.w);\n"
+            "#else\n"
             "    gl_Position = vec4(ndc.xyz * ndc.w, ndc.w);\n"
+            "#endif\n"
             "    oFogC = nv_fog(oFog.x);\n"
             "    gl_PointSize = max(oPts.x, 1.0);\n");
         return;
@@ -503,7 +568,9 @@ static void emit_viewport_epilogue(SB *sb, int ff)
         "    if (posMode == 1) {\n"
         "        // The program left clip space alone: hand it over as is,\n"
         "        // remapping depth only where the target API wants [-w,w].\n"
-        "#if NV2A_CLIP_Z01\n"
+        "#if NV2A_CLIP_Z01 && NV2A_ZREV\n"
+        "        gl_Position = vec4(oPos.xy, oPos.w - oPos.z, oPos.w);\n"
+        "#elif NV2A_CLIP_Z01\n"
         "        gl_Position = vec4(oPos.xyz, oPos.w);\n"
         "#else\n"
         "        gl_Position = vec4(oPos.xy, 2.0 * oPos.z - oPos.w, oPos.w);\n"
@@ -517,6 +584,9 @@ static void emit_viewport_epilogue(SB *sb, int ff)
         "        ndc.x = (oPos.x - wideShift) * 2.0 / vpSurface.x - 1.0;\n"
         "        ndc.y = 1.0 - oPos.y * 2.0 / vpSurface.y;\n"
         "        ndc.z = oPos.z / 16777215.0;\n"
+        "#if NV2A_ZREV\n"
+        "        ndc.z = 1.0 - ndc.z;\n"
+        "#endif\n"
         "#if !NV2A_CLIP_Z01\n"
         "        ndc.z = ndc.z * 2.0 - 1.0;\n"
         "#endif\n"
@@ -574,6 +644,9 @@ static void emit_viewport_epilogue(SB *sb, int ff)
         "    ndc.z = (zClip.y > zClip.x)\n"
         "          ? (oPos.z - zClip.x) / (zClip.y - zClip.x)\n"
         "          : (oPos.z - vpOff.z) / (vpScale.z != 0.0 ? vpScale.z : 1.0);\n"
+        "#endif\n"
+        "#if NV2A_ZREV\n"
+        "    ndc.z = 1.0 - ndc.z;\n"
         "#endif\n"
         "#if !NV2A_CLIP_Z01\n"
         "    ndc.z = ndc.z * 2.0 - 1.0;   // D3D depth [0,1] -> GL [-1,1]\n"
@@ -788,6 +861,8 @@ static int emit_ff(const Nv2aVshFixed *f, char *buf, int bufsize, int msl)
         msl_vertex_head(&sb, f->inputs_read);
     } else {
     sb_add(&sb, "%s", GLSL_PRELUDE);
+    depth_defines(&sb, 0);
+    if (vsh_invariant()) sb_add(&sb, "%s", GLSL_INVARIANT);
     for (i = 0; i < NV2A_VSH_NUM_INPUTS; i++)
         if (f->inputs_read & (1u << i))
             sb_add(&sb, "layout(location = %d) in vec4 v%d;\n", i, i);
@@ -1124,6 +1199,8 @@ int nv2a_vsh_emit_glsl(const Nv2aVshProgram *p, char *buf, int bufsize)
     int i;
 
     sb_add(&sb, "%s", GLSL_PRELUDE);
+    depth_defines(&sb, 0);
+    if (vsh_invariant()) sb_add(&sb, "%s", GLSL_INVARIANT);
 
     /* Only the inputs the program reads. Declaring all sixteen would compile
      * but would make every draw look like it needs sixteen bound arrays. */
@@ -1178,18 +1255,27 @@ int nv2a_vsh_emit_glsl(const Nv2aVshProgram *p, char *buf, int bufsize)
  * One definition, handed out, is what stops a member added on one side from
  * silently shifting every varying on the other.
  */
+#define MSL_VARYINGS_REST \
+"    float  gl_PointSize [[point_size]];\n" \
+"    float4 oD0;\n" \
+"    float4 oD1;\n" \
+"    float4 oT0;\n" \
+"    float4 oT1;\n" \
+"    float4 oT2;\n" \
+"    float4 oT3;\n" \
+"    float  oFogC;\n" \
+"};\n"
+/* The vertex stage's own copy, its position declared invariant: the
+ * fragment stage reads the same struct without the qualifier, which only a
+ * vertex function's output may carry. */
+static const char *MSL_VARYINGS_INVARIANT =
+"struct Nv2aVshOut {\n"
+"    float4 gl_Position [[position, invariant]];\n"
+MSL_VARYINGS_REST;
 static const char *MSL_VARYINGS =
 "struct Nv2aVshOut {\n"
 "    float4 gl_Position [[position]];\n"
-"    float  gl_PointSize [[point_size]];\n"
-"    float4 oD0;\n"
-"    float4 oD1;\n"
-"    float4 oT0;\n"
-"    float4 oT1;\n"
-"    float4 oT2;\n"
-"    float4 oT3;\n"
-"    float  oFogC;\n"
-"};\n";
+MSL_VARYINGS_REST;
 
 const char *nv2a_msl_varying_struct(void) { return MSL_VARYINGS; }
 
@@ -1200,7 +1286,7 @@ static const char *MSL_PRELUDE =
 "// Metal's clip volume puts z in [0, w], the same as the console's, so the\n"
 "// epilogue leaves depth alone -- a remap that is right for OpenGL halves\n"
 "// the depth range here and buries everything in the near half.\n"
-"#define NV2A_CLIP_Z01 1\n"
+"// (NV2A_CLIP_Z01 and NV2A_ZREV follow, from depth_defines.)\n"
 "typedef float2 vec2;\n"
 "typedef float3 vec3;\n"
 "typedef float4 vec4;\n"
@@ -1251,7 +1337,9 @@ static void msl_vertex_head(SB *sb, uint16_t inputs_read)
     char tmp[4096];
     int i;
 
-    sb_add(sb, "%s\n%s\n", MSL_PRELUDE, MSL_VARYINGS);
+    sb_add(sb, "%s\n%s\n", MSL_PRELUDE,
+           nv2a_vsh_msl_invariant && vsh_invariant() ? MSL_VARYINGS_INVARIANT : MSL_VARYINGS);
+    depth_defines(sb, 1);
     if (nv2a_uniform_msl_struct(tmp, (int)sizeof tmp, 0)) sb_add(sb, "%s\n", tmp);
     else sb->overflow = 1;
     sb_add(sb,
