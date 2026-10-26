@@ -10,6 +10,71 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.5.7 — 26 October 2026
+
+What players reported from 0.5.4 to 0.5.6, and two things they asked for. Every
+platform is new in 0.5.7.
+
+- **Rails, rafters and walkways are no longer missing.** The renderer kept a
+  batch's indices in an array of 16,384 and dropped whatever came after,
+  without a word; the console has no such limit. Most of the game's batches
+  are far smaller, but a few areas send their scenery in longer ones: on
+  Kibogaoka Hill a triangle list of 20,745 indices every frame, in the
+  Fortified Residential Zone lists of up to 35,580. Their last thousands of
+  triangles were never drawn: on Kibogaoka Hill, among others, a walkway
+  and its railing across the back of the square at the start; in the
+  Fortified Residential Zone, up to about 12,000 triangles of scenery a frame.
+  Batches are kept whole now (up to a million indices), and one past the
+  old limit is noted in the log (`[GL] big batch`). Thanks to the players
+  who reported it!
+- **The boost dash's haze no longer breaks up over shadows and glass.** The
+  boost effect draws the frame twice -- sharp, and a small distorted copy --
+  and blends the sharp one over the copy by its alpha. The frame is a 16-bit
+  surface with no alpha on the console, so that alpha is always 1 there; here
+  the targets kept whatever alpha a shadow, a pane of glass or a spray of
+  particles had written, and the distorted copy showed through, blocky and
+  smeared, exactly there. Surfaces with no alpha channel now keep none
+  (`RECOMP_GL_SURF_ALPHA=1`: as before).
+- **Less z-fighting in the distance.** Graffiti, windows and signs are drawn
+  over the walls they sit on. Two things could make them flicker against the
+  wall far away: the position worked out slightly differently by different
+  shaders -- it is invariant now -- and a depth buffer with its precision near
+  the camera. Depth is now kept reversed, in 32-bit floating point, wherever
+  the device allows it (Metal; OpenGL 4.5 or ARB_clip_control, which Windows
+  and Linux drivers have; OpenGL ES with EXT_clip_control), which puts the
+  precision in the distance. On the Mac's OpenGL and on older drivers depth
+  stays as it was; the log says which (`[GL] depth:`).
+  `RECOMP_GL_ZREV=0` and `RECOMP_GL_INVARIANT=0` turn either off.
+- **Up to 6× the resolution, for 4K screens.** The resolution menus
+  (Windows: Video menu and F9; Linux: F9; Mac: Video › Resolution) go to 5×
+  and 6×. 6× is 3840×2880: a 4K screen's width one pixel for one, and in
+  widescreen its 3840×2160 exactly. Android and iPhone stay at up to 4×.
+- **A portable install on Windows and Linux.** On the first start the Windows
+  build asks whether to keep its settings, cache, logs and unpacked disc
+  images beside **JSRF Unleashed.exe** (portable) or in
+  `%LOCALAPPDATA%\JSRF Unleashed`. A file named `portable.txt` beside the exe
+  is the switch: `--portable` makes it later (the settings come along), and
+  deleting it goes back. A game folder or disc image put in that folder is
+  found by itself and remembered relative to it, so the whole folder can move
+  to another computer or onto a USB drive. The Linux build has the same switch
+  (`portable.txt` beside `jsrf-unleashed`, `--portable`). Both launchers take
+  `--scale 1` to `6`.
+- For looking into missing geometry: `RECOMP_GL_PRIMLOG=<s>` counts draws and
+  vertices by primitive type every s seconds, and the draws dropped before
+  they reach the GPU, by reason.
+- Tested on a Mac, Metal and OpenGL, 0.5.6 against 0.5.7: Kibogaoka Hill
+  (the walkway missing in every one of twelve consecutive frames of 0.5.6,
+  there in every one of 0.5.7's) and the Fortified Residential Zone (the
+  batch sizes, and where on screen the part past the old limit lands); the
+  boost dash in the race against Beat on Dogenzaka Hill (the haze clean);
+  Dogenzaka Hill in seven missions with the batch log (none of its batches
+  goes past the old limit); then the release build on the title, on
+  Dogenzaka Hill with SMAA and MSAA 4× (Metal and OpenGL), in the Fortified
+  Residential Zone and on Kibogaoka Hill. Linux (Mesa): the attract demo,
+  depth reversed, and the portable switch. Windows (under Wine): the title
+  screen, depth reversed, the first-start question and the portable switch.
+  The Android and iPhone builds were built and checked, not run.
+
 ## 0.5.6 — 25 October 2026
 
 Shadows, which a Windows player reported missing from 0.5.5: they had never
