@@ -27,6 +27,15 @@
       },
       "versions": [
         {
+          "version": "0.5.7",
+          "buildVersion": "0.5.7",
+          "date": "2026-10-26T10:26:20Z",
+          "localizedDescription": "Rails, rafters and walkways that were missing (Kibogaoka Hill, the Fortified Residential Zone among them) are drawn again: the game sends that scenery in batches longer than the renderer kept. The boost dash's haze no longer breaks up over shadows and glass, and graffiti, windows and signs flicker less against their walls in the distance.",
+          "downloadURL": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/download/v0.5.7/JSRF-Unleashed-iOS.ipa",
+          "size": 13359943,
+          "minOSVersion": "15.0"
+        },
+        {
           "version": "0.5.6",
           "buildVersion": "0.5.6",
           "date": "2026-10-25T12:34:11Z",
