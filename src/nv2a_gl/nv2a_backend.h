@@ -408,6 +408,11 @@ typedef struct Nv2aGfx {
      * it is. NULL, or 0, where the device cannot -- an OpenGL without
      * glClipControl. */
     int      (*zrev)(int want);
+    /* For a slow frame's line in the log: milliseconds so far that the GPU
+     * spent on the work it finished, and that the render thread waited for
+     * it (every frame's buffers in flight, none to record into). NULL where
+     * the backend cannot say. */
+    void     (*gpu_ms)(double *busy, double *waited);
 } Nv2aGfx;
 
 /* The implementations. Each returns NULL where it cannot run (no Metal

@@ -774,6 +774,7 @@ static struct {
     double   compile_s, compile_worst, tex_s;
     double   idle_s;                            /* building ahead for the shader cache */
     double   pso_ms0;                           /* the backend's pipeline time at the frame's start */
+    double   gpu_busy0, gpu_wait0;              /* and its GPU times (gpu_ms) */
     uint32_t draws0;
 } g_hf;                                         /* this frame */
 static struct {
@@ -9726,23 +9727,34 @@ static void frame_pace(void)
                           double other = ms - 1000.0 * (g_hf.compile_s + g_hf.tex_s + g_hf.idle_s) - pso;
                           char pl[96] = "";
                           if (G->pipeline_ms) snprintf(pl, sizeof pl, ", pipelines %.1f ms", pso);
+                          char gp[96] = "";
                           if (g_hf.idle_s > 0.0)
                               snprintf(pl + strlen(pl), sizeof pl - strlen(pl), ", %.1f ms building ahead",
                                        1000.0 * g_hf.idle_s);
+                          /* Of the rest, the GPU's part: what it was busy with
+                           * in the meantime (earlier frames' work included),
+                           * and how long the render thread waited for it. */
+                          if (G->gpu_ms) {
+                              double busy = 0.0, waited = 0.0;
+                              G->gpu_ms(&busy, &waited);
+                              snprintf(gp, sizeof gp, " (GPU busy %.1f ms, waited for %.1f)",
+                                       busy - g_hf.gpu_busy0, waited - g_hf.gpu_wait0);
+                          }
                           g_ht.logged++;
                           fprintf(stderr, "[HITCH] frame %u: %.1f ms flip to flip, %u draws | "
                                   "%u programs built in %.1f ms (worst %.1f)%s | %u textures new, "
-                                  "%.1f ms in textures | %.1f ms the rest\n",
+                                  "%.1f ms in textures | %.1f ms the rest%s\n",
                                   S.frames, ms, S.draws - g_hf.draws0, g_hf.compiles,
                                   1000.0 * g_hf.compile_s, 1000.0 * g_hf.compile_worst, pl,
-                                  g_hf.tex_new, 1000.0 * g_hf.tex_s, other < 0.0 ? 0.0 : other);
+                                  g_hf.tex_new, 1000.0 * g_hf.tex_s, other < 0.0 ? 0.0 : other, gp);
                       }
                   }
               }
               g_pace_st.last = t;
               memset(&g_hf, 0, sizeof g_hf);
               g_hf.draws0 = S.draws;
-              if (G->pipeline_ms) g_hf.pso_ms0 = G->pipeline_ms(); }
+              if (G->pipeline_ms) g_hf.pso_ms0 = G->pipeline_ms();
+              if (G->gpu_ms) G->gpu_ms(&g_hf.gpu_busy0, &g_hf.gpu_wait0); }
         }
 }
 

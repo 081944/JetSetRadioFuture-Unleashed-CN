@@ -1742,6 +1742,7 @@ static const Nv2aGfx g_gl = {
     glx_target_smaa,
     glx_samples_max, glx_samples,
     glx_zrev,
+    NULL,                       /* gpu_ms */
 };
 
 const Nv2aGfx *nv2a_gfx_gl(void) { return &g_gl; }

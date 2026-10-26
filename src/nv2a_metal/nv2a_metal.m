@@ -273,11 +273,15 @@ static void enc_end(void)
 
 /* A command buffer to record into. The first one of a frame waits until the
  * frame that last used this arena slot has finished on the GPU. */
+static double g_ms_gpu_wait;              /* the render thread's, in frame_begin */
+static atomic_llong g_gpu_busy_us;        /* added up by the completion handlers */
 static void frame_begin(void)
 {
     if (g_cb) return;
     if (!g_frame_open) {
+        double t0 = now_ms();
         dispatch_semaphore_wait(g_inflight, DISPATCH_TIME_FOREVER);
+        g_ms_gpu_wait += now_ms() - t0;
         g_frame_slot = (g_frame_slot + 1) % MTL_FRAMES_IN_FLIGHT;
         g_arena[g_frame_slot].cur = 0;
         g_arena[g_frame_slot].pos = 0;
@@ -287,6 +291,11 @@ static void frame_begin(void)
         g_vbuf = nil;
     }
     g_cb = [g_queue commandBuffer];
+    /* How long the GPU took over it, for the log's slow frames. */
+    [g_cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        CFTimeInterval s = b.GPUStartTime, e = b.GPUEndTime;
+        if (e > s) atomic_fetch_add(&g_gpu_busy_us, (long long)((e - s) * 1e6));
+    }];
 }
 
 /* Submit what is recorded. At the end of a frame, the arena slot is released
@@ -1948,6 +1957,11 @@ static void mtl_report(void)
 }
 
 static double mtl_pipeline_ms(void) { return g_ms_pso; }
+static void mtl_gpu_ms(double *busy, double *waited)
+{
+    *busy = (double)atomic_load(&g_gpu_busy_us) / 1000.0;
+    *waited = g_ms_gpu_wait;
+}
 
 /* ---- multisampling ------------------------------------------------------------------------------ */
 
@@ -2180,6 +2194,7 @@ static const Nv2aGfx g_metal = {
     mtl_target_smaa,
     mtl_samples_max, mtl_samples,
     mtl_zrev,
+    mtl_gpu_ms,
 };
 
 const Nv2aGfx *nv2a_gfx_metal(void) { return &g_metal; }
