@@ -785,6 +785,16 @@ static int g_zrev;
 static uint32_t zrev_func(uint32_t f);
 static void zrev_row(float out[4]);
 
+/* The most the resolution menus offer: 6x (3840x2880, for a 4K screen) on a
+ * computer; 4x on Android, as on the iPhone, where 4x already fills the
+ * screen and a 6x frame would be most of the memory a phone has to give.
+ * RECOMP_GL_SCALE itself still takes up to 8. */
+#if defined(__ANDROID__)
+#define NV2A_SCALE_MAX 4
+#else
+#define NV2A_SCALE_MAX 6
+#endif
+
 /*
  * Internal resolution.
  *
@@ -1491,8 +1501,12 @@ static void sdl_toggle_widescreen(void)
     fprintf(stderr, "[WIN] widescreen %s\n", on ? "on (16:9)" : "off (4:3)");
 }
 
-/* F9: the internal resolution, 1x to 4x the Xbox's 640x480 -- what the Mac's
- * Video menu and the iPhone's settings offer. The renderer sizes its targets
+/* F9: the internal resolution, 1x to 6x the Xbox's 640x480 (4x on Android,
+ * as the iPhone's settings) -- what the Mac's Video menu offers. 6x is
+ * 3840x2880: a 4K screen's width, one pixel for one, with the height drawn
+ * finer than the screen shows it -- in widescreen, where the 640x480 surface
+ * holds a 16:9 view squeezed, that is 3840x2160 exactly across. The
+ * renderer sizes its targets
  * once, at start-up, so a new one means starting again: after asking, the
  * choice is stored under the launchers' own "scale" key (they pass it on as
  * RECOMP_GL_SCALE), put in the environment and the engine relaunches itself
@@ -1525,9 +1539,13 @@ static void sdl_keys_release(void)
 
 static void sdl_choose_scale(void)
 {
-    static const char *const names[4] = {
-        "1x  640x480", "2x  1280x960", "3x  1920x1440", "4x  2560x1920" };
-    SDL_MessageBoxButtonData b[5];
+    static const char *const names[NV2A_SCALE_MAX] = {
+        "1x  640x480", "2x  1280x960", "3x  1920x1440", "4x  2560x1920",
+#if NV2A_SCALE_MAX > 4
+        "5x  3200x2400", "6x  3840x2880 (4K)"
+#endif
+    };
+    SDL_MessageBoxButtonData b[NV2A_SCALE_MAX + 1];
     SDL_MessageBoxData box;
     char msg[512];
     int cur = (int)gl_scale(), pick = -1, i, was_fs;
@@ -1541,31 +1559,32 @@ static void sdl_choose_scale(void)
     was_fs = 0;     /* the app is always full screen, and the box shows over it */
 #endif
     if (was_fs) sdl_toggle_fullscreen();
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < NV2A_SCALE_MAX; i++) {
         b[i].flags    = i + 1 == cur ? SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT : 0;
         b[i].buttonid = i + 1;
         b[i].text     = names[i];
     }
-    b[4].flags    = SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT;
-    b[4].buttonid = 0;
-    b[4].text     = "Cancel";
+    b[NV2A_SCALE_MAX].flags    = SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT;
+    b[NV2A_SCALE_MAX].buttonid = 0;
+    b[NV2A_SCALE_MAX].text     = "Cancel";
     /* Short lines: SDL's own X11 message box does not wrap, and cut the
      * first line off at its width. */
     snprintf(msg, sizeof msg,
              "The game is drawn at a multiple of the Xbox's 640x480,\n"
              "then fitted to the window. Higher is sharper and asks\n"
-             "more of the graphics card. Now: %dx (%dx%d).\n\n"
+             "more of the graphics card.%s\nNow: %dx (%dx%d).\n\n"
              "Changing it restarts the game: anything since\n"
              "your last save is lost.",
+             NV2A_SCALE_MAX > 4 ? " 6x suits a 4K screen." : "",
              cur, 640 * cur, 480 * cur);
     memset(&box, 0, sizeof box);
     box.flags      = SDL_MESSAGEBOX_INFORMATION | SDL_MESSAGEBOX_BUTTONS_LEFT_TO_RIGHT;
     box.window     = g_window;
     box.title      = "Resolution";
     box.message    = msg;
-    box.numbuttons = 5;
+    box.numbuttons = NV2A_SCALE_MAX + 1;
     box.buttons    = b;
-    if (SDL_ShowMessageBox(&box, &pick) != 0 || pick < 1 || pick > 4 || pick == cur) {
+    if (SDL_ShowMessageBox(&box, &pick) != 0 || pick < 1 || pick > NV2A_SCALE_MAX || pick == cur) {
         if (was_fs) sdl_toggle_fullscreen();
         sdl_keys_release();
         return;
@@ -1670,7 +1689,7 @@ static void sdl_menu_update(void)
 {
     int i, cur = (int)gl_scale();
     if (!g_menu_bar) return;
-    for (i = 1; i <= 4; i++)
+    for (i = 1; i <= NV2A_SCALE_MAX; i++)
         CheckMenuItem(g_menu_res, MENU_RES1 + i - 1,
                       MF_BYCOMMAND | (i == cur ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(g_menu_video, MENU_WIDE,
@@ -1715,6 +1734,8 @@ static void sdl_menu_init(void)
     AppendMenuW(g_menu_res, MF_STRING, MENU_RES1 + 1, L"2x  (1280 x 960)");
     AppendMenuW(g_menu_res, MF_STRING, MENU_RES1 + 2, L"3x  (1920 x 1440)");
     AppendMenuW(g_menu_res, MF_STRING, MENU_RES1 + 3, L"4x  (2560 x 1920)");
+    AppendMenuW(g_menu_res, MF_STRING, MENU_RES1 + 4, L"5x  (3200 x 2400)");
+    AppendMenuW(g_menu_res, MF_STRING, MENU_RES1 + 5, L"6x  (3840 x 2880) -- 4K");
     AppendMenuW(g_menu_aa, MF_STRING, MENU_SMAA, L"&SMAA");
     AppendMenuW(g_menu_aa, MF_SEPARATOR, 0, NULL);
     AppendMenuW(g_menu_aa, MF_STRING, MENU_MSAA1 + 0, L"MSAA &off");
@@ -1733,7 +1754,7 @@ static void sdl_menu_init(void)
 
 static void sdl_menu_command(unsigned id)
 {
-    if (id >= MENU_RES1 && id < MENU_RES1 + 4) {
+    if (id >= MENU_RES1 && id < MENU_RES1 + NV2A_SCALE_MAX) {
         int pick = (int)(id - MENU_RES1) + 1, ans = 0;
         char msg[256];
         SDL_MessageBoxButtonData b[2];

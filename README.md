@@ -60,21 +60,26 @@ Each run writes `last-run.log` into the game folder (with a few older ones in
 2. Run **JSRF Unleashed.exe**. It is not signed (that costs money every
    year), so the first time Windows may say it protected your PC: click
    **More info**, then **Run anyway**.
-3. It asks where your game is: pick the folder that contains `default.xbe`,
-   or the folder with your disc image (`.iso`) in it, which it offers to
-   unpack once into `%LOCALAPPDATA%\JSRF Unleashed`. It remembers the choice.
+3. The first time, it asks where to keep its settings, cache, logs and
+   unpacked disc images: in its own folder (**portable** — the whole folder can
+   then move, to another computer or onto a USB drive or SSD) or in
+   `%LOCALAPPDATA%\JSRF Unleashed`. Then where your game is: pick the folder
+   that contains `default.xbe`, or the folder with your disc image (`.iso`) in
+   it, which it offers to unpack once. It remembers the choice.
 
 It needs graphics drivers with OpenGL 3.3, which any GPU from the last ten
 years has. The **Video** menu at the top of the window sets the resolution,
-from 1× to 4× the Xbox's 640×480 (2× by default; the game restarts to apply
-it), the anti-aliasing (SMAA, MSAA 2× to 8×, or both), widescreen 16:9 and
+from 1× to 6× the Xbox's 640×480 (2× by default; 6×, 3840×2880, is for a 4K
+screen; the game restarts to apply it), the anti-aliasing (SMAA, MSAA 2× to 8×, or both), widescreen 16:9 and
 full screen; all but full screen are remembered. The same are on **F9**,
 **F8**, **F10** and **F11** (or Alt+Enter), which also work in full screen,
 where the menu is hidden.
 Controllers work through SDL: Xbox, PlayStation, Switch Pro and many more.
 Saves are kept in the game folder, in `UDATA`, as on the Mac. The
 `README.txt` inside lists the options and where the settings and logs
-(`last-run.log`) are kept.
+(`last-run.log`) are kept. A portable install is a file named `portable.txt`
+beside **JSRF Unleashed.exe**: `--portable` makes it later (settings come
+along), and deleting it goes back. The Linux build has the same switch.
 
 On a Mac, the Windows build also runs in [CrossOver](https://www.codeweavers.com/crossover)
 (a Windows 10 64-bit bottle, then **Run Command…** on JSRF Unleashed.exe),
@@ -197,7 +202,7 @@ and where settings, saves and logs are kept.
 
 On Linux the keyboard layout is the same as below; **F11** (or Alt+Return)
 toggles full screen, **F10** widescreen, **F9** sets the resolution (1× to
-4×; the game restarts to apply it) and **F8** the anti-aliasing (SMAA, MSAA,
+6×; the game restarts to apply it) and **F8** the anti-aliasing (SMAA, MSAA,
 or both).
 
 ### Your game files
@@ -233,8 +238,8 @@ knows.
 **Controls › Keyboard…** in the menu bar shows the same list.
 
 **Video menu:**
-- **Resolution** — the internal resolution, 1× to 4× (2× by default). The
-  game restarts to apply it.
+- **Resolution** — the internal resolution, 1× to 6× (2× by default; 6×,
+  3840×2880, is for a 4K screen). The game restarts to apply it.
 - **Anti-aliasing** — smooths the jagged edges, two ways that can be used
   together. **SMAA** is a quick pass over each finished frame, on or off at
   once. **MSAA** 2×, 4× or 8× draws every edge with that many samples a

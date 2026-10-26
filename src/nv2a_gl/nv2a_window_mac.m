@@ -458,7 +458,10 @@ int nv_window_keys(unsigned short *buttons, unsigned char *analog)
  * for a setting people change once. Choosing a scale restarts the game.
  */
 
-static int scale_clamp(int s) { return s < 1 ? 1 : s > 4 ? 4 : s; }
+/* 1x to 6x: 6x is 3840x2880, a 4K screen's width one pixel for one (and,
+ * in widescreen, its 3840x2160 exactly across). */
+#define NV_SCALE_MAX 6
+static int scale_clamp(int s) { return s < 1 ? 1 : s > NV_SCALE_MAX ? NV_SCALE_MAX : s; }
 
 int nv_window_pref_scale(void);
 int nv_window_pref_scale(void)
@@ -823,10 +826,11 @@ static void build_menu(void)
     [appItem setSubmenu:appMenu];
     [bar addItem:appItem];
 
-    for (i = 1; i <= 4; i++) {
+    for (i = 1; i <= NV_SCALE_MAX; i++) {
         NSMenuItem *it = [[NSMenuItem alloc]
-            initWithTitle:[NSString stringWithFormat:@"%dx  (%d x %d)",
-                                                     i, 640 * i, 480 * i]
+            initWithTitle:[NSString stringWithFormat:@"%dx  (%d x %d)%@",
+                                                     i, 640 * i, 480 * i,
+                                                     i == 6 ? @"  -- 4K" : @""]
                    action:@selector(pickScale:)
             keyEquivalent:@""];
         [it setTag:i];
