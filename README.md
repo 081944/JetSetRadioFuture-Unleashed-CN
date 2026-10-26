@@ -240,6 +240,11 @@ knows.
 
 **Controls › Keyboard…** in the menu bar shows the same list.
 
+**Controls › Camera on the Right Stick** (on by default): the right stick —
+or the arrow keys — turns the camera around the skater and tilts it, and it
+eases back behind them when you let go; the L trigger still puts it straight
+behind at once, as in the original game. Turn it off for the original camera.
+
 **Video menu:**
 - **Resolution** — the internal resolution, 1× to 6× (2× by default; 6×,
   3840×2880, is for a 4K screen). The game restarts to apply it.
