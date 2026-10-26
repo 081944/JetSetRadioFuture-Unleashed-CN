@@ -76,7 +76,8 @@ screen; the game restarts to apply it), the anti-aliasing (SMAA, MSAA 2× to
 game starts the way it was left, in full screen or in a window
 (`--fullscreen` and `--windowed` choose for one start). The same are on
 **F9**, **F8**, **F10** and **F11** (or Alt+Enter), which also work in full
-screen, where the menu is hidden.
+screen, where the menu is hidden. **Controls › Camera on the Right Stick**,
+or **F7**, turns the right-stick camera (below) off and on.
 Controllers work through SDL: Xbox, PlayStation, Switch Pro and many more.
 Saves are kept in the game folder, in `UDATA`, as on the Mac. The
 `README.txt` inside lists the options and where the settings and logs
@@ -205,8 +206,8 @@ and where settings, saves and logs are kept.
 
 On Linux the keyboard layout is the same as below; **F11** (or Alt+Return)
 toggles full screen, **F10** widescreen, **F9** sets the resolution (1× to
-6×; the game restarts to apply it) and **F8** the anti-aliasing (SMAA, MSAA,
-or both).
+6×; the game restarts to apply it), **F8** the anti-aliasing (SMAA, MSAA,
+or both) and **F7** turns the right-stick camera (below) off and on.
 
 ### Your game files
 
@@ -240,10 +241,13 @@ knows.
 
 **Controls › Keyboard…** in the menu bar shows the same list.
 
-**Controls › Camera on the Right Stick** (on by default): the right stick —
-or the arrow keys — turns the camera around the skater and tilts it, and it
-eases back behind them when you let go; the L trigger still puts it straight
-behind at once, as in the original game. Turn it off for the original camera.
+**The camera on the right stick** (on by default, on every platform): the
+right stick — or the arrow keys — turns the camera around the skater and
+tilts it, and it eases back behind them when you let go; the L trigger still
+puts it straight behind at once, as in the original game. Turn it off for the
+original camera: **Controls › Camera on the Right Stick** on the Mac, **F7**
+(or the Controls menu) on Windows, **F7** on Linux, and the settings on the
+iPhone and on Android.
 
 **Video menu:**
 - **Resolution** — the internal resolution, 1× to 6× (2× by default; 6×,

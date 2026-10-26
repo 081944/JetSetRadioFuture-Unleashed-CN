@@ -69,6 +69,11 @@ Keyboard (by key position, so W A S D on QWERTY is Z Q S D on AZERTY):
   F8                  anti-aliasing: SMAA (a quick pass over each finished
                       frame) and MSAA 2x, 4x or 8x (every edge drawn with
                       that many samples a pixel), either or both; remembered
+  F7                  the camera on the right stick, on (the default) or off:
+                      the right stick (or the arrow keys) turns the camera
+                      around you and tilts it, and it eases back behind you
+                      when let go; L trigger puts it straight behind at once.
+                      Off, the camera is the original game's. Remembered
 
 
 Where things are kept

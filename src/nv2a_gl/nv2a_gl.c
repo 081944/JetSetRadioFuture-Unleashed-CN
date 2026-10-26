@@ -1401,6 +1401,29 @@ static void sdl_cfg_set(const char *key, int val)
 /* nv2a_widescreen() asks this when RECOMP_WIDESCREEN is not set. */
 int nv_window_pref_widescreen(void) { return sdl_cfg_get("widescreen", 0) != 0; }
 
+/* The camera on the right stick (port/recomp_manual.c): on unless turned off --
+ * Controls in the window's menu bar on Windows, F7 anywhere (and the Android
+ * app's settings), kept as rstick_camera= (0 for off). Asked every frame, so
+ * the file is read once. */
+static volatile int g_rstick_cam = -1;
+int nv_window_pref_rstick_camera(void);
+int nv_window_pref_rstick_camera(void)
+{
+    if (g_rstick_cam < 0) g_rstick_cam = sdl_cfg_get("rstick_camera", 1) != 0;
+    return g_rstick_cam;
+}
+static void nv_window_set_rstick_camera(int on)
+{
+    g_rstick_cam = on ? 1 : 0;
+    sdl_cfg_set("rstick_camera", g_rstick_cam);
+    fprintf(stderr, "[WIN] the camera on the right stick: %s\n", on ? "on" : "off");
+}
+/* Asked for from another thread (the Android app's settings): done at the
+ * next sdl_pump, by the thread that owns the window and the settings file. */
+static volatile int g_sdl_want_rcam = -1;
+void nv_window_request_rstick_camera(int on);
+void nv_window_request_rstick_camera(int on) { g_sdl_want_rcam = on ? 1 : 0; }
+
 /* The keyboard as a gamepad -- the same layout as the Mac's, by key POSITION
  * (scancodes), so W A S D on QWERTY is Z Q S D on AZERTY:
  *   W A S D    left stick + d-pad       arrows   right stick
@@ -1409,7 +1432,8 @@ int nv_window_pref_widescreen(void) { return sdl_cfg_get("widescreen", 0) != 0; 
  *   R          Black                    F  White
  *   Return     Start                    Esc  Back (and Android's Back)
  *   C / V      left / right stick click
- * F11 or Alt+Return: full screen. F10: widescreen. F9: resolution. */
+ * F11 or Alt+Return: full screen. F10: widescreen. F9: resolution. F8:
+ * anti-aliasing. F7: the camera on the right stick. */
 static volatile unsigned short g_sdl_kb_buttons;
 static volatile unsigned char  g_sdl_kb_analog[8];
 
@@ -1696,6 +1720,13 @@ static void sdl_choose_aa(void)
     sdl_keys_release();
 }
 
+/* F7 and Controls > Camera on the Right Stick: on or off, kept. */
+static void sdl_toggle_rstick_camera(void)
+{
+    nv_window_set_rstick_camera(!nv_window_pref_rstick_camera());
+    sdl_menu_update();
+}
+
 #if defined(_WIN32)
 /*
  * The window's menu bar (Windows): Video -- the resolution, anti-aliasing,
@@ -1709,9 +1740,10 @@ static void sdl_choose_aa(void)
  * menu would. Choosing a resolution asks before it restarts.
  */
 #include <SDL2/SDL_syswm.h>
-enum { MENU_RES1 = 101, MENU_WIDE = 110, MENU_FULL = 111, MENU_SMAA = 120, MENU_MSAA1 = 121 };
+enum { MENU_RES1 = 101, MENU_WIDE = 110, MENU_FULL = 111, MENU_SMAA = 120, MENU_MSAA1 = 121,
+       MENU_RCAM = 130 };
 static HWND  g_menu_hwnd;
-static HMENU g_menu_bar, g_menu_video, g_menu_res, g_menu_aa;
+static HMENU g_menu_bar, g_menu_video, g_menu_res, g_menu_aa, g_menu_controls;
 
 static void sdl_menu_update(void)
 {
@@ -1733,6 +1765,9 @@ static void sdl_menu_update(void)
         EnableMenuItem(g_menu_aa, MENU_MSAA1 + i,
                        MF_BYCOMMAND | (!g_msaa_max || n <= g_msaa_max ? MF_ENABLED : MF_GRAYED));
     }
+    if (g_menu_controls)
+        CheckMenuItem(g_menu_controls, MENU_RCAM,
+                      MF_BYCOMMAND | (nv_window_pref_rstick_camera() ? MF_CHECKED : MF_UNCHECKED));
 }
 
 /* The menu takes its height from the window, not from the picture: the
@@ -1775,6 +1810,10 @@ static void sdl_menu_init(void)
     AppendMenuW(g_menu_video, MF_STRING, MENU_WIDE, L"&Widescreen\tF10");
     AppendMenuW(g_menu_video, MF_STRING, MENU_FULL, L"&Full screen\tF11");
     AppendMenuW(g_menu_bar, MF_POPUP, (UINT_PTR)g_menu_video, L"&Video");
+    if ((g_menu_controls = CreatePopupMenu()) != NULL) {
+        AppendMenuW(g_menu_controls, MF_STRING, MENU_RCAM, L"Camera on the &Right Stick\tF7");
+        AppendMenuW(g_menu_bar, MF_POPUP, (UINT_PTR)g_menu_controls, L"&Controls");
+    }
     SDL_EventState(SDL_SYSWMEVENT, SDL_ENABLE);
     sdl_menu_update();
     sdl_menu_show(!(SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN_DESKTOP));
@@ -1811,6 +1850,8 @@ static void sdl_menu_command(unsigned id)
         sdl_pick_smaa(!g_smaa_want);
     } else if (id >= MENU_MSAA1 && id < MENU_MSAA1 + 4) {
         sdl_pick_msaa(1 << (id - MENU_MSAA1));
+    } else if (id == MENU_RCAM) {
+        sdl_toggle_rstick_camera();
     }
 }
 #endif
@@ -2245,6 +2286,11 @@ static void sdl_pump(void)
         g_sdl_want_wide = -1;
         if (want != nv2a_widescreen()) sdl_toggle_widescreen();
     }
+    if (g_sdl_want_rcam >= 0) {
+        int want = g_sdl_want_rcam;
+        g_sdl_want_rcam = -1;
+        if (want != nv_window_pref_rstick_camera()) sdl_toggle_rstick_camera();
+    }
     while (SDL_PollEvent(&ev)) {
         switch (ev.type) {
         case SDL_QUIT:
@@ -2263,6 +2309,7 @@ static void sdl_pump(void)
                 if (k == SDL_SCANCODE_F10) { sdl_toggle_widescreen(); break; }
                 if (k == SDL_SCANCODE_F9)  { sdl_choose_scale(); break; }
                 if (k == SDL_SCANCODE_F8)  { sdl_choose_aa(); break; }
+                if (k == SDL_SCANCODE_F7)  { sdl_toggle_rstick_camera(); break; }
             }
             sdl_key(ev.key.keysym.scancode, 1);
             break;

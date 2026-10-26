@@ -4117,9 +4117,11 @@ void sub_00042EE0(void)
  * If something else moved the eye in between (an event placing the camera),
  * that is left as it is and the turn dropped.
  *
- * Not in a conversation (mode 12) or the first-person look (14). On where the
- * platform has a switch for it, nv_window_pref_rstick_camera -- the Mac's
- * Controls menu, on unless turned off; RECOMP_RSTICK_CAMERA=1 or 0 overrides.
+ * Not in a conversation (mode 12) or the first-person look (14). On unless
+ * the player turns it off, nv_window_pref_rstick_camera: the Mac's Controls
+ * menu, the iPhone's and the Android app's settings, and on Windows and Linux
+ * F7 (and Controls in the Windows window's menu bar); RECOMP_RSTICK_CAMERA=1
+ * or 0 overrides.
  * Tests: JSRF_RCAM_LOG=1 logs it ten times a second; JSRF_RCAM_FIXED=<degrees>
  * holds a fixed turn; JSRF_RCAM_DUMPCAM=<s> prints the camera object once.
  */
