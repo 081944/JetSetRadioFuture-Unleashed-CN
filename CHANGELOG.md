@@ -10,6 +10,88 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.5.9 — 27 October 2026
+
+The camera on the right stick turns smoothly, a hang a few seconds into a level
+is gone, and the sound chip and the renderer keep closer to the console's
+timing. The sound, OpenGL, half-pixel and depth changes come from what
+**spriteice** found while working on his own PC port of the game -- thank you,
+[spriteice](https://github.com/spriteice)! Every platform is new in 0.5.9.
+
+- **The camera on the right stick turns smoothly.** It turned by the clock,
+  while the game moves by its frames, so a slow pan came out in uneven steps
+  whenever the frames were not exactly evenly spaced -- "like a really bad
+  V-Sync", a player wrote, with the stick a third of the way and the skater
+  standing still, while the game's own first-person look panned smoothly. It
+  turns by the game's frames now, as the game's camera does: at Shibuya
+  Terminal, the same 0.11 degree every frame. And the stick's response is
+  softer: a third of the way turns the camera about 7 degrees a second (it
+  was under 1), all the way still 150. `JSRF_RCAM_CLOCK=1`: by the clock, as
+  before. Thanks to the player who reported it!
+- **A hang a few seconds into a level.** CRI's sound library guards its data
+  with a lock of its own: whoever takes it is raised to the highest priority
+  and the library's server thread is stopped, and on the way out the server
+  is started again and the priority put back -- on the console nothing else
+  runs in between. Here, stopping or starting another thread let any other
+  thread run, and the server could take the same lock right then: the game's
+  main thread was left at the highest priority with nothing left to release,
+  and went round the library's release loop for ever while every other thread
+  waited. The picture stopped a few seconds after a level appeared (`[STALL]`
+  in the log). A thread at the highest priority now goes through those two
+  calls without letting anything else run, as on the console.
+  `RECOMP_TC_HANDOFF=1`: as before.
+- **The sound chip, a frame at a time.** The APU was run eight of its frames
+  at a time and then rested 5 ms. What the game asks of it -- a voice started
+  or stopped -- is answered between frames, so DirectSound could wait up to
+  5 ms each time, again and again in a crowd that keeps restarting voices
+  (Shibuya Terminal). Each frame is now made at its own moment, every 0.67 ms
+  as on the console, kept level with the sound device frame by frame.
+  `RECOMP_APU_PACE=8`: as before. And the game's vertical-blank handler,
+  which holds back every other game thread while it waits, is now ended
+  within a millisecond every frame, not only while the renderer is busy
+  (`RECOMP_ACK_KEEPER=2`: as before).
+- **OpenGL waits less on its driver.** The renderer asked the driver for
+  errors after every draw, which makes a driver working on a thread of its
+  own (Mesa's, AMD's, NVIDIA's) catch up with the game first -- hundreds of
+  times a frame. Once a frame now (`RECOMP_GL_ERRORS_PER_DRAW=1`: after every
+  draw, to find one). On every platform, the commands the game sends the GPU
+  are sorted a little quicker, and the clock is read once a frame instead of
+  several times a draw.
+- **Half a pixel.** The console's driver moves fixed-function draws -- the
+  city's scenery, the menus -- half a pixel right and down for its
+  rasteriser. The engine kept that, while taking it off the vertex programs'
+  draws (the characters, the traffic), so the two did not quite line up.
+  Both go without it now. `RECOMP_GL_FF_NUDGE=1`: as before.
+- **Depth.** With depth reversed (Metal, and OpenGL where the driver allows
+  it), the vertex programs' depth was worked out as one less the depth,
+  which keeps at the far end only the steps a 24-bit depth buffer has. It is
+  worked out as the far end less the depth now, with all the precision the
+  32-bit buffer has there. And polygon offset, which the engine ignored, is
+  applied when the game asks for it (`RECOMP_GL_NOPOLYOFFSET=1`: as before).
+- AMD graphics on Linux (Mesa's radeonsi driver): the vertex programs without
+  0.5.7's invariant position, which has been found to do more harm than good
+  there (not tested here: no such GPU). The log says so;
+  `RECOMP_GL_INVARIANT=1` keeps it.
+- Tested on a Mac, Metal and OpenGL: Shibuya Terminal from an empty save
+  folder (the camera at a third of the stick with the skater standing still:
+  0.109 to 0.110 degree at every one of 197 frames; the sound chip at 1,500
+  frames a second, the sound's output never running dry; 60 frames a
+  second), and loaded there 23 more times with and without the hang's fix,
+  eight of them with its window held open longer on purpose. The hang came
+  once, without the fix, in thirteen loads -- too rare for the eleven loads
+  with the fix to say much; the fix rests on the log, which shows exactly
+  where the game was stuck. The Garage with and without the half-pixel
+  change (as sharp either way). Then the release build on the title, on
+  Dogenzaka Hill with SMAA and MSAA 4x (Metal and OpenGL), in the Fortified
+  Residential Zone and at Shibuya Terminal. Linux (Mesa): the attract demo,
+  and 0.5.9 against 0.5.8's sound chip and vertical-blank timing on that
+  slow software renderer -- 7.8 frames a second against 7.2, the game's
+  vertical-blank handler 24.8 times a second against 22.7, its main thread
+  waiting less than half as long for the others; F7 and the portable switch.
+  Windows (under Wine): the title as an upgrade from 0.5.8, F7 and the
+  Controls menu. The Android and iPhone builds were built and checked, not
+  run.
+
 ## 0.5.8 — 26 October 2026
 
 The stutter of a first visit, the sound that stuttered with it, a camera on the
