@@ -2509,11 +2509,56 @@ void xbox_nv2a_software_method_done(void)
     g_swm_in_flight = 0;
 }
 
+/* A software method in flight whose PMC_INTR_0 bit is gone: the title's DPC
+ * would never see it, never acknowledge it, and no software method would be
+ * raised again (the make-space wait at 0x0019151B for good). The handler's
+ * wrapper clears that bit a few instructions before it acknowledges, so only
+ * a bit missing on three ticks in a row counts; then both bits are set again
+ * and the interrupt raised again, and the log says so. A safety net: the
+ * atomic sets and clears close the race found, but a PS5 port still logged a
+ * few of these in a session, and whether each was a lost bit or a slow
+ * acknowledgement is not known. RECOMP_SWM_RESCUE=0 turns it off. */
+static void kernel_pgraph_rescue(void)
+{
+    static int on = -1;
+    static unsigned missing;
+    static unsigned long rescued;
+    if (on < 0) { const char *e = getenv("RECOMP_SWM_RESCUE"); on = !(e && atoi(e) == 0); }
+    if (!on) return;
+    if (!(__atomic_load_n(&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0), __ATOMIC_ACQUIRE)
+          & NV2A_PMC_INTR_PGRAPH)) {
+        if (++missing < 3) return;
+    } else {
+        missing = 0;
+        return;
+    }
+    missing = 0;
+    xbox_guest_lock_acquire();
+    if (g_swm_in_flight &&
+        !(BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0) & NV2A_PMC_INTR_PGRAPH)) {
+        __atomic_fetch_or(&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR),
+                          NV2A_PGRAPH_INTR_ERROR, __ATOMIC_ACQ_REL);
+        __atomic_fetch_or(&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0),
+                          NV2A_PMC_INTR_PGRAPH, __ATOMIC_ACQ_REL);
+        int claimed = kernel_raise_interrupt_locked(NV2A_VECTOR);
+        if (++rescued <= 8) {
+            fprintf(stderr, "  [NV2A] software method #%lu had lost its interrupt bit: raised again (#%lu), ISR %s\n",
+                    g_swm_raised, rescued, claimed < 0 ? "not callable" : claimed ? "claimed it" : "declined it");
+            fflush(stderr);
+        }
+    }
+    xbox_guest_lock_release();
+}
+
 static void kernel_pgraph_tick(void)
 {
     uint32_t t = g_swm_tail;
     int claimed;
-    if (g_swm_in_flight || t == __atomic_load_n(&g_swm_head, __ATOMIC_ACQUIRE)) return;
+    if (g_swm_in_flight) {
+        kernel_pgraph_rescue();
+        return;
+    }
+    if (t == __atomic_load_n(&g_swm_head, __ATOMIC_ACQUIRE)) return;
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR)) return;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_TRAP_ADDR) =
         0x100u | (g_swm_q[t % SWM_QUEUE].subch << 16);
