@@ -2413,9 +2413,12 @@ static void kernel_vblank_tick(void)
      * interrupt the title has not looked at yet from one it has acknowledged.
      * Without that distinction the status bits were wiped 200 us after this
      * line and the DPC below found nothing pending -- see vblank_intr_tick(). */
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |=
-        NV2A_PCRTC_INTR_VBLANK | NV2A_VBLANK_PENDING_TAG;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
+    /* Atomic: the ack thread and the keeper complete these registers while
+     * this thread sets them, and the title's handlers clear them. */
+    __atomic_fetch_or(&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0),
+                      NV2A_PCRTC_INTR_VBLANK | NV2A_VBLANK_PENDING_TAG, __ATOMIC_ACQ_REL);
+    __atomic_fetch_or(&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0),
+                      NV2A_PMC_INTR_PCRTC, __ATOMIC_ACQ_REL);
 
     g_vblank_count++;
     {
@@ -2517,8 +2520,13 @@ static void kernel_pgraph_tick(void)
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_TRAP_DATA) = g_swm_q[t % SWM_QUEUE].param;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_NSOURCE) = 1u;   /* a notification */
     g_swm_in_flight = 1;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR) |= NV2A_PGRAPH_INTR_ERROR;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)  |= NV2A_PMC_INTR_PGRAPH;
+    /* Atomic, as the vblank's: a plain read-modify-write here and the
+     * handler's clear in sub_00194210 on the game's thread could each undo
+     * the other's bit. */
+    __atomic_fetch_or(&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR),
+                      NV2A_PGRAPH_INTR_ERROR, __ATOMIC_ACQ_REL);
+    __atomic_fetch_or(&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0),
+                      NV2A_PMC_INTR_PGRAPH, __ATOMIC_ACQ_REL);
     claimed = kernel_raise_interrupt(NV2A_VECTOR);
     g_swm_raised++;
     if (g_swm_raised <= 3 || claimed <= 0) {
