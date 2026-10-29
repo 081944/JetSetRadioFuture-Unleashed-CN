@@ -10,6 +10,49 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.5.10 — 29 October 2026
+
+A hang where the picture stopped for good, now and then, while the game waited
+for room for its drawing commands is fixed. [Marice](https://github.com/Marice)
+found where to look (pull request #46, merged here with his two fixes) --
+thank you, Marice! Every platform is new in 0.5.10.
+
+- **A hang where the picture stopped for good.** When the game needs a lot of
+  room in the GPU's command buffer, it asks the GPU to call it back once it has
+  caught up (a software method, an interrupt) and sleeps until then. The
+  engine's GPU thread clears that interrupt's status whenever no callback is in
+  flight, but it asked whether one was in flight first and cleared after, in two
+  steps: a callback raised between the two had its status wiped. The game's
+  handler then found nothing, never answered, no callback was ever raised
+  again, and the game slept for good (its main thread waiting at 0x0019151B in
+  the log). The GPU thread now reads the status first, asks after, and clears
+  only what it read; and the keeper thread, which ends the vertical blank every
+  millisecond, leaves the callback's bit in PMC_INTR_0 to the thread that owns
+  it, where it could otherwise wipe a new callback's in a much rarer way.
+  `RECOMP_PGRAPH_ACK=1`: as before.
+- **Marice's fixes (#46).** The GPU's interrupt status bits are set and
+  cleared atomically everywhere: three threads write them, and since 0.5.9 the
+  keeper does so every millisecond, so a plain read-modify-write on one could
+  undo another's. And a callback whose interrupt bit went missing is raised
+  again after three ticks, with a line in the log -- a safety net that should
+  now never be needed (`RECOMP_SWM_RESCUE=0` turns it off).
+- Tested on a Mac, against 0.5.9 back to back on the same machine: the
+  Fortified Residential Zone four times (0.5.10, 0.5.9, 0.5.9, 0.5.10 -- 60
+  frames a second throughout, not one slow frame once the level was on, 9 to
+  19 callbacks delivered in each), Dogenzaka Hill on OpenGL with SMAA and MSAA
+  4x, and Shibuya Terminal from an empty save folder (the camera at a third of
+  the stick: 0.109 to 0.110 degree at every one of 197 frames; the sound never
+  running dry) -- the same as 0.5.9. Then a test build that holds the GPU
+  thread in that gap on purpose: the old way, the callback raised in the gap
+  was wiped every time, and without Marice's safety net the game stopped for
+  good at the first one, its main thread waiting at 0x0019151B; 0.5.10's way,
+  callbacks raised in the gap were kept, and 13 and 25 were delivered in two
+  runs without one going missing. Linux (Mesa) and Windows (under Wine), each
+  against 0.5.9 on the same machine: the attract demo, the frame rate and the
+  vertical blank the same within a few per cent either way; F7 and the
+  portable switch. The Android and iPhone builds were built and checked, not
+  run.
+
 ## 0.5.9 — 27 October 2026
 
 The camera on the right stick turns smoothly, a hang a few seconds into a level
