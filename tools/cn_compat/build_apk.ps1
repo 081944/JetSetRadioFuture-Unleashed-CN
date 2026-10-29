@@ -88,7 +88,7 @@ if (!(Test-Path -LiteralPath $keystore)) {
         '-keyalg', 'RSA', '-keysize', '4096', '-validity', '36500', '-dname', 'CN=JSRF Unleashed CN Test',
         '-storepass:file', $pass, '-keypass:file', $pass)
 }
-$apk = Join-Path $OutputDir 'JSRF-Unleashed-CN-android-arm64.apk'
+$apk = Join-Path $OutputDir 'JSRF-Unleashed-android-arm64-CN.apk'
 Invoke-Tool $java @('-jar', "$bt/lib/apksigner.jar", 'sign', '--ks', $keystore, '--ks-key-alias', 'jsrf',
     '--ks-pass', "file:$pass", '--out', $apk, "$work/aligned.apk")
 Invoke-Tool $java @('-jar', "$bt/lib/apksigner.jar", 'verify', '--verbose', $apk)

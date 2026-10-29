@@ -4,7 +4,7 @@
 
 用户已在 AYN Thor 上确认游戏运行正常且显示中文，并已进行新增手柄设置的测试。底层检查和单台设备反馈不等于完整通关或所有设备兼容验证。
 
-发布构建输出 `build-cn-apk/JSRF-Unleashed-CN-android-arm64.apk`，支持 Android 10 及以上的 ARM64 设备。之前的测试包已通过签名、ZIP 完整性、16 KiB ZIP 对齐、安装信息和原生 JNI 入口检查。
+发布构建输出 `build-cn-apk/JSRF-Unleashed-android-arm64-CN.apk`，支持 Android 10 及以上的 ARM64 设备。之前的测试包已通过签名、ZIP 完整性、16 KiB ZIP 对齐、安装信息和原生 JNI 入口检查。
 
 手机只需复制这个 APK 和原有 `JSRF-CN.iso`。安装后选择该 ISO，沿用原应用的资源提取流程；不需要把美版镜像复制到手机，也不需要修改中文版 ISO。
 

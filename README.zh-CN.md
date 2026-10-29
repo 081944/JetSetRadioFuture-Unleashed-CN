@@ -4,7 +4,7 @@
 
 ## 下载与使用
 
-从 [本分支 Releases](https://github.com/081944/JetSetRadioFuture-Unleashed-CN/releases) 下载 `JSRF-Unleashed-CN-android-arm64.apk`。需要 Android 10 或以上、ARM64 和 OpenGL ES 3.0。
+从 [本分支 Releases](https://github.com/081944/JetSetRadioFuture-Unleashed-CN/releases) 下载 `JSRF-Unleashed-android-arm64-CN.apk`。需要 Android 10 或以上、ARM64 和 OpenGL ES 3.0。
 
 1. 安装 APK，把自己持有的受支持中文版 ISO 复制到设备。
 2. 启动应用，选择中文版 ISO，等待资源提取完成。
