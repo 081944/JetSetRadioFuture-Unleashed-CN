@@ -3,7 +3,7 @@ param(
     [string]$SdlSource = '',
     [string]$CnProfileDir = '',
     [string]$GeneratedDir = '',
-    [string]$Version = '0.5.10-cn.1-test',
+    [string]$Version = '0.5.10-cn.1',
     [int]$Jobs = 4,
     [switch]$SdlOnly
 )

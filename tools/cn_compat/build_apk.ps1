@@ -1,7 +1,7 @@
 param(
     [string]$AndroidSdk = "$env:LOCALAPPDATA\Android\Sdk",
     [string]$JavaDir = 'C:\Program Files\Android\Android Studio\jbr',
-    [string]$Version = '0.5.10-cn.1-test',
+    [string]$Version = '0.5.10-cn.1',
     [int]$VersionCode = 4,
     [string]$SigningDir = '',
     [string]$OutputDir = ''
