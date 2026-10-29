@@ -76,7 +76,7 @@ public class SetupActivity extends Activity {
         if (other != null) {
             if (mStatus == null) showSetup();
             status("These files won't work with JSRF Unleashed.\n\n" + other
-                   + "\n\nReplace the files in " + gameDir().getAbsolutePath() + " with a standalone US disc's.");
+                   + "\n\nUse " + getString(R.string.supported_disc) + ".");
             return;
         }
         startActivity(new Intent(this, JsrfActivity.class));
@@ -97,8 +97,8 @@ public class SetupActivity extends Activity {
         TextView body = new TextView(this);
         body.setTextSize(16);
         body.setPadding(0, dp(12), 0, dp(12));
-        body.setText("This plays your own copy of Jet Set Radio Future: the standalone US disc. "
-                + "Nothing of the game comes with the app.\n\n"
+        body.setText("This plays your own copy of Jet Set Radio Future: " + getString(R.string.supported_disc) + ". "
+                + "Game resources are extracted from your disc.\n\n"
                 + "Choose the disc image (.iso) of your copy: it is unpacked once into the app, "
                 + "which needs about 3 GB of free space.\n\n"
                 + "Or copy the extracted game folder (the one with default.xbe and Media in it) "

@@ -112,6 +112,7 @@ if(ANDROID)
         main.c
         recomp_manual.c
         xbe_check.c
+        cn_compat.c
         android/jsrf_android.c
         ios/xiso.c
         ${JSRF_GEN_SOURCES}
@@ -122,9 +123,29 @@ else()
         main.c
         recomp_manual.c
         xbe_check.c
+        cn_compat.c
         ios/xiso.c
         ${JSRF_GEN_SOURCES}
     )
+endif()
+set(JSRF_CN_PROFILE_DIR "" CACHE PATH "Experimental local Chinese compatibility profile")
+if(JSRF_CN_PROFILE_DIR)
+    if(NOT EXISTS "${JSRF_CN_PROFILE_DIR}/cn_profile.h" OR
+       NOT EXISTS "${JSRF_CN_PROFILE_DIR}/manifest.json" OR
+       NOT EXISTS "${JSRF_GEN_DIR}/cn_codegen.sha256")
+        message(FATAL_ERROR "CN profile requires matching generated code. Run tools/cn_compat/generate.py.")
+    endif()
+    file(READ "${JSRF_CN_PROFILE_DIR}/manifest.json" _cn_manifest)
+    string(JSON _cn_expected GET "${_cn_manifest}" target_sha256)
+    file(READ "${JSRF_GEN_DIR}/cn_codegen.sha256" _cn_codegen)
+    string(STRIP "${_cn_codegen}" _cn_codegen)
+    if(NOT _cn_codegen STREQUAL _cn_expected)
+        message(FATAL_ERROR "CN profile and generated engine are from different XBEs.")
+    endif()
+    target_include_directories(jsrf_recomp PRIVATE "${JSRF_CN_PROFILE_DIR}")
+    target_compile_definitions(jsrf_recomp PRIVATE JSRF_CN_PROFILE=1)
+elseif(EXISTS "${JSRF_GEN_DIR}/cn_codegen.sha256")
+    message(FATAL_ERROR "CN-generated code requires JSRF_CN_PROFILE_DIR; it cannot run as a stock US engine.")
 endif()
 # The shader seed (src/nv2a_gl/nv2a_gl.c, seed_import): the states of the
 # shaders the game draws with, collected by playing it, carried in the engine

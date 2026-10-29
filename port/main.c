@@ -63,6 +63,7 @@
 #include "win32_compat.h"
 #include "recomp_icall_feedback.h"
 #include "xbe_check.h"
+#include "cn_compat.h"
 #include "ios/xiso.h"
 #include "apu.h"
 #include <stdio.h>
@@ -760,6 +761,17 @@ static int host_main(void)
     }
     printf("XBE loaded: %zu bytes\n", xbe_size);
 
+    {
+        char why[256];
+        int cn = jsrf_cn_prepare(&xbe_data, xbe_size, why, sizeof why);
+        if (cn < 0) {
+            fprintf(stderr, "[CN] %s\n", why);
+            free(xbe_data);
+            return 3;
+        }
+        if (cn) printf("[CN] verified Chinese XBE; prepared US-layout text/font compatibility in memory\n");
+    }
+
     /* Only the standalone US disc's program fits the translated code
      * (xbe_check.c). Another build's would run until the first pointer into
      * the wrong bytes; stop here and say what the files are instead. Exit code 3 tells
@@ -780,7 +792,10 @@ static int host_main(void)
                 return 3;
             }
         } else {
-            printf("[XBE] the standalone US disc's program (section layout as built from)\n");
+            if (jsrf_cn_header((const unsigned char *)xbe_data, xbe_size))
+                printf("[XBE] normalized Chinese font profile (US address layout)\n");
+            else
+                printf("[XBE] the standalone US disc's program (section layout as built from)\n");
         }
     }
 

@@ -26,6 +26,7 @@
  * the engine never executes the file's code anyway, only its own translation.
  */
 #include "xbe_check.h"
+#include "cn_compat.h"
 
 #include "ios/xiso.h"
 
@@ -120,6 +121,15 @@ int jsrf_xbe_check(const unsigned char *x, size_t n, char *why, size_t whyn)
     int same = 1;
 
     if (why && whyn) why[0] = 0;
+    /* Profile recognition is compiled out in ordinary upstream builds.
+     * The loader checks the entire file before normalizing/mapping it. */
+#ifdef JSRF_CN_PROFILE
+    if (jsrf_cn_header(x, n)) return JSRF_XBE_OK;
+    if (why && whyn) snprintf(why, whyn,
+        "This CN test build requires the measured Chinese-patched Japanese disc (JSRF-CN.iso).");
+    snprintf(s_detail, sizeof s_detail, "default.xbe: does not match the CN profile header");
+    return JSRF_XBE_OTHER;
+#endif
     if (n < 0x178 || memcmp(x, "XBEH", 4)) {
         if (why) snprintf(why, whyn, "Their default.xbe is not an Xbox program: the file is damaged, "
                                      "or it is not the game's.");
