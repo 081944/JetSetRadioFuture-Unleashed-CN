@@ -29,6 +29,7 @@
 #include <android/log.h>
 #include "xiso.h"
 #include "../xbe_check.h"
+#include "../../src/input/controller_mapping.h"
 
 #ifndef JSRF_VERSION
 #define JSRF_VERSION "dev"
@@ -268,6 +269,18 @@ Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeSetRstickCamera(JNIEnv *env, jc
 }
 
 /* A line for the log, from the Java side. */
+JNIEXPORT void JNICALL
+Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeSetControllerMapping(
+    JNIEnv *env, jclass cls, jboolean swap_triggers, jboolean nintendo)
+{
+    unsigned flags = (swap_triggers ? JSRF_PAD_SWAP_TRIGGERS : 0) |
+                     (nintendo ? JSRF_PAD_NINTENDO : 0);
+    (void)env; (void)cls;
+    xbox_InputSetControllerMapping(flags);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "[PAD] mapping: shoulder/trigger swap=%d, Nintendo=%d",
+                        swap_triggers != 0, nintendo != 0);
+}
+
 JNIEXPORT void JNICALL
 Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeLog(JNIEnv *env, jclass cls, jstring line)
 {

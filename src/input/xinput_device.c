@@ -422,6 +422,15 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags,
 
 #include <SDL.h>
 
+#ifdef __ANDROID__
+#include "controller_mapping.h"
+static unsigned g_controller_mapping;
+void xbox_InputSetControllerMapping(unsigned flags)
+{
+    __atomic_store_n(&g_controller_mapping, flags, __ATOMIC_RELAXED);
+}
+#endif
+
 static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
 static DWORD g_packet[XBOX_MAX_CONTROLLERS];
@@ -547,6 +556,9 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
             /* SDL trigger axes are 0..32767 -> Xbox analog button 0..255 */
             analog[6] = (unsigned char)(SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERLEFT) >> 7);
             analog[7] = (unsigned char)(SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) >> 7);
+#ifdef __ANDROID__
+            jsrf_controller_map(analog, __atomic_load_n(&g_controller_mapping, __ATOMIC_RELAXED));
+#endif
             /* SDL Y axes point down; the Xbox's up -- invert, as (-1 - v) so
              * v = -32768 does not overflow. */
             axes[0] = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTX);

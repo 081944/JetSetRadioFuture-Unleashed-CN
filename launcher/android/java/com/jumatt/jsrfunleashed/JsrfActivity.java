@@ -31,12 +31,14 @@ public class JsrfActivity extends SDLActivity
     static native void nativeSetWidescreen(boolean on);
     static native boolean nativeRstickCamera();
     static native void nativeSetRstickCamera(boolean on);
+    static native void nativeSetControllerMapping(boolean swapTriggers, boolean nintendo);
     static native String nativeVersion();
     static native void nativeLog(String line);
 
     private TouchPadView mPad;
     private InputManager mInput;
     private String mPadsSaid = "";
+    private boolean mSwapTriggers, mNintendo;
 
     @Override
     protected String[] getLibraries() {
@@ -57,6 +59,9 @@ public class JsrfActivity extends SDLActivity
     protected void onCreate(Bundle state) {
         super.onCreate(state);
         if (mLayout == null) return;        /* SDL could not load the engine: it says so */
+        mSwapTriggers = getSharedPreferences("controller", MODE_PRIVATE).getBoolean("swap_triggers", false);
+        mNintendo = getSharedPreferences("controller", MODE_PRIVATE).getBoolean("nintendo", false);
+        nativeSetControllerMapping(mSwapTriggers, mNintendo);
         mPad = new TouchPadView(this, this);
         mLayout.addView(mPad, new RelativeLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
@@ -175,6 +180,8 @@ public class JsrfActivity extends SDLActivity
             "On-screen controls: " + (touch ? "shown" : "hidden"),
             "Resolution: " + scale + "x",
             "Camera on the right stick: " + (rcam ? "on" : "off"),
+            "肩键/扳机互换 (LB↔LT、RB↔RT)：" + (mSwapTriggers ? "开" : "关"),
+            "ABXY 布局：" + (mNintendo ? "任天堂" : "微软"),
             "Controls",
         };
         mPad.reset();
@@ -193,6 +200,12 @@ public class JsrfActivity extends SDLActivity
                     break;
                 case 3:
                     nativeSetRstickCamera(!rcam);
+                    break;
+                case 4:
+                    setControllerMapping(!mSwapTriggers, mNintendo);
+                    break;
+                case 5:
+                    pickControllerLayout();
                     break;
                 default:
                     showControls();
@@ -214,6 +227,31 @@ public class JsrfActivity extends SDLActivity
                     Toast.makeText(this, "Used the next time the game starts.", Toast.LENGTH_LONG).show();
             })
             .setNegativeButton("Cancel", null)
+            .show();
+    }
+
+    private void setControllerMapping(boolean swapTriggers, boolean nintendo) {
+        boolean saved = getSharedPreferences("controller", MODE_PRIVATE).edit()
+            .putBoolean("swap_triggers", swapTriggers)
+            .putBoolean("nintendo", nintendo).commit();
+        if (!saved) {
+            Toast.makeText(this, "无法保存手柄设置，请重试。", Toast.LENGTH_LONG).show();
+            return;
+        }
+        mSwapTriggers = swapTriggers;
+        mNintendo = nintendo;
+        nativeSetControllerMapping(mSwapTriggers, mNintendo);
+        Toast.makeText(this, "手柄设置已保存，立即生效。", Toast.LENGTH_SHORT).show();
+    }
+
+    private void pickControllerLayout() {
+        dialog().setTitle("实体手柄 ABXY 布局")
+            .setSingleChoiceItems(new String[] { "微软（默认）", "任天堂（A↔B、X↔Y）" },
+                mNintendo ? 1 : 0, (d, which) -> {
+                    setControllerMapping(mSwapTriggers, which == 1);
+                    d.dismiss();
+                })
+            .setNegativeButton("取消", null)
             .show();
     }
 
