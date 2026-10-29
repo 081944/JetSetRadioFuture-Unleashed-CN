@@ -73,6 +73,7 @@ final class TouchPadView extends View {
     private int mInL, mInT, mInR, mInB;
 
     private boolean mControls;          /* the pad and Start / Back showing */
+    private boolean mPerformanceOverlay;
     private int mPills;                 /* Start / Back held */
     private final long[] mPillDown = new long[2];
     private final int[] mPillSeq = new int[2];
@@ -94,6 +95,12 @@ final class TouchPadView extends View {
         if (on == mControls) return;
         mControls = on;
         reset();
+    }
+
+    void setPerformanceOverlay(boolean on) {
+        if (on == mPerformanceOverlay) return;
+        mPerformanceOverlay = on;
+        invalidate();
     }
 
     /** Nothing held (the app is going away, a dialog is coming up). */
@@ -198,6 +205,7 @@ final class TouchPadView extends View {
 
     @Override
     protected void onDraw(Canvas c) {
+        if (mPerformanceOverlay) drawPerformance(c);
         if (mControls) {
             for (int i = 0; i < COUNT; i++) {
                 circle(c, cx[i], cy[i], rad[i], mHeld[i] ? 0.42f : 0.16f, 0.55f);
@@ -220,6 +228,32 @@ final class TouchPadView extends View {
             drawPill(c, mStart, "START", 13, (mPills & KB_START) != 0);
         }
         drawPill(c, mGear, GEAR, 20, mGearDown);
+    }
+
+    private void drawPerformance(Canvas c) {
+        String stats = JsrfActivity.nativePerformanceStats();
+        if (stats == null) stats = "Performance stats unavailable";
+        String[] lines = stats.split("\\n");
+        float pad = 9 * dp, lineH = 16 * dp, textSize = 11 * dp;
+        mText.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        mText.setTextSize(textSize);
+        float width = 0;
+        for (String line : lines) width = Math.max(width, mText.measureText(line));
+        float left = getWidth() - mInR - width - pad * 2 - 8 * dp;
+        float top = mInT + 8 * dp;
+        float right = left + width + pad * 2;
+        float bottom = top + lines.length * lineH + pad * 2;
+        mFill.setColor(Color.argb(190, 18, 20, 24));
+        c.drawRoundRect(left, top, right, bottom, 7 * dp, 7 * dp, mFill);
+        mLine.setColor(Color.argb(120, 255, 255, 255));
+        mLine.setStrokeWidth(1 * dp);
+        c.drawRoundRect(left, top, right, bottom, 7 * dp, 7 * dp, mLine);
+        mText.setColor(Color.WHITE);
+        mText.setTextAlign(Paint.Align.LEFT);
+        for (int i = 0; i < lines.length; i++)
+            c.drawText(lines[i], left + pad, top + pad + (i + 1) * lineH - 3 * dp, mText);
+        mText.setTextAlign(Paint.Align.CENTER);
+        postInvalidateDelayed(250);
     }
 
     private static int white(float a) {

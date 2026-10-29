@@ -30,6 +30,7 @@
 #include "xiso.h"
 #include "../xbe_check.h"
 #include "../../src/input/controller_mapping.h"
+#include "../../src/nv2a_gl/nv2a_gl.h"
 
 #ifndef JSRF_VERSION
 #define JSRF_VERSION "dev"
@@ -266,6 +267,36 @@ Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeSetRstickCamera(JNIEnv *env, jc
 {
     (void)env; (void)cls;
     nv_window_request_rstick_camera(on ? 1 : 0);
+}
+
+JNIEXPORT void JNICALL
+Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeSetPerformanceOverlay(
+    JNIEnv *env, jclass cls, jboolean on)
+{
+    (void)env; (void)cls;
+    nv2a_gl_performance_enable(on ? 1 : 0);
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_jumatt_jsrfunleashed_JsrfActivity_nativePerformanceStats(JNIEnv *env, jclass cls)
+{
+    unsigned fps = 0, frame_us = 0, cpu_us = 0;
+    int gpu_us = -1, gpu_supported = 0;
+    char text[128];
+    (void)cls;
+    nv2a_gl_performance_stats(&fps, &frame_us, &cpu_us, &gpu_us, &gpu_supported);
+    if (fps == 0) {
+        snprintf(text, sizeof text, "FPS --   Frame --\nCPU frame --   GPU %s",
+                 gpu_supported ? "pending" : "n/a");
+    } else if (gpu_us >= 0) {
+        snprintf(text, sizeof text, "FPS %.1f   Frame %.2f ms\nCPU frame %.2f ms   GPU %.2f ms",
+                 fps / 1000.0, frame_us / 1000.0, cpu_us / 1000.0, gpu_us / 1000.0);
+    } else {
+        snprintf(text, sizeof text, "FPS %.1f   Frame %.2f ms\nCPU frame %.2f ms   GPU %s",
+                 fps / 1000.0, frame_us / 1000.0, cpu_us / 1000.0,
+                 gpu_supported ? "pending" : "n/a");
+    }
+    return (*env)->NewStringUTF(env, text);
 }
 
 /* A line for the log, from the Java side. */

@@ -37,6 +37,11 @@ The game goes in the app's folder, `Android/data/com.jumatt.jsrfunleashed/files/
 screen); its saves are kept there, under `UDATA`, and `Logs/last-run.log`
 beside it. The settings are in `files/settings`.
 
+The ⚙ menu can show a performance overlay with smoothed FPS, frame interval,
+CPU time used by the game/render thread between frames, and GPU time when the
+device exposes `GL_EXT_disjoint_timer_query`. GPU queries are read
+asynchronously; devices without that extension show `GPU n/a`.
+
 Android-specific choices, all in `port/` and `launcher/android/`:
 
 - `-fsigned-char`: plain `char` is signed on x86 and on Apple's arm64, where

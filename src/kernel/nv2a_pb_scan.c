@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../nv2a_gl/nv2a_gl.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -254,6 +255,16 @@ uint32_t nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             uint32_t subch  = (w >> 13) & 7u;
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
+
+            /* A complete geometry payload has no register changes between its
+             * words. Preserve the inventory/software/debug paths verbatim. */
+            if (noninc && subch == 0 && s_exec_enabled && !s_scan_enabled &&
+                count > 1 && count <= (end_va - va) / 4 &&
+                nv2a_gl_method_run(method, (const uint32_t *)(mem + va), count)) {
+                va += count * 4;
+                words += count;
+                continue;
+            }
 
             for (uint32_t i = 0; i < count && va < end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;

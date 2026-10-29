@@ -33,9 +33,19 @@ int  nv2a_gl_enabled(void);
 
 /* Every decoded pushbuffer method, in order. Safe to call before init. */
 void nv2a_gl_method(uint32_t method, uint32_t param);
+/* Optional non-incrementing geometry packet; 0 asks the caller to use the
+ * scalar executor, 1 means every word was handled (including overflow drops). */
+int nv2a_gl_method_run(uint32_t method, const uint32_t *params, uint32_t count);
 
 /* End-of-run summary: what was drawn, what was refused, and why. */
 void nv2a_gl_report(void);
+
+#if defined(NV2A_GLES)
+/* Android's optional in-game performance overlay. */
+void nv2a_gl_performance_enable(int on);
+void nv2a_gl_performance_stats(unsigned *fps_milli, unsigned *frame_us,
+                               unsigned *cpu_us, int *gpu_us, int *gpu_supported);
+#endif
 
 #ifdef __cplusplus
 }

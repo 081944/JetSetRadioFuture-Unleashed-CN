@@ -4,10 +4,12 @@ Run from the repository: python -m unittest tools.cn_compat.test_local -v
 """
 from pathlib import Path
 import os
+import re
 import struct
 import unittest
 
-from tools.cn_compat.prepare import ROOT, hybrid, offset, delta, rd, localized_slots
+from tools.cn_compat.prepare import (ROOT, hybrid, offset, delta, rd,
+                                     localized_slots, validate_custom_text)
 from unicorn import Uc, UC_ARCH_X86, UC_MODE_32, UC_HOOK_CODE
 from unicorn.x86_const import *
 
@@ -58,12 +60,62 @@ class Prototype(unittest.TestCase):
     def test_localized_literals_preserve_us_layout_and_other_rdata(self):
         expected = bytearray(self.us)
         slots = list(localized_slots(self.us, self.cn))
-        self.assertEqual(len(slots), 409)
+        self.assertEqual(len(slots), 534)
         for start, end, literal in slots:
             expected[start:end] = literal
             self.assertEqual(self.target[start:end], literal)
             self.assertEqual(literal.split(b'\0')[0], self.cn[start:self.cn.index(0, start)])
         self.assertEqual(expected[0x1B4000:0x1DB7F0], self.target[0x1B4000:0x1DB7F0])
+
+    def test_save_load_prompts_preserve_custom_encoded_translation(self):
+        # Regression: these were excluded by strict standard CP932 decoding.
+        for va in (0x1CB318, 0x1CB884, 0x1CB8C0, 0x1CB8E8,
+                   0x1CBE9C, 0x1CBEBC, 0x1CBED8):
+            start = offset(va)
+            original = self.cn[start:self.cn.index(0, start)]
+            with self.subTest(va=hex(va)):
+                with self.assertRaises(UnicodeDecodeError):
+                    original.decode('cp932')
+                self.assertEqual(self.target[start:self.target.index(0, start)], original)
+                self.assertNotEqual(original, self.us[start:self.us.index(0, start)])
+
+    def test_custom_encoding_rejects_unknown_glyphs_and_truncated_pairs(self):
+        glyphs = {0x8898}
+        validate_custom_text(bytes.fromhex('8898') + b'$nA%s', glyphs)
+        for invalid in (b'\x88', b'\x88\x99', b'\x01'):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                validate_custom_text(invalid, glyphs)
+
+    def test_translated_rdata_strings_are_not_omitted_by_reference_filter(self):
+        # Audit independent of the allowlist and of JP references. This catches
+        # translated literals still used by US tables but omitted by JP tables.
+        glyphs = {struct.unpack_from('<H', self.cn, offset(base)+i*4)[0]
+                  for base, count in [(0x1F7088, 0x486), (0x289080, 0x183)]
+                  for i in range(count)}
+        checked = 0
+        for match in re.finditer(rb'[^\0]{1,8192}\0', self.us[0x1B4000:0x1DB7F0]):
+            start = 0x1B4000 + match.start()
+            va = start + 0xFF60
+            old = match.group()[:-1]
+            new_end = self.cn.index(0, start)
+            new = self.cn[start:new_end]
+            if old == new or self.cn[start-1] or not any(b >= 128 for b in new):
+                continue
+            if struct.pack('<I', va) not in self.us:
+                continue
+            try:
+                text = old.decode('cp932')
+                validate_custom_text(new, glyphs)
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if any(ord(ch) < 32 and ch not in '\n\r\t' for ch in text):
+                continue
+            with self.subTest(va=hex(va)):
+                self.assertEqual(self.target[start:self.target.index(0, start)], new)
+            checked += 1
+        # Other allowlisted entries contain only ASCII or have binary prefix
+        # bytes before their string boundary; this independent scan covers 481.
+        self.assertEqual(checked, 481)
 
     def test_all_character_mappings_match_chinese_original(self):
         expected = {}

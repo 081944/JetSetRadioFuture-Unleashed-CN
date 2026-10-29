@@ -17,6 +17,10 @@ from tools.xiso.xdvdfs import Xiso
 US_SHA = 'bb2410618c35ccab1ab8ad989194bbd50619eeb648a03b21483efca57f36547d'
 CN_SHA = '9ff97d993c826ad47f94d540bb0cbe1205f390eb35e6184c370b8cd8cdfb97e9'
 BASE = 0x10000
+# Four translated graffiti titles remain at the same literal addresses, but
+# only the US graffiti table references them. The JP table omits those entries.
+# Audited against the exact two input hashes; retain the US table and layout.
+US_ONLY_LITERAL_REFS = frozenset({0x1D9A34, 0x1D9A74, 0x1D9B60, 0x1DA074})
 
 
 def read_xbe(path):
@@ -55,6 +59,30 @@ def offset(va):
     raise ValueError(f'Unmapped prototype address {va:#x}')
 
 
+def validate_custom_text(text, glyphs):
+    """Validate raw game text against the transplanted font, not CP932 Unicode.
+
+    The Chinese font assigns glyphs to otherwise undefined CP932 byte pairs.
+    Decoding with Python's standard codec therefore rejects valid game text.
+    """
+    pos = 0
+    while pos < len(text):
+        first = text[pos]
+        if first < 0x80:
+            if first < 0x20 and first not in (9, 10, 13):
+                raise ValueError('Unexpected control byte in localized text')
+            pos += 1
+        elif 0xA1 <= first <= 0xDF:
+            pos += 1  # Single-byte half-width characters.
+        else:
+            if pos + 1 >= len(text):
+                raise ValueError('Truncated custom glyph in localized text')
+            code = (first << 8) | text[pos+1]
+            if code not in glyphs:
+                raise ValueError(f'Unknown localized glyph {code:#x}')
+            pos += 2
+
+
 def localized_slots(us, cn):
     """Audited same-address literals, not JP pointer tables or global data.
 
@@ -63,6 +91,9 @@ def localized_slots(us, cn):
     """
     addresses = json.loads((Path(__file__).with_name('localization_slots.json'))
                            .read_text(encoding='utf-8'))
+    glyphs = {struct.unpack_from('<H', cn, offset(base)+i*4)[0]
+              for base, count in [(0x1F7088, 0x486), (0x289080, 0x183)]
+              for i in range(count)}
     previous_end = 0
     for address in addresses:
         va = int(address, 16)
@@ -73,12 +104,12 @@ def localized_slots(us, cn):
             raise ValueError(f'Overlapping or oversized localized string at {va:#x}')
         if us[start-1] or cn[start-1] or any(us[old_end:end]):
             raise ValueError(f'Unexpected string boundary at {va:#x}')
-        # Both builds refer to the same literal VA, despite shifted tables.
+        # Require references in both builds except four audited US-only titles.
         pointer = struct.pack('<I', va)
-        if pointer not in us or pointer not in cn:
+        if pointer not in us or (pointer not in cn and va not in US_ONLY_LITERAL_REFS):
             raise ValueError(f'Missing string reference at {va:#x}')
         us[start:old_end].decode('cp932')
-        cn[start:new_end].decode('cp932')
+        validate_custom_text(cn[start:new_end], glyphs)
         yield start, end, cn[start:new_end] + bytes(end-new_end)
         previous_end = end
 
@@ -190,7 +221,7 @@ def prepare(us, cn, dest):
     (dest/'seeds.json').write_text(json.dumps([{'start':f'0x{x:08X}'} for x in seeds]), encoding='utf-8')
     manifest = dict(source_sha256=sha(cn), target_sha256=sha(target),
                     patch_runs=len(runs), patch_bytes=len(blob),
-                    localized_strings=409,
+                    localized_strings=sum(1 for _ in localized_slots(us, cn)),
                     stage='experimental-font-and-text-port; device validation pending')
     (dest/'manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     return manifest

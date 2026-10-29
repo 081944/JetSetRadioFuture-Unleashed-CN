@@ -92,6 +92,7 @@
 #include <math.h>
 #include <time.h>
 #include <stddef.h>
+#include <stdatomic.h>
 
 #include "d3d8_swizzle.h"          /* swizzle + DXT helpers, header-only */
 
@@ -492,6 +493,7 @@ typedef struct {
     double present, pace;   /* at the flip: showing the frame, waiting for its time */
     unsigned n_draws, n_const_upload, n_prog_switch, n_tex_upload, n_tex_lookup;
     unsigned long vbo_bytes, unif_vec4;
+    unsigned long geometry_packets, geometry_words;
     unsigned tex_held;                  /* textures the cache holds, now */
     unsigned long long tex_held_bytes;  /* ... and their size, uploaded as RGBA8 */
     unsigned n_tex_rewritten;           /* dropped by tcache_verify: rewritten in place */
@@ -615,6 +617,9 @@ static void prof_report(void)
                 (g_pb_words - prev_words) / 1000);
             prev_pb = g_pb_time; prev_words = g_pb_words;
         }
+        fprintf(stderr, "[GLPROF]   geometry packet path: %lu packets, %lu words per second\n",
+                (unsigned long)((g_prof.geometry_packets - prev.geometry_packets) / dt),
+                (unsigned long)((g_prof.geometry_words - prev.geometry_words) / dt));
         fflush(stderr);
         last = now; prev = g_prof;
     }
@@ -626,6 +631,16 @@ static void prof_report(void)
 static int      g_on = -1;
 static int      g_ready;
 static int      g_failed;
+#if defined(NV2A_GLES)
+/* Read by the Android UI thread through JNI. Store integer microseconds so
+ * each value is a single atomic read on both 32- and 64-bit Android. */
+static atomic_uint_least32_t g_perf_fps_milli;
+static atomic_uint_least32_t g_perf_frame_us;
+static atomic_uint_least32_t g_perf_cpu_us;
+static atomic_int_least32_t  g_perf_gpu_us = ATOMIC_VAR_INIT(-1);
+static atomic_int            g_perf_gpu_supported;
+static atomic_int            g_perf_enabled;
+#endif
 
 /* The device everything below draws through: OpenGL (nv2a_gfx_gl.c) or Metal
  * (nv2a_metal.m). Chosen once, in gfx_init(). */
@@ -4579,7 +4594,7 @@ extern char **environ;
 static const char *vc_debug_switch(void)
 {
     static const char *const fine[] = {
-        "SCALE", "READBACK", "CURTAIN", "PRESENTER", "PROFILE", "VCACHE",
+        "SCALE", "READBACK", "CURTAIN", "PRESENTER", "PROFILE", "PACKET_SCALAR", "VCACHE",
         "VCACHE_MB", "VCACHE_VERIFY", "CONST_PART", "ANISO", "MIPMAP", "DEPTHCLAMP",
         "TEXHASH_FULL", "CONTIG_ALL", "HEAP_FIRST", "STICKY_ATTRS",
         /* the frame dumps: taken at the flip, from the picture */
@@ -9891,6 +9906,154 @@ static void cache_idle_frame(void)
     }
 }
 
+#if defined(NV2A_GLES)
+/* EXT_disjoint_timer_query is optional on Android. Queries are polled without
+ * waiting, so a slow GPU never stalls the render thread just to report itself. */
+#ifndef GL_TIME_ELAPSED_EXT
+#define GL_TIME_ELAPSED_EXT 0x88BF
+#endif
+#ifndef GL_QUERY_RESULT_EXT
+#define GL_QUERY_RESULT_EXT 0x8866
+#endif
+#ifndef GL_QUERY_RESULT_AVAILABLE_EXT
+#define GL_QUERY_RESULT_AVAILABLE_EXT 0x8867
+#endif
+#ifndef GL_GPU_DISJOINT_EXT
+#define GL_GPU_DISJOINT_EXT 0x8FBB
+#endif
+typedef void (GL_APIENTRYP PerfGenQueriesFn)(GLsizei, GLuint *);
+typedef void (GL_APIENTRYP PerfBeginQueryFn)(GLenum, GLuint);
+typedef void (GL_APIENTRYP PerfEndQueryFn)(GLenum);
+typedef void (GL_APIENTRYP PerfGetQueryObjectFn)(GLuint, GLenum, GLuint *);
+typedef void (GL_APIENTRYP PerfGetQueryObject64Fn)(GLuint, GLenum, GLuint64 *);
+typedef struct { GLuint id; int state; } PerfQuery;
+static struct {
+    int checked, supported, active;
+    PerfGenQueriesFn gen;
+    PerfBeginQueryFn begin;
+    PerfEndQueryFn end;
+    PerfGetQueryObjectFn get;
+    PerfGetQueryObject64Fn get64;
+    PerfQuery query[4];
+} g_perf_query = { .active = -1 };
+static double g_perf_last_frame, g_perf_frame_ema;
+static struct timespec g_perf_last_cpu;
+static int g_perf_have_cpu;
+
+static void perf_frame_tick(void)
+{
+    double now;
+    if (!atomic_load_explicit(&g_perf_enabled, memory_order_relaxed)) {
+        g_perf_last_frame = 0.0;
+        g_perf_frame_ema = 0.0;
+        g_perf_have_cpu = 0;
+        return;
+    }
+    now = mono_now();
+    {
+        struct timespec cpu;
+        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu) == 0) {
+            if (g_perf_have_cpu) {
+                int64_t ns = (int64_t)(cpu.tv_sec - g_perf_last_cpu.tv_sec) * 1000000000LL
+                           + (int64_t)cpu.tv_nsec - g_perf_last_cpu.tv_nsec;
+                if (ns > 0)
+                    atomic_store_explicit(&g_perf_cpu_us, (unsigned)(ns / 1000), memory_order_relaxed);
+            }
+            g_perf_last_cpu = cpu;
+            g_perf_have_cpu = 1;
+        }
+    }
+    if (g_perf_last_frame > 0.0) {
+        double dt = now - g_perf_last_frame;
+        if (dt > 0.0 && dt < 2.0) {
+            g_perf_frame_ema = g_perf_frame_ema > 0.0
+                ? g_perf_frame_ema * 0.85 + dt * 0.15 : dt;
+            atomic_store_explicit(&g_perf_frame_us, (unsigned)(g_perf_frame_ema * 1000000.0 + 0.5), memory_order_relaxed);
+            atomic_store_explicit(&g_perf_fps_milli, (unsigned)(1000.0 / g_perf_frame_ema + 0.5), memory_order_relaxed);
+        }
+    }
+    g_perf_last_frame = now;
+}
+
+static void perf_gpu_init(void)
+{
+    const char *ext;
+    GLuint ids[4];
+    int i;
+    if (g_perf_query.checked) return;
+    g_perf_query.checked = 1;
+    ext = (const char *)glGetString(GL_EXTENSIONS);
+    if (!ext || !strstr(ext, "GL_EXT_disjoint_timer_query")) return;
+    g_perf_query.gen = (PerfGenQueriesFn)SDL_GL_GetProcAddress("glGenQueriesEXT");
+    g_perf_query.begin = (PerfBeginQueryFn)SDL_GL_GetProcAddress("glBeginQueryEXT");
+    g_perf_query.end = (PerfEndQueryFn)SDL_GL_GetProcAddress("glEndQueryEXT");
+    g_perf_query.get = (PerfGetQueryObjectFn)SDL_GL_GetProcAddress("glGetQueryObjectuivEXT");
+    g_perf_query.get64 = (PerfGetQueryObject64Fn)SDL_GL_GetProcAddress("glGetQueryObjectui64vEXT");
+    if (!g_perf_query.gen || !g_perf_query.begin || !g_perf_query.end ||
+        !g_perf_query.get || !g_perf_query.get64) return;
+    g_perf_query.gen(4, ids);
+    for (i = 0; i < 4; i++) {
+        if (!ids[i]) return;
+        g_perf_query.query[i].id = ids[i];
+    }
+    g_perf_query.supported = 1;
+    atomic_store_explicit(&g_perf_gpu_supported, 1, memory_order_relaxed);
+}
+
+/* End the prior frame's GPU sample and start the next one. The caller starts
+ * the next query after G->present(), with all of that frame's GL work queued. */
+static void perf_gpu_end_frame(void)
+{
+    GLint disjoint = 0;
+    int i;
+    if (!atomic_load_explicit(&g_perf_enabled, memory_order_relaxed) && g_perf_query.active < 0)
+        return;
+    perf_gpu_init();
+    if (!g_perf_query.supported) return;
+    if (g_perf_query.active >= 0) {
+        PerfQuery *q = &g_perf_query.query[g_perf_query.active];
+        g_perf_query.end(GL_TIME_ELAPSED_EXT);
+        q->state = 2;
+        g_perf_query.active = -1;
+    }
+    glGetIntegerv(GL_GPU_DISJOINT_EXT, &disjoint);
+    if (disjoint) {
+        for (i = 0; i < 4; i++) g_perf_query.query[i].state = 0;
+        atomic_store_explicit(&g_perf_gpu_us, -1, memory_order_relaxed);
+        return;
+    }
+    for (i = 0; i < 4; i++) {
+        PerfQuery *q = &g_perf_query.query[i];
+        if (q->state == 2) {
+            GLuint ready = 0;
+            g_perf_query.get(q->id, GL_QUERY_RESULT_AVAILABLE_EXT, &ready);
+            if (ready) {
+                GLuint64 ns = 0;
+                g_perf_query.get64(q->id, GL_QUERY_RESULT_EXT, &ns);
+                atomic_store_explicit(&g_perf_gpu_us, (int)(ns / 1000), memory_order_relaxed);
+                q->state = 0;
+            }
+        }
+    }
+}
+
+static void perf_gpu_begin_frame(void)
+{
+    int i;
+    if (!atomic_load_explicit(&g_perf_enabled, memory_order_relaxed) ||
+        !g_perf_query.supported || g_perf_query.active >= 0) return;
+    for (i = 0; i < 4; i++) {
+        PerfQuery *q = &g_perf_query.query[i];
+        if (q->state == 0 && q->id) {
+            g_perf_query.begin(GL_TIME_ELAPSED_EXT, q->id);
+            q->state = 1;
+            g_perf_query.active = i;
+            return;
+        }
+    }
+}
+#endif /* NV2A_GLES */
+
 static void present(int is_frame)
 {
     uint32_t va, bpp, x, y;
@@ -9909,7 +10072,11 @@ static void present(int is_frame)
         }
     }
 #endif
-    if (is_frame) { S.frames++; g_frame_clock = mono_now();
+    if (is_frame) {
+#if defined(NV2A_GLES)
+                    perf_frame_tick();
+#endif
+                    S.frames++; g_frame_clock = mono_now();
                     prof_report(); tcache_sweep(); tcache_verify();
                     /* the census counts one frame, not everything since the
                      * last dump -- otherwise it measures the gap, not the
@@ -9982,6 +10149,11 @@ static void present(int is_frame)
         /* With SMAA, what is shown is the copy of it with its edges smoothed. */
         if (g_smaa_now && G->target_smaa) prt = G->target_smaa(prt);
         g_shown_rt = prt;
+#if defined(NV2A_GLES)
+        /* End the GPU timer before SDL_GL_SwapWindow: a vsync wait belongs to
+         * frame pacing, not GPU execution time. */
+        perf_gpu_end_frame();
+#endif
 #if defined(NV2A_GL_USE_CGL)
         /* OpenGL on a Mac: read the finished frame and hand it to the window.
          *
@@ -10014,6 +10186,11 @@ static void present(int is_frame)
         /* The device's end of the frame: Metal shows it in the window's
          * layer, and either way the frame's work is handed to the GPU. */
         G->present(prt, pw, ph);
+#if defined(NV2A_GLES)
+        {
+            perf_gpu_begin_frame();
+        }
+#endif
 #if defined(NV2A_GL_USE_CGL)
         if (g_windowed && nv_window_should_close()) {
             fprintf(stderr, "  [GL] window closed; stopping\n");
@@ -10737,6 +10914,45 @@ static void methtrace_note(uint32_t method, uint32_t param)
     fprintf(stderr, "[MT] f%u d%u %04X = %08X (%g)\n", S.flips, S.since_present, method, param, f);
 }
 
+int nv2a_gl_method_run(uint32_t method, const uint32_t *params, uint32_t count)
+{
+    static int allowed = -1;
+    uint32_t take, i;
+    if (method != M_ARRAY_ELEMENT16 && method != M_ARRAY_ELEMENT32 &&
+        method != M_INLINE_ARRAY) return 0;
+    if (!count || !nv2a_gl_enabled() || g_failed || !S.const_attr_init) return 0;
+    if (allowed < 0)
+        allowed = !getenv("RECOMP_PB_SOFT") && !getenv("RECOMP_GL_PACKET_SCALAR") &&
+                  vc_debug_switch() == NULL;
+    if (!allowed) return 0;
+
+    g_prof.geometry_packets++;
+    g_prof.geometry_words += count;
+
+    /* No word in these payloads changes the split flags. After the first
+     * split check, every later scalar check would do nothing. */
+    split_batch_if_state_moved();
+    if (method == M_ARRAY_ELEMENT16) {
+        take = (MAX_INDICES - S.idx_count) / 2;
+        if (take > count) take = count;
+        for (i = 0; i < take; i++) {
+            S.idx[S.idx_count++] = params[i] & 0xFFFF;
+            S.idx[S.idx_count++] = params[i] >> 16;
+        }
+    } else if (method == M_ARRAY_ELEMENT32) {
+        take = MAX_INDICES - S.idx_count;
+        if (take > count) take = count;
+        memcpy(S.idx + S.idx_count, params, (size_t)take * sizeof *params);
+        S.idx_count += take;
+    } else {
+        take = MAX_INLINE - S.inline_count;
+        if (take > count) take = count;
+        memcpy(S.inline_buf + S.inline_count, params, (size_t)take * sizeof *params);
+        S.inline_count += take;
+    }
+    return 1;
+}
+
 void nv2a_gl_method(uint32_t method, uint32_t param)
 {
     if (!nv2a_gl_enabled() || g_failed) return;
@@ -10757,7 +10973,30 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
         memcpy(S.const_set, S.const_attr, sizeof S.const_set);
     }
 
-    /* Ranged methods first: they are the ones a title spends its bandwidth on. */
+    /* Geometry payloads repeat for every index/inline word. Handle them before
+     * the register ranges and immediate-attribute decoder: those checks have
+     * no side effects for these three methods. Keep tracing, initialization,
+     * state-change splitting and capacity checks identical to the scalar path. */
+    if (method == M_ARRAY_ELEMENT16) {
+        split_batch_if_state_moved();
+        if (S.idx_count + 2 <= MAX_INDICES) {
+            S.idx[S.idx_count++] = param & 0xFFFF;
+            S.idx[S.idx_count++] = param >> 16;
+        }
+        return;
+    }
+    if (method == M_ARRAY_ELEMENT32) {
+        split_batch_if_state_moved();
+        if (S.idx_count < MAX_INDICES) S.idx[S.idx_count++] = param;
+        return;
+    }
+    if (method == M_INLINE_ARRAY) {
+        split_batch_if_state_moved();
+        if (S.inline_count < MAX_INLINE) S.inline_buf[S.inline_count++] = param;
+        return;
+    }
+
+    /* Ranged methods first among the remaining register writes. */
     /* Both of these arrive as a run of dwords, and which component each dword
      * belongs to must be counted rather than derived from the method address.
      *
@@ -11375,17 +11614,6 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
             g_imm_n = 0;
         }
         break;
-    case M_ARRAY_ELEMENT16:
-        split_batch_if_state_moved();
-        if (S.idx_count + 2 <= MAX_INDICES) {
-            S.idx[S.idx_count++] = param & 0xFFFF;
-            S.idx[S.idx_count++] = param >> 16;
-        }
-        break;
-    case M_ARRAY_ELEMENT32:
-        split_batch_if_state_moved();
-        if (S.idx_count < MAX_INDICES) S.idx[S.idx_count++] = param;
-        break;
     case M_DRAW_ARRAYS:
         split_batch_if_state_moved();
         {
@@ -11422,10 +11650,6 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
         S.draw_first = first;
         S.draw_count = 0;
     }
-        break;
-    case M_INLINE_ARRAY:
-        split_batch_if_state_moved();
-        if (S.inline_count < MAX_INLINE) S.inline_buf[S.inline_count++] = param;
         break;
 
     case M_SET_DEPTH_TEST_ENABLE: S.depth_test = (int)param; break;
@@ -11923,6 +12147,29 @@ static int gfx_init(uint32_t w, uint32_t h)
 /* The present count -- the same number RECOMP_GL_DUMP_AFTER counts in -- for
  * diagnostics outside this file that want to act on one particular frame. */
 uint32_t nv2a_gl_flips(void) { return S.flips; }
+
+#if defined(NV2A_GLES)
+void nv2a_gl_performance_enable(int on)
+{
+    atomic_store_explicit(&g_perf_enabled, on ? 1 : 0, memory_order_relaxed);
+    if (!on) {
+        atomic_store_explicit(&g_perf_fps_milli, 0, memory_order_relaxed);
+        atomic_store_explicit(&g_perf_frame_us, 0, memory_order_relaxed);
+        atomic_store_explicit(&g_perf_cpu_us, 0, memory_order_relaxed);
+        atomic_store_explicit(&g_perf_gpu_us, -1, memory_order_relaxed);
+    }
+}
+
+void nv2a_gl_performance_stats(unsigned *fps_milli, unsigned *frame_us,
+                               unsigned *cpu_us, int *gpu_us, int *gpu_supported)
+{
+    if (fps_milli) *fps_milli = atomic_load_explicit(&g_perf_fps_milli, memory_order_relaxed);
+    if (frame_us) *frame_us = atomic_load_explicit(&g_perf_frame_us, memory_order_relaxed);
+    if (cpu_us) *cpu_us = atomic_load_explicit(&g_perf_cpu_us, memory_order_relaxed);
+    if (gpu_us) *gpu_us = atomic_load_explicit(&g_perf_gpu_us, memory_order_relaxed);
+    if (gpu_supported) *gpu_supported = atomic_load_explicit(&g_perf_gpu_supported, memory_order_relaxed);
+}
+#endif
 
 /* Test hooks for the game side (recomp_manual.c): capture a burst of frames
  * (every surface, as RECOMP_GL_DUMP_FB does) starting now, and log every

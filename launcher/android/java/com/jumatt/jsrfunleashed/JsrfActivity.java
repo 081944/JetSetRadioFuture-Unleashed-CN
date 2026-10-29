@@ -31,6 +31,8 @@ public class JsrfActivity extends SDLActivity
     static native void nativeSetWidescreen(boolean on);
     static native boolean nativeRstickCamera();
     static native void nativeSetRstickCamera(boolean on);
+    static native void nativeSetPerformanceOverlay(boolean on);
+    static native String nativePerformanceStats();
     static native void nativeSetControllerMapping(boolean swapTriggers, boolean nintendo);
     static native String nativeVersion();
     static native void nativeLog(String line);
@@ -39,6 +41,7 @@ public class JsrfActivity extends SDLActivity
     private InputManager mInput;
     private String mPadsSaid = "";
     private boolean mSwapTriggers, mNintendo;
+    private boolean mPerformanceOverlay;
 
     @Override
     protected String[] getLibraries() {
@@ -61,8 +64,11 @@ public class JsrfActivity extends SDLActivity
         if (mLayout == null) return;        /* SDL could not load the engine: it says so */
         mSwapTriggers = getSharedPreferences("controller", MODE_PRIVATE).getBoolean("swap_triggers", false);
         mNintendo = getSharedPreferences("controller", MODE_PRIVATE).getBoolean("nintendo", false);
+        mPerformanceOverlay = Settings.get(this, "performance_overlay", 0) != 0;
+        nativeSetPerformanceOverlay(mPerformanceOverlay);
         nativeSetControllerMapping(mSwapTriggers, mNintendo);
         mPad = new TouchPadView(this, this);
+        mPad.setPerformanceOverlay(mPerformanceOverlay);
         mLayout.addView(mPad, new RelativeLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         mInput = (InputManager) getSystemService(INPUT_SERVICE);
@@ -174,6 +180,7 @@ public class JsrfActivity extends SDLActivity
         final boolean wide = nativeWidescreen();
         final boolean touch = touchPref();
         final boolean rcam = nativeRstickCamera();
+        final boolean perf = mPerformanceOverlay;
         final int scale = Settings.get(this, "scale", 2);
         String[] items = {
             "Widescreen: " + (wide ? "on" : "off"),
@@ -182,6 +189,7 @@ public class JsrfActivity extends SDLActivity
             "Camera on the right stick: " + (rcam ? "on" : "off"),
             "肩键/扳机互换 (LB↔LT、RB↔RT)：" + (mSwapTriggers ? "开" : "关"),
             "ABXY 布局：" + (mNintendo ? "任天堂" : "微软"),
+            "性能叠层：" + (perf ? "开" : "关"),
             "Controls",
         };
         mPad.reset();
@@ -206,6 +214,12 @@ public class JsrfActivity extends SDLActivity
                     break;
                 case 5:
                     pickControllerLayout();
+                    break;
+                case 6:
+                    mPerformanceOverlay = !perf;
+                    Settings.set(this, "performance_overlay", mPerformanceOverlay ? 1 : 0);
+                    nativeSetPerformanceOverlay(mPerformanceOverlay);
+                    mPad.setPerformanceOverlay(mPerformanceOverlay);
                     break;
                 default:
                     showControls();
