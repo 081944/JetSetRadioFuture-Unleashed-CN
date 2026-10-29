@@ -3,6 +3,7 @@ param(
     [string]$SdlSource = '',
     [string]$CnProfileDir = '',
     [string]$GeneratedDir = '',
+    [string]$Version = '0.5.10-cn.1-test',
     [int]$Jobs = 4,
     [switch]$SdlOnly
 )
@@ -39,12 +40,13 @@ if ($SdlOnly) { return }
 Invoke-CMake -CMakeArgs @('-S', "$repoRoot/port", '-B', "$workDir/engine", '-G', 'Ninja',
     "-DCMAKE_MAKE_PROGRAM=$ninjaPath", "-DCMAKE_TOOLCHAIN_FILE=$toolchain",
     '-DANDROID_ABI=arm64-v8a', '-DANDROID_PLATFORM=android-29',
-    '-DCMAKE_BUILD_TYPE=RelWithDebInfo', '-DJSRF_VERSION=cn-prototype',
+    '-DCMAKE_BUILD_TYPE=RelWithDebInfo', "-DJSRF_VERSION=$Version",
     "-DJSRF_GEN_DIR=$GeneratedDir", "-DJSRF_CN_PROFILE_DIR=$CnProfileDir",
     "-DSDL2_DIR=$sdlInstall/lib/cmake/SDL2")
 Invoke-CMake -CMakeArgs @('--build', "$workDir/engine", '-j', "$Jobs", '--target', 'jsrf_recomp')
 $profileManifest = Get-Content -LiteralPath (Join-Path $CnProfileDir 'manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $nativeReceipt = [ordered]@{
+    version = $Version
     target_sha256 = $profileManifest.target_sha256
     library_sha256 = (Get-FileHash -LiteralPath "$workDir/engine/libmain.so" -Algorithm SHA256).Hash.ToLowerInvariant()
 }

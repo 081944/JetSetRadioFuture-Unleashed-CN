@@ -1,18 +1,21 @@
 param(
     [string]$AndroidSdk = "$env:LOCALAPPDATA\Android\Sdk",
     [string]$JavaDir = 'C:\Program Files\Android\Android Studio\jbr',
-    [string]$Version = '0.5.9-cn.1',
-    [int]$VersionCode = 3,
+    [string]$Version = '0.5.10-cn.1-test',
+    [int]$VersionCode = 4,
+    [string]$SigningDir = '',
     [string]$OutputDir = ''
 )
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 if (!$OutputDir) { $OutputDir = Join-Path $repoRoot 'build-cn-apk' }
+if (!$SigningDir) { $SigningDir = Join-Path $repoRoot 'build-cn-apk' }
 $OutputDir = [IO.Path]::GetFullPath($OutputDir)
 $work = Join-Path $OutputDir ('work-' + [guid]::NewGuid().ToString('N'))
 $native = Join-Path $repoRoot 'build-cn-native'
 $profile = Get-Content -LiteralPath "$repoRoot/game_files/cn_compat/manifest.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 $receipt = Get-Content -LiteralPath "$native/engine/cn-build.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+if ($receipt.version -ne $Version) { throw 'APK and native engine versions differ. Build the native library with the same -Version first.' }
 if ($profile.target_sha256 -ne $receipt.target_sha256 -or
     (Get-FileHash -LiteralPath "$native/engine/libmain.so" -Algorithm SHA256).Hash.ToLowerInvariant() -ne $receipt.library_sha256) {
     throw 'Native library receipt does not match current CN profile. Run build_native.ps1 first.'
@@ -78,8 +81,9 @@ try {
 } finally { $archive.Dispose() }
 Invoke-Tool "$bt/zipalign.exe" @('-P', '16', '-f', '4', "$work/unsigned.apk", "$work/aligned.apk")
 # Persist the local test identity so later test APKs can update this install.
-$keystore = Join-Path $OutputDir 'cn-test.keystore'
-$pass = Join-Path $OutputDir 'cn-test.keystore.pass'
+New-Item -ItemType Directory -Path $SigningDir -Force | Out-Null
+$keystore = Join-Path $SigningDir 'cn-test.keystore'
+$pass = Join-Path $SigningDir 'cn-test.keystore.pass'
 if (!(Test-Path -LiteralPath $keystore)) {
     if (Test-Path -LiteralPath $pass) { throw 'Password exists without keystore; inspect the test signing files' }
     [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(24)) |
