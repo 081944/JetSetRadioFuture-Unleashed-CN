@@ -50,3 +50,24 @@ port/recomp/
 # Backups and merge leftovers
 *.bak*
 *.orig
+
+# CN development: local game-derived profiles and private signing material
+/analysis/
+/Media/
+cn_profile.h
+cn_codegen.sha256
+*.apk
+*.aab
+*.idsig
+*.keystore
+*.jks
+*.p12
+*.pfx
+*.pass
+*.dex
+*.class
+*.so
+*.a
+*.o
+.env
+.env.*

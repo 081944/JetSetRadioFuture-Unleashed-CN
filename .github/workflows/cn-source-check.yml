@@ -1,0 +1,27 @@
+name: CN source checks
+on:
+  push:
+    branches: [cn]
+  pull_request:
+    branches: [cn]
+permissions:
+  contents: read
+jobs:
+  source-only:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Audit introduced source and history
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python tools/cn_compat/audit_publish.py
+          if ($LASTEXITCODE -ne 0) { throw 'Source publication audit failed' }
+          python -m unittest tools.cn_compat.test_audit_publish -v
+          if ($LASTEXITCODE -ne 0) { throw 'Publication guard tests failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Whitespace check failed' }

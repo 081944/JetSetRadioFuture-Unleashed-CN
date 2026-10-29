@@ -4,6 +4,8 @@
 
 # JSRF Unleashed
 
+> **中文 Android 分支：** 本 fork 基于 [JuMatt/JetSetRadioFuture-Unleashed](https://github.com/JuMatt/JetSetRadioFuture-Unleashed)，增加特定日版汉化镜像支持和可保存的实体手柄布局设置。请先阅读 [中文说明](README.zh-CN.md)。下方保留上游原文，其下载链接指向上游；本分支 APK 请访问 [中文版 Releases](https://github.com/081944/JetSetRadioFuture-Unleashed-CN/releases)。
+
 **Jet Set Radio Future, running natively on Mac, Windows, Linux, Android, iPhone and iPad.** Not an emulator — the
 game's own code, statically recompiled into C and built as a native
 application.
