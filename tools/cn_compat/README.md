@@ -4,7 +4,7 @@
 
 用户已在 AYN Thor 上确认游戏运行正常且显示中文，并已进行新增手柄设置的测试；合并上游 0.5.10 后也已确认正常运行。底层检查和单台设备反馈不等于完整通关或所有设备兼容验证。
 
-发布构建输出 `build-cn-apk/JSRF-Unleashed-android-arm64-CN.apk`，支持 Android 10 及以上的 ARM64 设备。之前的测试包已通过签名、ZIP 完整性、16 KiB ZIP 对齐、安装信息和原生 JNI 入口检查。
+发布构建输出 `build/dist/<版本>/JSRF-Unleashed-android-arm64-CN.apk`，支持 Android 10 及以上的 ARM64 设备。之前的测试包已通过签名、ZIP 完整性、16 KiB ZIP 对齐、安装信息和原生 JNI 入口检查。
 
 手机只需复制这个 APK 和原有 `JSRF-CN.iso`。安装后选择该 ISO，沿用原应用的资源提取流程；不需要把美版镜像复制到手机，也不需要修改中文版 ISO。
 
@@ -64,7 +64,46 @@ if ($LASTEXITCODE -ne 0) { throw 'Code generation failed' }
 
 `test_local.py` 及 `verify_codegen.py` 通过 `JSRF_US_XBE`、`JSRF_CN_XBE` 读取构建者提供的输入。未设置环境变量时保留早期工作区 `../analysis/us.xbe` 与 `../analysis/cn.xbe` 的兼容路径。这些文件不属于仓库源码；`prepare.py` 可直接读取 ISO。
 
-版本号和 `versionCode` 由 `version.json` 提供，两个脚本默认读取，不需要再传 `-Version`；传了不同的值会直接报错（`-AllowVersionOverride` 仅供一次性本地验证）。签名身份缺失时脚本报错而不是新建，`signing.json` 里的证书指纹用来确认 keystore 没被换掉。打包结束会写出 `build-report.json` 与 `.apk.sha256`，可供两台机器对比产物是否同源。更换机器时把 `build-cn-apk/` 下的 keystore 与 `.pass` 用离线方式拷过去即可，构建目录 `build*/` 必须重建。
+版本号和 `versionCode` 由 `version.json` 提供，两个脚本默认读取，不需要再传 `-Version`；传了不同的值会直接报错（`-AllowVersionOverride` 仅供一次性本地验证）。签名身份缺失时脚本报错而不是新建，`signing.json` 里的证书指纹用来确认 keystore 没被换掉。打包结束会写出 `build-report.json` 与 `.apk.sha256`，可供两台机器对比产物是否同源。更换机器时把 `build/signing/` 下的 keystore 与 `.pass` 用离线方式拷过去即可，其余构建目录 `build*/` 必须重建。
+
+## 目录与打包规则
+
+仓库根只放源码、脚本和文档。所有可再生成的内容都有固定去处，不再在根目录平铺。
+
+| 路径 | 内容 | 能否删除 |
+| --- | --- | --- |
+| `src/ port/ launcher/ tools/ docs/ tests/ templates/` | 源码 | 否，进 Git |
+| `game_files/SDL2/` | 上游 SDL2 源码 | 可删，重新解压 |
+| `game_files/cn_compat/` | `prepare.py` 的产物：profile、`cn_profile.h`、`default.xbe`、`abi/`、`disasm/`、`recomp/`、`func_id/` | 可删，重跑 `prepare.py` + `generate.py` |
+| `port/recomp/gen/` | `generate.py` 生成的 C | 可删，重跑 `generate.py` |
+| `build-cn-native/` | 原生库的 CMake 树 | 可删，重编约 15 分钟 |
+| `build/work/` | 一次打包的临时区 | 脚本自动删除 |
+| `build/dist/<版本>/` | 交付物（APK、`.sha256`、`.idsig`、`build-report.json`） | 保留 |
+| `build/signing/` | keystore 与密码 | **绝不删** |
+| `build/logs/` | 构建日志与历史归档 | 可删 |
+
+六条规则：
+
+1. **`build/` 是唯一的打包输出根。** 除上表四项外不要在 `build/` 下新建别的东西，也不要在仓库根新建 `build-*` 目录。
+2. **一次打包对应一个 `build/work/work-<guid>/`。** 脚本启动时先清空 `build/work/`，成功结束时删除本次目录，中途失败留下的目录会在下次打包开头被清掉。需要检查中间产物时加 `-KeepWork`。
+3. **交付物按版本隔离。** `-OutputDir` 默认取 `build/dist/<version.json 里的版本>`：重打同一版本会覆盖同名文件，打新版本会并排新建目录，不同版本的 APK 不会互相覆盖。
+4. **签名材料与产物分开存放。** keystore 只在 `build/signing/`，不进 Git、不进发布包；换机器时单独离线拷贝这两个文件。
+5. **`build-cn-native/` 不搬进 `build/`。** CMake 缓存记录的是绝对路径，移动目录等于全量重编。该路径由 `build_native.ps1 -BuildDir` 指定，真要搬就一次搬到底。
+6. **日志不留在源码目录。** 构建输出重定向到 `build/logs/<名字>.log`，历史日志放 `build/logs/archive/`；`profile` 目录只放输入，工具产生的临时文件走系统临时目录。
+
+标准打包序列：
+
+```powershell
+pwsh -ExecutionPolicy Bypass -File tools/cn_compat/build_native.ps1 -Jobs 8
+pwsh -ExecutionPolicy Bypass -File tools/cn_compat/build_apk.ps1
+# 产物：build/dist/<版本>/JSRF-Unleashed-android-arm64-CN.apk
+```
+
+需要从零重来时，下面这些都可再生成（不含 SDL2 与 profile 时约 600 MB）：
+
+```powershell
+Remove-Item -Recurse -Force build, build-cn-native, game_files/cn_compat, port/recomp/gen
+```
 
 原生构建必须同时设置：
 

@@ -4,8 +4,10 @@ Local integration test: requires GCC and Unicorn, no game/window/device.
 """
 import argparse
 from pathlib import Path
+import shutil
 import struct
 import subprocess
+import tempfile
 import re
 
 from tools.cn_compat.prepare import ROOT, offset
@@ -119,11 +121,15 @@ int main(int argc, char **argv) {
     fclose(in); fclose(out); free(mem); return 0;
 }
 '''
-    (profile/'test_codegen.c').write_text(harness, encoding='utf-8')
-    exe = profile/'test_codegen.exe'
+    # The harness, its binary and the glyph dump are throwaway build products.
+    # Keep them out of the profile directory: that directory is a pure input
+    # (prepare.py output) and should never accumulate generated files.
+    workdir = Path(tempfile.mkdtemp(prefix='jsrf-cn-verify-'))
+    (workdir/'test_codegen.c').write_text(harness, encoding='utf-8')
+    exe = workdir/'test_codegen.exe'
     subprocess.run(['gcc', '-std=c11', '-O2', '-I'+str(ROOT/'templates/runtime'),
-                    str(profile/'test_codegen.c'), '-o', str(exe)], check=True)
-    results = profile/'glyph_results.bin'
+                    str(workdir/'test_codegen.c'), '-o', str(exe)], check=True)
+    results = workdir/'glyph_results.bin'
     subprocess.run([str(exe), str(xbe), str(results)], check=True)
     actual = struct.unpack('<65536I', results.read_bytes())
     Prototype.setUpClass()
@@ -143,6 +149,7 @@ int main(int argc, char **argv) {
             raise AssertionError(f'C falsely recognized {code:#x}')
     print(f'Generated native C agrees with CN x86 for {len(codes)} mapped codes; '
           'all 65536 inputs, texture indices 0-7, resource load/free, readiness and stack cleanup checked.')
+    shutil.rmtree(workdir, ignore_errors=True)
 
 
 if __name__ == '__main__':

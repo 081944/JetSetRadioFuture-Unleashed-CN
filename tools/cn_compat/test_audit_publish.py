@@ -12,7 +12,7 @@ class PublishGuard(unittest.TestCase):
 
     def test_local_data_and_binaries_rejected(self):
         for name in ['game_files/profile.json', 'analysis/report.md',
-                     'port/recomp/gen/recomp_0000.c', 'build-cn-apk/log.txt',
+                     'port/recomp/gen/recomp_0000.c', 'build/work/scratch/unsigned.apk',
                      'cn_profile.h', 'disc.iso', 'game.xbe', 'jetfont.dat',
                      'release.apk', 'private.keystore', 'password.pass']:
             with self.subTest(name=name), self.assertRaises(ValueError):

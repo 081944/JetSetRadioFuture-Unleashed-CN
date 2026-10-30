@@ -5,21 +5,47 @@ param(
     [int]$VersionCode = 0,
     [string]$SigningDir = '',
     [string]$OutputDir = '',
+    [string]$NativeDir = '',
     [switch]$AllowVersionOverride,
-    [switch]$AllowNewIdentity
+    [switch]$AllowNewIdentity,
+    # Keep the scratch directory (build/work/work-<guid>) after a successful run
+    # when the packaging steps need to be inspected.
+    [switch]$KeepWork
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'version.ps1')
 $repoRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
-if (!$OutputDir) { $OutputDir = Join-Path $repoRoot 'build-cn-apk' }
-if (!$SigningDir) { $SigningDir = Join-Path $repoRoot 'build-cn-apk' }
-$OutputDir = [IO.Path]::GetFullPath($OutputDir)
-$work = Join-Path $OutputDir ('work-' + [guid]::NewGuid().ToString('N'))
-$native = Join-Path $repoRoot 'build-cn-native'
+if (!$NativeDir) { $NativeDir = Join-Path $repoRoot 'build-cn-native' }
+$native = [IO.Path]::GetFullPath($NativeDir)
 
 $release = Resolve-CnReleaseInfo -Info (Get-CnReleaseInfo) -Version $Version -VersionCode $VersionCode -AllowOverride:$AllowVersionOverride
 if ($release.overridden) {
     Write-Warning "Using overridden version $($release.version) / versionCode $($release.versionCode); $($release.source) says otherwise."
+}
+
+# Layout rule (see tools/cn_compat/README.md "打包目录规则"):
+#   build/signing/            signing identity, never leaves this machine
+#   build/work/work-<guid>/   scratch area for one packaging run, deleted afterwards
+#   build/dist/<version>/     the shipped artifacts of exactly one version
+# Nothing else is written under build/. build-cn-native/ stays a sibling because
+# moving it invalidates the CMake cache and forces a full native rebuild.
+if (!$OutputDir) { $OutputDir = Join-Path $repoRoot "build/dist/$($release.version)" }
+if (!$SigningDir) { $SigningDir = Join-Path $repoRoot 'build/signing' }
+$OutputDir = [IO.Path]::GetFullPath($OutputDir)
+$workRoot = Join-Path $repoRoot 'build/work'
+$work = Join-Path $workRoot ('work-' + [guid]::NewGuid().ToString('N'))
+
+# A run that dies mid-way leaves its scratch directory behind. One packaging run
+# at a time owns build/work, so clear the leftovers up front instead of letting
+# 70 MB per attempt pile up in the tree.
+if (Test-Path -LiteralPath $workRoot) {
+    Get-ChildItem -LiteralPath $workRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        try {
+            Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop
+        } catch {
+            Write-Warning "Stale work directory could not be removed (in use?): $($_.FullName)"
+        }
+    }
 }
 $source = Get-CnGitState -RepoRoot $repoRoot
 
@@ -212,6 +238,15 @@ $reportPath = Join-Path $OutputDir 'build-report.json'
 Write-CnJsonFile -Path $reportPath -Object $report
 
 Get-FileHash -LiteralPath $apk -Algorithm SHA256
+
+# The scratch directory holds ~70 MB of intermediate APK/classes/dex. It is only
+# useful while debugging, so drop it unless -KeepWork was passed.
+if ($KeepWork) {
+    Write-Output "Work dir kept: $work"
+} else {
+    Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 Write-Output "Packaged APK: $apk"
 Write-Output "SHA256 sidecar: $(Join-Path $OutputDir "$apkName.sha256")"
 Write-Output "Build report: $reportPath"

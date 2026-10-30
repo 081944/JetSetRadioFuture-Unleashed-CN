@@ -6,6 +6,7 @@ param(
     [string]$Version = '',
     [int]$VersionCode = 0,
     [int]$Jobs = 4,
+    [string]$BuildDir = '',
     [switch]$AllowVersionOverride,
     [switch]$SdlOnly
 )
@@ -19,12 +20,15 @@ if ($release.overridden) {
 if (!$SdlSource) { $SdlSource = Join-Path $repoRoot 'game_files/SDL2' }
 if (!$CnProfileDir) { $CnProfileDir = Join-Path $repoRoot 'game_files/cn_compat' }
 if (!$GeneratedDir) { $GeneratedDir = Join-Path $repoRoot 'port/recomp/gen' }
+# Kept as a top-level directory on purpose: the CMake cache records absolute paths,
+# so relocating it under build/ would force a full ~15 min native rebuild.
+if (!$BuildDir) { $BuildDir = Join-Path $repoRoot 'build-cn-native' }
 $ndkChoice = Get-ChildItem -LiteralPath (Join-Path $AndroidSdk 'ndk') -Directory |
     Where-Object { Test-Path (Join-Path $_.FullName 'build/cmake/android.toolchain.cmake') } |
     Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
 if (!$ndkChoice) { throw 'No complete Android NDK installation found' }
 $toolchain = Join-Path $ndkChoice.FullName 'build/cmake/android.toolchain.cmake'
-$workDir = Join-Path $repoRoot 'build-cn-native'
+$workDir = [IO.Path]::GetFullPath($BuildDir)
 $sdlInstall = Join-Path $workDir 'sdl-install'
 $ninjaPath = (Get-Command ninja -ErrorAction Stop).Source
 $sdkCmake = Get-ChildItem -LiteralPath (Join-Path $AndroidSdk 'cmake') -Directory |

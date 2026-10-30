@@ -20,7 +20,7 @@
 
 已核对 XBE 哈希、生成器及运行时模板、手写函数声明与入口钩子均未变化，因此复用原生成 C，重新编译更新后的引擎。字体及转换的本地回归、实际生成字体 C 的全部 65,536 个输入、手柄四种组合检查通过。
 
-原生和 APK 构建脚本共用 `tools/cn_compat/version.json` 作为版本号唯一来源，命令行不再需要传 `-Version`；打包时检查原生回执、兼容数据、生成代码三者一致。可用 `-OutputDir` 将不同版本存入不同的本地构建目录；签名身份默认始终保存在原 `build-cn-apk/`，不随输出目录改变，也不提交到仓库。
+原生和 APK 构建脚本共用 `tools/cn_compat/version.json` 作为版本号唯一来源，命令行不再需要传 `-Version`；打包时检查原生回执、兼容数据、生成代码三者一致。产物默认按版本落在 `build/dist/<版本>/`；签名身份固定在 `build/signing/`，不随输出目录改变，也不提交到仓库。
 
 ## 0.5.10-cn.2 发布
 
@@ -38,7 +38,7 @@
 
 - **版本号单一来源**：`tools/cn_compat/version.json` 同时保存 `version` 与 `versionCode`，`build_native.ps1`、`build_apk.ps1` 都从这里读取；命令行传不同值会被拒绝（`-AllowVersionOverride` 只用于一次性本地验证，并且会写进报告）。发新版本只改这一个文件。
 - **签名身份单一**：`tools/cn_compat/signing.json` 记录发布证书的 SHA256 指纹与 DN。keystore 不存在时脚本直接报错，不再静默新建；`-AllowNewIdentity` 才会生成一次性身份，并明确提示该包装不上已有安装。签名后从 APK 里读回证书指纹与 `signing.json` 比对，不一致就拒绝产出。
-- **构建报告**：`build_apk.ps1` 结束时写出 `build-cn-apk/build-report.json` 和同名 `.apk.sha256`，含 `source_commit` / `source_dirty` / 分支、`profile_target_sha256`、`gen_stamp`、`libmain.so` 哈希、`cert_sha256`、版本与 `versionCode`、NDK 与 build-tools 版本、构建机与时间。两台机器各跑一次再对比报告，即可判断产物是否同源。
+- **构建报告**：`build_apk.ps1` 结束时在 `build/dist/<版本>/` 写出 `build-report.json` 和同名 `.apk.sha256`，含 `source_commit` / `source_dirty` / 分支、`profile_target_sha256`、`gen_stamp`、`libmain.so` 哈希、`cert_sha256`、版本与 `versionCode`、NDK 与 build-tools 版本、构建机与时间。两台机器各跑一次再对比报告，即可判断产物是否同源。
 - **已发布版本号不可复用**：若 `v<version>` 标签存在且不是 HEAD 的祖先，脚本拒绝打包，必须先改 `version.json`。标签之后的文档提交不影响重打包，这与「标签钉构建提交」的既有约定一致。
 
 回执中的 `gen_stamp` 让 `build_apk.ps1` 能拒绝「兼容数据与生成代码不同源」的组合；旧回执缺少该字段时会提示重跑 `build_native.ps1`。`build-report.json`、`.apk.sha256` 与 keystore 都在忽略目录，只做本地溯源，不提交 Git。
