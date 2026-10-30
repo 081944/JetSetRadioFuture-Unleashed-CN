@@ -36,6 +36,10 @@ void nv2a_gl_method(uint32_t method, uint32_t param);
 /* Optional non-incrementing geometry packet; 0 asks the caller to use the
  * scalar executor, 1 means every word was handled (including overflow drops). */
 int nv2a_gl_method_run(uint32_t method, const uint32_t *params, uint32_t count);
+/* A run of transform program or constant dwords, appended whole. Returns 0 when
+ * the word is not part of such a run and the caller must dispatch it itself. */
+int nv2a_gl_transform_run(uint32_t method, const uint32_t *params, uint32_t count,
+                          int noninc);
 
 /* End-of-run summary: what was drawn, what was refused, and why. */
 void nv2a_gl_report(void);

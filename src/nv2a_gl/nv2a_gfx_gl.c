@@ -889,10 +889,48 @@ static void glx_prog_use(uint32_t h)
     g_cur_prog = h;
 }
 
+/* What each uniform was last set to, for the program that is in use now.
+ *
+ * The draws in a frame arrive in runs that share a program and its uniforms --
+ * measured, 62% of them repeat the previous draw's state entirely -- and each
+ * glUniform is a driver call with its own validation. Setting the same value
+ * again buys nothing, so it is not done. A program switch clears this: the
+ * uniforms live in the program object and the other one has its own. */
+#define UNI_FMAX 64              /* floats cached per uniform; c[] is past it */
+static float    g_uni_f[NV2A_U_COUNT][UNI_FMAX];
+static int      g_uni_f_n[NV2A_U_COUNT];   /* floats cached, or -1 */
+static int      g_uni_i[NV2A_U_COUNT];
+static uint32_t g_uni_prog;
+
+static void uni_sync(void)
+{
+    if (g_uni_prog != g_cur_prog) {
+        int i;
+        g_uni_prog = g_cur_prog;
+        for (i = 0; i < NV2A_U_COUNT; i++) {
+            g_uni_i[i] = 0x7FFFFFFF;      /* no int can be this */
+            g_uni_f_n[i] = -1;
+        }
+    }
+}
+
 static void glx_uniform_f(int id, const float *v, int n)
 {
     GLint loc;
+    int vecsz = 1, nf;
     if (!prog_ok(g_cur_prog) || id < 0 || id >= NV2A_U_COUNT) return;
+    switch (nv2a_uniform_desc[id].type) {
+    case NV2A_UT_VEC2: vecsz = 2; break;
+    case NV2A_UT_VEC3: vecsz = 3; break;
+    case NV2A_UT_VEC4: vecsz = 4; break;
+    case NV2A_UT_MAT2: vecsz = 4; break;
+    default: break;
+    }
+    nf = n * vecsz;
+    uni_sync();
+    if (nf <= UNI_FMAX && g_uni_f_n[id] == nf
+        && !memcmp(g_uni_f[id], v, (size_t)nf * sizeof(float)))
+        return;
     loc = g_prog[g_cur_prog - 1].loc[id];
     if (loc < 0) return;
     switch (nv2a_uniform_desc[id].type) {
@@ -901,16 +939,23 @@ static void glx_uniform_f(int id, const float *v, int n)
     case NV2A_UT_VEC3:  glUniform3fv(loc, n, v); break;
     case NV2A_UT_VEC4:  glUniform4fv(loc, n, v); break;
     case NV2A_UT_MAT2:  glUniformMatrix2fv(loc, n, GL_FALSE, v); break;
-    default: break;
+    default: return;
     }
+    if (nf <= UNI_FMAX) {
+        memcpy(g_uni_f[id], v, (size_t)nf * sizeof(float));
+        g_uni_f_n[id] = nf;
+    } else g_uni_f_n[id] = -1;
 }
 
 static void glx_uniform_i(int id, int v)
 {
     GLint loc;
     if (!prog_ok(g_cur_prog) || id < 0 || id >= NV2A_U_COUNT) return;
+    uni_sync();
+    if (g_uni_i[id] == v) return;
     loc = g_prog[g_cur_prog - 1].loc[id];
     if (loc >= 0) glUniform1i(loc, v);
+    g_uni_i[id] = v;
 }
 
 /* Part of c[]: the constants that changed since this program last had them,
@@ -933,10 +978,29 @@ static int glx_uniform_f_part(int id, int first, const float *v, int n)
     return 1;
 }
 
+/* What each texture unit has bound, so a draw that keeps its textures does not
+ * rebind them. Anything that binds outside this function clears it: SMAA puts
+ * its own textures on the same units at the end of a frame. */
+#define TEXUNITS 4        /* the units a draw binds; unit 7 is scratch */
+static uint32_t g_tex_unit[TEXUNITS];
+static int      g_tex_unit_set[TEXUNITS];
+
+static void glx_texture_invalidate(void)
+{
+    memset(g_tex_unit_set, 0, sizeof g_tex_unit_set);
+}
+
 static void glx_texture(int unit, uint32_t tex)
 {
+    if (unit >= 0 && unit < TEXUNITS && g_tex_unit_set[unit]
+        && g_tex_unit[unit] == tex)
+        return;
     glActiveTexture((GLenum)(GL_TEXTURE0 + unit));
     glBindTexture(GL_TEXTURE_2D, (GLuint)tex);
+    if (unit >= 0 && unit < TEXUNITS) {
+        g_tex_unit[unit] = tex;
+        g_tex_unit_set[unit] = 1;
+    }
 }
 
 /* ---- state --------------------------------------------------------------- */
@@ -1681,6 +1745,7 @@ static int smaa_size(uint32_t pw, uint32_t ph)
 
 static void smaa_bind(int unit, GLuint tex)
 {
+    glx_texture_invalidate();      /* these units stop holding what a draw bound */
     glActiveTexture((GLenum)(GL_TEXTURE0 + unit));
     glBindTexture(GL_TEXTURE_2D, tex);
 }

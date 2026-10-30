@@ -266,6 +266,26 @@ uint32_t nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
                 continue;
             }
 
+            /* A run of transform program (0B00-0B7C) or constant (0B80-0BFC)
+             * dwords: the backend appends those in the order they arrive, so
+             * the run does not need one dispatch per word. This title uploads
+             * a quarter million constant dwords a second and each one was a
+             * descent through the method dispatch chain to do a four-byte copy.
+             *
+             * The range test stays here rather than inside the call: this runs
+             * for every multi-word packet on the stream, and the ones that
+             * matter are a small minority. A call that has to go and find that
+             * out costs more than the two comparisons. */
+            if (subch == 0 && s_exec_enabled && !s_scan_enabled && count > 1
+                && method >= 0x0B00 && method <= 0x0BFC
+                && count <= (end_va - va) / 4
+                && nv2a_gl_transform_run(method, (const uint32_t *)(mem + va),
+                                         count, noninc)) {
+                va += count * 4;
+                words += count;
+                continue;
+            }
+
             for (uint32_t i = 0; i < count && va < end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 /* The inventory is only ever printed under RECOMP_PB_SCAN, so

@@ -32,6 +32,7 @@
 #include "nv2a_psh.h"
 #include "nv2a_backend.h"
 #include "nv2a_shader_cache.h"
+#include "jsrf_debug_env.h"
 
 /*
  * Two ways to get a 3.3 core context.
@@ -503,6 +504,14 @@ static void vc_report(const char *when);
 static GlProfile g_prof;
 static int g_prof_on = -1;
 
+/* Which methods the title actually sends, indexed by method >> 2 (a method is
+ * 13 bits and always 4-aligned). The dispatch in nv2a_gl_method is a long
+ * chain of range tests; knowing the order of the head of the distribution is
+ * the difference between shortening it where it pays and guessing. Counted
+ * only while the profile is on, so a shipping build pays one predictable
+ * branch per method. */
+static uint32_t g_meth_count[0x800];
+
 static double prof_now(void)
 {
     struct timespec t;
@@ -510,7 +519,7 @@ static double prof_now(void)
     return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
 }
 #define PROF_ON() (g_prof_on < 0 \
-        ? (g_prof_on = getenv("RECOMP_GL_PROFILE") ? 1 : 0) : g_prof_on)
+        ? (g_prof_on = jsrf_getenv("RECOMP_GL_PROFILE") ? 1 : 0) : g_prof_on)
 #define PROF_T0() double _t0 = PROF_ON() ? prof_now() : 0.0
 #define PROF_ADD(field) do { if (PROF_ON()) g_prof.field += prof_now() - _t0; } while (0)
 
@@ -537,6 +546,11 @@ static void prof_report(void)
     double now;
     if (!PROF_ON()) return;
     now = prof_now();
+    { static int announced;
+      if (!announced) {
+          announced = 1;
+          jsrf_dbg_log("profiler on (RECOMP_GL_PROFILE or debug.jsrf.recomp_gl_profile)\n");
+      } }
     if (last == 0.0) { last = now; prev = g_prof; return; }
     if (now - last < 1.0) return;
     {
@@ -551,7 +565,7 @@ static void prof_report(void)
         d.whole_draw = g_prof.whole_draw - prev.whole_draw;
         d.present = g_prof.present - prev.present;
         d.pace    = g_prof.pace    - prev.pace;
-        fprintf(stderr,
+        jsrf_dbg_log(
             "[GLPROF] %.0f draws/s | tex %4.1f%%  verts %4.1f%%  vbo %4.1f%%  "
             "uniforms %4.1f%%  glDraw %4.1f%%  state %4.1f%%  (rest %4.1f%%)\n",
             (g_prof.n_draws - prev.n_draws) / dt,
@@ -561,7 +575,7 @@ static void prof_report(void)
         /* Where the rest goes: the draws' own work outside the calls above
          * (finding the program, the uniforms by name, the bookkeeping), and
          * the flip -- showing the frame, and waiting for its moment. */
-        fprintf(stderr,
+        jsrf_dbg_log(
             "[GLPROF]   draws in all %4.1f%% (%.1f us each, %.1f us outside the above) | "
             "present %4.1f%%  pacing %4.1f%%\n",
             100 * d.whole_draw / dt,
@@ -571,8 +585,32 @@ static void prof_report(void)
                 ? 1e6 * (d.whole_draw - d.tex - d.verts - d.vbo - d.unif - d.draw - d.state)
                   / (g_prof.n_draws - prev.n_draws) : 0.0,
             100 * d.present / dt, 100 * d.pace / dt);
+        /* The remainder from the line above, split into the three stretches
+         * that run before any of the counted GL work does. Per draw, because
+         * that is the number a fixed cost has to be judged in. */
         { static double last_vc;
-          if (now - last_vc >= 10.0) { last_vc = now; vc_report(" (so far)"); } }
+          if (now - last_vc >= 10.0) {
+              int slot, shown;
+              uint32_t taken[12];
+              last_vc = now;
+              /* The head of the method distribution, most frequent first. */
+              memset(taken, 0, sizeof taken);
+              jsrf_dbg_log("method mix:");
+              for (shown = 0; shown < 12; shown++) {
+                  uint32_t best = 0, best_n = 0;
+                  for (slot = 0; slot < 0x800; slot++) {
+                      int skip = 0, j;
+                      for (j = 0; j < shown; j++) if (taken[j] == (uint32_t)slot) { skip = 1; break; }
+                      if (skip) continue;
+                      if (g_meth_count[slot] > best_n) { best_n = g_meth_count[slot]; best = (uint32_t)slot; }
+                  }
+                  if (!best_n) break;
+                  taken[shown] = best;
+                  jsrf_dbg_log(" %04X x%u", best << 2, best_n);
+              }
+              jsrf_dbg_log("\n");
+              vc_report(" (so far)");
+          } }
         /* Per second, not per frame -- which is what it used to say, and the
          * numbers were read as per-frame for long enough to be worth the
          * correction: six thousand program switches in a frame is an
@@ -586,14 +624,14 @@ static void prof_report(void)
          * and this title finishes three of those per frame. */
         { static uint32_t prev_frames, prev_flips;
           double fps = (S.frames - prev_frames) / dt;
-          fprintf(stderr,
+          jsrf_dbg_log(
             "[GLPROF]   %.1f fps, %.0f passes/s, %.0f draws and %.0f "
             "triangles per frame\n",
             fps, (S.flips - prev_flips) / dt,
             fps > 0 ? (g_prof.n_draws - prev.n_draws) / dt / fps : 0.0,
             fps > 0 ? (double)(S.tris - prev_tris_p) / dt / fps : 0.0);
           prev_frames = S.frames; prev_flips = S.flips; prev_tris_p = S.tris; }
-        fprintf(stderr,
+        jsrf_dbg_log(
             "[GLPROF]   per second: %lu KB of vertices, %lu constant vec4s, "
             "%u constant uploads, %u program switches, %u texture uploads, "
             "%u texture lookups; %u textures held (%llu MB); %llu KB compared, "
@@ -609,7 +647,7 @@ static void prof_report(void)
             g_prof.n_tex_rewritten - prev.n_tex_rewritten);
         {
             static double prev_pb; static unsigned long prev_words;
-            fprintf(stderr,
+            jsrf_dbg_log(
                 "[GLPROF]   pushbuffer walk (decode + backend state machine): "
                 "%4.1f%% of wall time, %lu K words/s -- everything not "
                 "accounted for is the recompiled guest itself\n",
@@ -617,7 +655,7 @@ static void prof_report(void)
                 (g_pb_words - prev_words) / 1000);
             prev_pb = g_pb_time; prev_words = g_pb_words;
         }
-        fprintf(stderr, "[GLPROF]   geometry packet path: %lu packets, %lu words per second\n",
+        jsrf_dbg_log( "[GLPROF]   geometry packet path: %lu packets, %lu words per second\n",
                 (unsigned long)((g_prof.geometry_packets - prev.geometry_packets) / dt),
                 (unsigned long)((g_prof.geometry_words - prev.geometry_words) / dt));
         fflush(stderr);
@@ -653,7 +691,7 @@ static int g_gl_err_reports;
 static int gl_err_per_draw(void)
 {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("RECOMP_GL_ERRORS_PER_DRAW");
+    if (v < 0) { const char *e = jsrf_getenv("RECOMP_GL_ERRORS_PER_DRAW");
                  v = (e && *e && *e != '0'); }
     return v;
 }
@@ -741,7 +779,7 @@ static uint32_t g_readback_bytes;
 static int dump_slot(void)
 {
     static long want = -2;
-    if (want == -2) { const char *v = getenv("RECOMP_GL_DUMP_SLOT");
+    if (want == -2) { const char *v = jsrf_getenv("RECOMP_GL_DUMP_SLOT");
                       want = v ? atol(v) : -1; }
     return (int)want;
 }
@@ -754,7 +792,7 @@ static int dump_slot(void)
 static long dump_big(void)
 {
     static long want = -2;
-    if (want == -2) { const char *v = getenv("RECOMP_GL_DUMP_BIG");
+    if (want == -2) { const char *v = jsrf_getenv("RECOMP_GL_DUMP_BIG");
                       want = v ? atol(v) : -1; }
     return want;
 }
@@ -849,7 +887,7 @@ static uint32_t gl_scale(void)
 {
     static uint32_t sc;
     if (!sc) {
-        const char *v = getenv("RECOMP_GL_SCALE");
+        const char *v = jsrf_getenv("RECOMP_GL_SCALE");
         long n = v ? strtol(v, NULL, 0) : 1;
         sc = (uint32_t)(n < 1 ? 1 : n > 8 ? 8 : n);
         if (sc > 1)
@@ -1035,14 +1073,14 @@ static struct {
 
 int nv2a_gl_enabled(void)
 {
-    if (g_on < 0) g_on = getenv("RECOMP_GL") ? 1 : 0;
+    if (g_on < 0) g_on = jsrf_getenv("RECOMP_GL") ? 1 : 0;
     return g_on;
 }
 
 static int verbose(void)
 {
     static int v = -1;
-    if (v < 0) v = getenv("RECOMP_GL_VERBOSE") ? 1 : 0;
+    if (v < 0) v = jsrf_getenv("RECOMP_GL_VERBOSE") ? 1 : 0;
     return v;
 }
 
@@ -1054,7 +1092,7 @@ static int verbose(void)
 static int vp_trace(void)
 {
     static int v = -1;
-    if (v < 0) v = getenv("RECOMP_GL_VP_TRACE") ? 1 : 0;
+    if (v < 0) v = jsrf_getenv("RECOMP_GL_VP_TRACE") ? 1 : 0;
     return v;
 }
 
@@ -1111,9 +1149,9 @@ static uint32_t resolve(uint32_t off)
 {
     extern uint32_t nv2a_dma_resolve(uint32_t) __attribute__((weak));
     static int all = -1, heap_first = -1;
-    if (all < 0) { const char *v = getenv("RECOMP_GL_CONTIG_ALL");
+    if (all < 0) { const char *v = jsrf_getenv("RECOMP_GL_CONTIG_ALL");
                    all = v ? atoi(v) : 0; }
-    if (heap_first < 0) { const char *v = getenv("RECOMP_GL_HEAP_FIRST");
+    if (heap_first < 0) { const char *v = jsrf_getenv("RECOMP_GL_HEAP_FIRST");
                           heap_first = v ? atoi(v) : 0; }
     if (all) {   /* the old behaviour, for comparing against */
         if (off < XBOX_CONTIG_SIZE) return XBOX_CONTIG_BASE + off;
@@ -1291,14 +1329,14 @@ static int gl_init(uint32_t w, uint32_t h)
             if (wh > maxh) { ww = ww * maxh / wh; wh = maxh; }
             if (ww > maxw) { wh = wh * maxw / ww; ww = maxw; }
         }
-        if ((e = getenv("RECOMP_WINDOW_W")) && atoi(e) >= 320) ww = atoi(e);
-        if ((e = getenv("RECOMP_WINDOW_H")) && atoi(e) >= 240) wh = atoi(e);
+        if ((e = jsrf_getenv("RECOMP_WINDOW_W")) && atoi(e) >= 320) ww = atoi(e);
+        if ((e = jsrf_getenv("RECOMP_WINDOW_H")) && atoi(e) >= 240) wh = atoi(e);
         /* Full screen: RECOMP_FULLSCREEN when it is set -- the launcher's
          * --fullscreen (1) and --windowed (0), and a restart at a new
          * resolution, which says where the game was. Otherwise, on Windows,
          * the way the game was left: F11, Alt+Enter and Video > Full screen
          * keep fullscreen= in the settings (sdl_fullscreen_by_player). */
-        if ((e = getenv("RECOMP_FULLSCREEN")) && *e) {
+        if ((e = jsrf_getenv("RECOMP_FULLSCREEN")) && *e) {
             if (atoi(e)) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
         }
 #if defined(_WIN32)
@@ -1326,7 +1364,7 @@ static int gl_init(uint32_t w, uint32_t h)
     /* No waiting for the display's refresh by default: the frame is paced
      * by the emulated vblank (RECOMP_FPS), and the swap happens on the
      * thread that runs the GPU. RECOMP_VSYNC=1 asks for it anyway. */
-    { const char *v = getenv("RECOMP_VSYNC");
+    { const char *v = jsrf_getenv("RECOMP_VSYNC");
       SDL_GL_SetSwapInterval(v && atoi(v) ? 1 : 0); }
 #if !defined(NV2A_GLES)
     /* Or, on Windows, a presenter thread swaps in step with the display. */
@@ -1365,12 +1403,12 @@ float nv2a_wide_aspect(void);
  * scale there. Only the keys this file owns are rewritten. */
 static void sdl_cfg_path(char *buf, size_t n)
 {
-    const char *f = getenv("JSRF_SETTINGS_FILE"), *x = getenv("XDG_CONFIG_HOME"),
-               *h = getenv("HOME");
+    const char *f = jsrf_getenv("JSRF_SETTINGS_FILE"), *x = jsrf_getenv("XDG_CONFIG_HOME"),
+               *h = jsrf_getenv("HOME");
 #if defined(_WIN32)
     /* %LOCALAPPDATA%\JSRF Unleashed\settings: the launcher's, which also
      * passes it as JSRF_SETTINGS_FILE. */
-    const char *ad = getenv("LOCALAPPDATA");
+    const char *ad = jsrf_getenv("LOCALAPPDATA");
     if (!(f && *f) && ad && *ad) { snprintf(buf, n, "%s/JSRF Unleashed/settings", ad); return; }
 #endif
     if (f && *f)      snprintf(buf, n, "%s", f);
@@ -2203,7 +2241,7 @@ static int SDLCALL pres_main(void *arg)
 /* On the GL thread, with its context current, once the window is open. */
 static void pres_start(void)
 {
-    const char *e = getenv("RECOMP_GL_PRESENTER");
+    const char *e = jsrf_getenv("RECOMP_GL_PRESENTER");
     SDL_DisplayMode m;
 #if defined(_WIN32)
     int want = !(e && e[0] == '0');
@@ -2589,8 +2627,8 @@ static uint32_t build_program(const char *vsrc, const char *fsrc, const char *wh
     static int zview = -1, z01 = -1;
     char *v2 = NULL, *f2 = NULL;
     uint32_t prog;
-    if (zview < 0) zview = getenv("RECOMP_GL_ZVIEW") ? 1 : 0;
-    if (z01 < 0)   z01   = getenv("RECOMP_GL_Z01") ? 1 : 0;
+    if (zview < 0) zview = jsrf_getenv("RECOMP_GL_ZVIEW") ? 1 : 0;
+    if (z01 < 0)   z01   = jsrf_getenv("RECOMP_GL_Z01") ? 1 : 0;
     if (zview) f2 = splice_define(fsrc, "#define NV2A_ZVIEW_ON 1\n");
     if (z01)   v2 = splice_define(vsrc, "#define NV2A_Z01 1\n");
     { double t0 = mono_now(), dt;
@@ -2633,7 +2671,7 @@ static void psh_sync_textures(void)
          * all: NONE means the sampler is never touched, whatever is bound. */
         { uint32_t mode = (S.shader_stage_prog >> (5 * i)) & 31u;
           static int nobump = -1;
-          if (nobump < 0) nobump = getenv("RECOMP_GL_NOBUMP") ? 1 : 0;
+          if (nobump < 0) nobump = jsrf_getenv("RECOMP_GL_NOBUMP") ? 1 : 0;
           /* RECOMP_GL_NOBUMP=1: sample a BUMPENVMAP stage as plain 2D,
            * the way every stage was sampled before it was implemented. */
           if (nobump && (mode == 6 || mode == 7)) mode = 1;
@@ -2679,7 +2717,7 @@ static void psh_sync_textures(void)
     /* RECOMP_GL_WBUFFER=0 ignores the register (the old behaviour); =1
      * forces it on; unset honours what the title wrote to CONTROL0. */
     { static int wb = -2;
-      if (wb == -2) { const char *v = getenv("RECOMP_GL_WBUFFER");
+      if (wb == -2) { const char *v = jsrf_getenv("RECOMP_GL_WBUFFER");
                       wb = v ? atoi(v) : -1; }
       S.psh.w_buffer = (uint8_t)(wb >= 0 ? wb
                                          : ((S.control0 >> 16) & 1u)); }
@@ -2706,7 +2744,7 @@ static void psh_sync_textures(void)
 static int sticky_attrs(void)
 {
     static int on = -1;
-    if (on < 0) { const char *v = getenv("RECOMP_GL_STICKY_ATTRS");
+    if (on < 0) { const char *v = jsrf_getenv("RECOMP_GL_STICKY_ATTRS");
                   on = (v && v[0] == '0') ? 0 : 1; }
     return on;
 }
@@ -2739,7 +2777,7 @@ static uint32_t psh_hash(void)
 static int texgen_off(void)
 {
     static int off = -1;
-    if (off < 0) { const char *v = getenv("RECOMP_GL_TEXGEN");
+    if (off < 0) { const char *v = jsrf_getenv("RECOMP_GL_TEXGEN");
                    off = !v ? 0 : *v == '0' ? 1 : (*v == 'a' || *v == 'A') ? 2 : 0; }
     return off == 2 ? (int)(S.frames & 1u) : off;
 }
@@ -2806,7 +2844,7 @@ static void ff_describe(Nv2aVshFixed *f)
     /* RECOMP_GL_FF_NOLIGHT=1: the old way -- the stream colour through, or
      * white -- for A/B. */
     { static int off = -1;
-      if (off < 0) off = getenv("RECOMP_GL_FF_NOLIGHT") ? 1 : 0;
+      if (off < 0) off = jsrf_getenv("RECOMP_GL_FF_NOLIGHT") ? 1 : 0;
       if (off) f->lit = 0; }
     if (f->lit) {
         /* Lit, the normal is always read: from its array when the batch has
@@ -2841,7 +2879,7 @@ static void dump_msl_pair(uint32_t hash, const char *vsrc, const char *fsrc)
     static const char *dir = (const char *)1;
     char nm[512];
     FILE *f;
-    if (dir == (const char *)1) dir = getenv("RECOMP_GL_DUMP_MSL");
+    if (dir == (const char *)1) dir = jsrf_getenv("RECOMP_GL_DUMP_MSL");
     if (!dir || !vsrc || !fsrc) return;
     snprintf(nm, sizeof nm, "%s/msl_%08X.vert.metal", dir, hash);
     f = fopen(nm, "wb");
@@ -2883,7 +2921,7 @@ static int ff_program_for_current(void)
               : nv2a_vsh_emit_ff_glsl(&f, vsrc, 96 * 1024))) {
         free(vsrc); S.shader_fails++; return -1;
     }
-    if (getenv("RECOMP_GL_DUMP_FF")) {
+    if (jsrf_getenv("RECOMP_GL_DUMP_FF")) {
         static int shown;
         if (shown++ < 2)
             fprintf(stderr, "----- fixed-function GLSL (inputs %04X, "
@@ -2896,7 +2934,7 @@ static int ff_program_for_current(void)
               : nv2a_psh_emit_glsl(&S.psh, fsrc, 96 * 1024))) {
         free(fsrc); free(vsrc); S.shader_fails++; return -1;
     }
-    if (msl && getenv("RECOMP_GL_DUMP_MSL")) dump_msl_pair(hash, vsrc, fsrc);
+    if (msl && jsrf_getenv("RECOMP_GL_DUMP_MSL")) dump_msl_pair(hash, vsrc, fsrc);
     g_seed_building = hash;
     prog = build_program(vsrc, fsrc, "fixed-function transform + combiners");
     g_seed_building = 0;
@@ -2960,7 +2998,7 @@ static int program_for_current(void)
      */
     if (S.xf_mode == NV2A_XF_MODE_FIXED) {
         static int off = -1;
-        if (off < 0) off = getenv("RECOMP_GL_NO_FIXEDFUNC") ? 1 : 0;
+        if (off < 0) off = jsrf_getenv("RECOMP_GL_NO_FIXEDFUNC") ? 1 : 0;
         if (!off) return ff_program_for_current();
     }
 
@@ -3006,7 +3044,7 @@ static int program_for_current(void)
               : nv2a_vsh_emit_glsl(&vp, vsrc, 96 * 1024))) {
         free(vsrc); S.shader_fails++; return -1;
     }
-    if (getenv("RECOMP_GL_DUMP_RAW")) {
+    if (jsrf_getenv("RECOMP_GL_DUMP_RAW")) {
         /* The microcode itself, so a decoder can be checked against it
          * offline instead of through a rebuild each time. */
         static int dumped;
@@ -3027,7 +3065,7 @@ static int program_for_current(void)
         g_pcache[slot].dis = nv2a_vsh_disasm(&vp, dis, sizeof dis)
                            ? strdup(dis) : NULL;
     }
-    if (getenv("RECOMP_GL_DUMP_VSH") || (dump_slot() >= 0 && slot == dump_slot())) {
+    if (jsrf_getenv("RECOMP_GL_DUMP_VSH") || (dump_slot() >= 0 && slot == dump_slot())) {
         char dis[16384];
         if (nv2a_vsh_disasm(&vp, dis, sizeof dis))
             fprintf(stderr, "----- NV2A program (%d slots, hash %08X) -----\n%s",
@@ -3043,7 +3081,7 @@ static int program_for_current(void)
     }
     /* RECOMP_GL_DUMP_MSL=<dir>: every program's Metal translation, from
      * either backend -- the OpenGL one translates it only to write it out. */
-    if (getenv("RECOMP_GL_DUMP_MSL")) {
+    if (jsrf_getenv("RECOMP_GL_DUMP_MSL")) {
         if (msl) dump_msl_pair(hash, vsrc, fsrc);
         else {
             char *mv = (char *)malloc(96 * 1024), *mf = (char *)malloc(96 * 1024);
@@ -3054,20 +3092,20 @@ static int program_for_current(void)
         }
     }
     { static int solid = -1;
-      if (solid < 0) solid = (getenv("RECOMP_GL_SOLID")
-                           || getenv("RECOMP_GL_DRAWID")
-                           || getenv("RECOMP_GL_TINT_XF")
-                           || getenv("RECOMP_GL_TINT_GEQUAL")
-                           || getenv("RECOMP_GL_TINTCLIP")) ? 1 : 0;
+      if (solid < 0) solid = (jsrf_getenv("RECOMP_GL_SOLID")
+                           || jsrf_getenv("RECOMP_GL_DRAWID")
+                           || jsrf_getenv("RECOMP_GL_TINT_XF")
+                           || jsrf_getenv("RECOMP_GL_TINT_GEQUAL")
+                           || jsrf_getenv("RECOMP_GL_TINTCLIP")) ? 1 : 0;
       if (solid) { free(fsrc); fsrc = NULL; } }
     /* RECOMP_GL_DUMP_PSH_3D=<n>: the generated combiner shader for the first
      * few programs compiled once the scene is up, with the raw register words
      * beside it. The logo phase compiles dozens of one-stage shaders that all
      * look the same and say nothing about why the streets are dark. */
     { static int psh_shots; static long at3d = -2;
-      if (at3d == -2) { const char *v = getenv("RECOMP_GL_DUMP_PSH_3D");
+      if (at3d == -2) { const char *v = jsrf_getenv("RECOMP_GL_DUMP_PSH_3D");
                         at3d = v ? atol(v) : -1; }
-      if (getenv("RECOMP_GL_DUMP_PSH")
+      if (jsrf_getenv("RECOMP_GL_DUMP_PSH")
        || (dump_slot() >= 0 && slot == dump_slot())
        || (at3d >= 0 && (long)S.draws_3d >= at3d && psh_shots < 4)) {
         int k;
@@ -3251,7 +3289,7 @@ static void tex_alpha_census(const uint8_t *rgba, uint32_t w, uint32_t h,
     int k;
 
     { static int on = -1;
-      if (on < 0) on = getenv("RECOMP_GL_TEXALPHA") ? 1 : 0;
+      if (on < 0) on = jsrf_getenv("RECOMP_GL_TEXALPHA") ? 1 : 0;
       if (!on) return; }
 
     for (i = 0; i < n; i++) if (rgba[i * 4 + 3] < 16) clear++;
@@ -3373,7 +3411,7 @@ static uint32_t tex_title_levels(const TexStage *t, uint32_t w, uint32_t h)
 {
     static int on = -1;
     uint32_t minf = (t->filter >> 16) & 0xF, n, m, maxl, clamp;
-    if (on < 0) { const char *v = getenv("RECOMP_GL_TITLE_MIPS"); on = v ? atoi(v) != 0 : 1; }
+    if (on < 0) { const char *v = jsrf_getenv("RECOMP_GL_TITLE_MIPS"); on = v ? atoi(v) != 0 : 1; }
     if (!on || minf < 3 || minf > 6 || t->levels < 2) return 1;
     if (!fmt_is_swz(t->color) && !fmt_is_dxt(t->color)) return 1;
     m = w > h ? w : h;
@@ -3395,7 +3433,7 @@ static uint8_t tex_aniso(const TexStage *t)
     static int forced = -1;
     int title = 1 << ((t->control0 >> 4) & 3);
     if (forced < 0) {
-        const char *v = getenv("RECOMP_GL_ANISO");
+        const char *v = jsrf_getenv("RECOMP_GL_ANISO");
         forced = v ? atoi(v) : 16;
         if (forced < 1) forced = 1;
         if (forced > 16) forced = 16;
@@ -3466,7 +3504,7 @@ static uint32_t tex_sample(uint32_t color, const uint8_t *src, uint32_t bytes, i
     /* RECOMP_GL_TEXHASH_FULL=1: hash every byte (slow; for testing
      * whether a texture the CPU rewrote in place is being served stale). */
     { static int full = -1;
-      if (full < 0) full = getenv("RECOMP_GL_TEXHASH_FULL") ? 1 : 0;
+      if (full < 0) full = jsrf_getenv("RECOMP_GL_TEXHASH_FULL") ? 1 : 0;
       if (full) step = 1; }
     hash = color * 2654435761u;
     for (i = 0; i < bytes && step; i += step)
@@ -3544,7 +3582,7 @@ static void tcache_verify(void)
     static long budget = -1;
     uint64_t spent = 0;
     uint32_t n;
-    if (budget < 0) { const char *e = getenv("RECOMP_GL_TEXCHECK_KB");
+    if (budget < 0) { const char *e = jsrf_getenv("RECOMP_GL_TEXCHECK_KB");
                       budget = (e ? atol(e) : 1024) * 1024L; if (budget < 0) budget = 0; }
     if (!budget) return;
     for (n = 0; n < TEX_CACHE && spent < (uint64_t)budget; n++) {
@@ -3601,7 +3639,7 @@ static void tex_sampler(const TexStage *t, uint32_t nlev, Nv2aSampler *out)
         uint32_t magf = (t->filter >> 24) & 0xF;
         static int want_mips = -1;
         if (want_mips < 0) {
-            const char *v = getenv("RECOMP_GL_MIPMAP");
+            const char *v = jsrf_getenv("RECOMP_GL_MIPMAP");
             want_mips = v ? atoi(v) : 0;
         }
 
@@ -3720,14 +3758,14 @@ static uint32_t upload_texture_inner(const TexStage *t)
      * first draw's sampling for all -- as before, to compare (=ab: every
      * other displayed frame, from textures of their own). */
     { static int one = -1;
-      if (one < 0) { const char *v = getenv("RECOMP_GL_TEX_ONESAMPLER");
+      if (one < 0) { const char *v = jsrf_getenv("RECOMP_GL_TEX_ONESAMPLER");
                      one = !v ? 0 : (*v == 'a' || *v == 'A') ? 2 : 1; }
       if (one == 1 || (one == 2 && (S.frames & 1u))) sampling = 0x80000000u; }
 
     /* Same routing census as the vertex arrays, for textures: a texture at
      * a heap VA below the arena mark is decoded from the window instead. */
     { static int dc = -1; static uint64_t n[5]; static uint32_t said;
-      if (dc < 0) dc = getenv("RECOMP_GL_DMACENSUS") ? 1 : 0;
+      if (dc < 0) dc = jsrf_getenv("RECOMP_GL_DMACENSUS") ? 1 : 0;
       if (dc) {
           uint32_t off = t->offset, mark = xbox_ContiguousAllocatedBytes(); int cls;
           if (off & 0x80000000u)      cls = 0;
@@ -3797,7 +3835,7 @@ static uint32_t upload_texture_inner(const TexStage *t)
      * s seconds on -- where, what size and format -- to find the texture a
      * newly appearing object is drawn with. */
     { static int on = -1; static double from, t0; static int n;
-      if (on < 0) { const char *v = getenv("RECOMP_GL_TEXLOG_SEC");
+      if (on < 0) { const char *v = jsrf_getenv("RECOMP_GL_TEXLOG_SEC");
                     on = v ? 1 : 0; from = v ? atof(v) : 0; t0 = mono_now(); }
       if (on && n < 400 && mono_now() - t0 >= from) {
           n++;
@@ -3862,15 +3900,15 @@ static uint32_t upload_texture_inner(const TexStage *t)
     {
         static int shots;
         static const char *pfx; static int init; static uint32_t after3d;
-        if (!init) { init = 1; pfx = getenv("RECOMP_GL_DUMP_TEX");
-                     { const char *a = getenv("RECOMP_GL_DUMP_TEX_3D");
+        if (!init) { init = 1; pfx = jsrf_getenv("RECOMP_GL_DUMP_TEX");
+                     { const char *a = jsrf_getenv("RECOMP_GL_DUMP_TEX_3D");
                        after3d = a ? (uint32_t)strtoul(a, 0, 0) : 0; } }
         /* RECOMP_GL_DUMP_TEX_OFF=<hex>: only the texture at this address. A
          * scene uploads hundreds, and the one worth looking at is usually a
          * particular address that showed up in a draw dump. */
         { static uint32_t only[8]; static int oinit, nonly;
           int hit = 0, q;
-          if (!oinit) { const char *o = getenv("RECOMP_GL_DUMP_TEX_OFF");
+          if (!oinit) { const char *o = jsrf_getenv("RECOMP_GL_DUMP_TEX_OFF");
                         oinit = 1;
                         /* A comma-separated list now: "0250F000,02512000". */
                         while (o && *o && nonly < 8) {
@@ -4119,8 +4157,8 @@ static void draw_log_latch(void)
 {
     /* RECOMP_GL_DRAW_LOG_SEC=<s>: and not before s seconds into the run. */
     static long want = -2; static double sec, t0;
-    if (want == -2) { const char *v = getenv("RECOMP_GL_DRAW_LOG");
-                      const char *w = getenv("RECOMP_GL_DRAW_LOG_SEC");
+    if (want == -2) { const char *v = jsrf_getenv("RECOMP_GL_DRAW_LOG");
+                      const char *w = jsrf_getenv("RECOMP_GL_DRAW_LOG_SEC");
                       want = v ? atol(v) : -1; sec = w ? atof(w) : 0.0; t0 = mono_now(); }
     if (want >= 0 && g_draw_log_flip < 0 && (long)S.since_present >= want
         && (sec <= 0.0 || mono_now() - t0 >= sec))
@@ -4175,7 +4213,7 @@ static void write_bmp(const char *nm, const uint8_t *buf,
 static int dump_max(void)
 {
     static int n = -1;
-    if (n < 0) { const char *v = getenv("RECOMP_GL_DUMP_MAX");
+    if (n < 0) { const char *v = jsrf_getenv("RECOMP_GL_DUMP_MAX");
                  n = v ? atoi(v) : 24; if (n < 1) n = 24; if (n > 72) n = 72; }
     return n;
 }
@@ -4223,7 +4261,7 @@ static void dump_fbo(uint32_t rt, const char *prefix, int *counter, int limit)
      * Rescaled around the range actually present: a perspective depth buffer
      * is almost all 1.0 and a straight copy is a white rectangle. */
     { static int depth = -1;
-      if (depth < 0) depth = getenv("RECOMP_GL_DUMP_DEPTH") ? 1 : 0;
+      if (depth < 0) depth = jsrf_getenv("RECOMP_GL_DUMP_DEPTH") ? 1 : 0;
       if (depth) {
           static float *zb; static uint32_t zcap;
           uint32_t np = pw * ph;
@@ -4314,7 +4352,7 @@ static uint32_t surf_color_mask(void)
 {
     static int keep = -1;
     uint32_t cm = S.color_mask ? S.color_mask : 0x01010101u;   /* 0: never set, all */
-    if (keep < 0) keep = getenv("RECOMP_GL_SURF_ALPHA") ? 1 : 0;
+    if (keep < 0) keep = jsrf_getenv("RECOMP_GL_SURF_ALPHA") ? 1 : 0;
     if (keep || surf_has_alpha(S.surf_format)) return S.color_mask;
     cm &= ~0x01000000u;
     /* The backends read 0 as "never set", so a mask that is left with no
@@ -4371,14 +4409,14 @@ void nv2a_set_wide_aspect(float a);
 int nv2a_widescreen(void)
 {
     if (g_wide < 0) {
-        const char *v = getenv("RECOMP_WIDESCREEN");
+        const char *v = jsrf_getenv("RECOMP_WIDESCREEN");
         extern int nv_window_pref_widescreen(void) __attribute__((weak));
         if (v && *v) g_wide = atoi(v) != 0;
-        else g_wide = (getenv("RECOMP_WINDOW") && nv_window_pref_widescreen)
+        else g_wide = (jsrf_getenv("RECOMP_WINDOW") && nv_window_pref_widescreen)
                     ? (nv_window_pref_widescreen() != 0) : 0;
         /* RECOMP_WIDE_ASPECT=<width/height>, e.g. 2.17: widen to that shape
          * instead of 16:9 (the iPhone sets its screen's itself). */
-        if ((v = getenv("RECOMP_WIDE_ASPECT")) != NULL && atof(v) > 0.0)
+        if ((v = jsrf_getenv("RECOMP_WIDE_ASPECT")) != NULL && atof(v) > 0.0)
             nv2a_set_wide_aspect((float)atof(v));
     }
     return g_wide;
@@ -4624,8 +4662,8 @@ static int vc_on(void)
     const char *v, *mb, *why = NULL;
     int i;
     if (g_vc_on >= 0) return g_vc_on;
-    v = getenv("RECOMP_GL_VCACHE");
-    mb = getenv("RECOMP_GL_VCACHE_MB");
+    v = jsrf_getenv("RECOMP_GL_VCACHE");
+    mb = jsrf_getenv("RECOMP_GL_VCACHE_MB");
     g_vc_on = (v ? atoi(v) != 0 : 1)
            && G->vbuf_new && G->vbuf_free && G->vbuf_fill && G->vbuf_bind && G->draw_indexed;
     if (g_vc_on && !v && (why = vc_debug_switch()) != NULL) g_vc_on = 0;
@@ -4695,7 +4733,7 @@ static void vc_touch(int32_t e)
 static int vc_verify_on(void)
 {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("RECOMP_GL_VCACHE_VERIFY"); v = (e && atoi(e)) ? 1 : 0; }
+    if (v < 0) { const char *e = jsrf_getenv("RECOMP_GL_VCACHE_VERIFY"); v = (e && atoi(e)) ? 1 : 0; }
     return v;
 }
 
@@ -4941,7 +4979,7 @@ static uint32_t vc_prepare(const VtxLive *live, int nlive, uint32_t stride_float
 static void vc_report(const char *when)
 {
     if (!g_vc) return;
-    fprintf(stderr, "  [GL] vertex cache%s: %d kept (%llu KB); draws %lu found, "
+    jsrf_dbg_log("  [GL] vertex cache%s: %d kept (%llu KB); draws %lu found, "
             "%lu found rewritten, %lu newly kept, %lu one-off, %lu the old way; "
             "%lu let go; %llu K vertices converted, %llu KB hashed, %llu KB sent\n",
             when, g_vc_n, (unsigned long long)(g_vc_held >> 10),
@@ -4999,7 +5037,7 @@ static void prim_note(int inl)
     static unsigned long draws[2][11], verts[2][11];
     uint32_t n = inl ? S.inline_count : S.idx_count, p = S.prim;
     int k, i;
-    if (on < 0) { const char *v = getenv("RECOMP_GL_PRIMLOG");
+    if (on < 0) { const char *v = jsrf_getenv("RECOMP_GL_PRIMLOG");
                   on = v ? 1 : 0; every = v ? atof(v) : 0.0; if (every <= 0) every = 10.0;
                   next = mono_now() + every; }
     if (!on || p > 10) return;
@@ -5034,7 +5072,7 @@ static void points_note(int inl)
     static unsigned long draws[2], verts[2];
     int k;
     uint32_t n = inl ? S.inline_count : S.idx_count;
-    if (on < 0) { const char *v = getenv("RECOMP_GL_POINTLOG");
+    if (on < 0) { const char *v = jsrf_getenv("RECOMP_GL_POINTLOG");
                   on = v ? 1 : 0; every = v ? atof(v) : 0.0; if (every <= 0) every = 10.0;
                   next = mono_now() + every; }
     if (!on) return;
@@ -5073,10 +5111,10 @@ static int texgen_note(uint32_t n)
     static uint32_t seen[64]; static int nseen;
     int s, c, any = 0;
     uint32_t key = 0;
-    if (on < 0) { const char *v = getenv("RECOMP_GL_TEXGENLOG");
+    if (on < 0) { const char *v = jsrf_getenv("RECOMP_GL_TEXGENLOG");
                   on = v ? 1 : 0; every = v ? atof(v) : 0.0; if (every <= 0) every = 10.0;
                   next = mono_now() + every;
-                  { const char *k = getenv("RECOMP_GL_SKIP_TEXGEN");
+                  { const char *k = jsrf_getenv("RECOMP_GL_SKIP_TEXGEN");
                     skip = !k ? 0 : (*k == 'a' || *k == 'A') ? 2 : 1; } }
     if (!on && !skip) return 0;
     for (s = 0; s < 4; s++)
@@ -5217,7 +5255,7 @@ static void do_draw_body(void)
      * array, and the normal it inherits; and the fixed-function draws with
      * no diffuse array whose inherited diffuse is not white. */
     { static int sl = -1, nl;
-      if (sl < 0) sl = getenv("RECOMP_GL_STICKYLOG") ? 1 : 0;
+      if (sl < 0) sl = jsrf_getenv("RECOMP_GL_STICKYLOG") ? 1 : 0;
       if (sl && nl < 120 && S.xf_mode == NV2A_XF_MODE_FIXED) {
           if (S.ff_lighting && !S.attr[2].size) {
               nl++;
@@ -5243,7 +5281,7 @@ static void do_draw_body(void)
      * geometry, so this shows what is underneath -- which separates "the base
      * pass is wrong" from "the overlay is covering it". */
     { static int no_t1 = -1;
-      if (no_t1 < 0) no_t1 = getenv("RECOMP_GL_NO_TEX1") ? 1 : 0;
+      if (no_t1 < 0) no_t1 = jsrf_getenv("RECOMP_GL_NO_TEX1") ? 1 : 0;
       if (no_t1 && S.tex[1].enabled) return; }
     /* RECOMP_GL_ONLY_UNTEX / _ONLY_TEX: show one half of the frame's draws.
      * Most of this screen is covered by geometry drawn with no texture stage
@@ -5252,8 +5290,8 @@ static void do_draw_body(void)
      * planes, which are meant to be flat. Drawing one set without the other
      * answers it in one frame. */
     { static int half = -2;
-      if (half == -2) half = getenv("RECOMP_GL_ONLY_UNTEX") ? 1
-                           : getenv("RECOMP_GL_ONLY_TEX")   ? 2 : 0;
+      if (half == -2) half = jsrf_getenv("RECOMP_GL_ONLY_UNTEX") ? 1
+                           : jsrf_getenv("RECOMP_GL_ONLY_TEX")   ? 2 : 0;
       if (half == 1 && S.psh.tex_bound[0]) return;
       if (half == 2 && !S.psh.tex_bound[0]) return; }
     /* RECOMP_GL_ONLY_XF=<mode>: draw only the batches that went through one
@@ -5267,7 +5305,7 @@ static void do_draw_body(void)
      * answers it, and neither answer can be reached by looking at the two
      * drawn on top of each other. */
     { static long only_xf = -2;
-      if (only_xf == -2) { const char *v = getenv("RECOMP_GL_ONLY_XF");
+      if (only_xf == -2) { const char *v = jsrf_getenv("RECOMP_GL_ONLY_XF");
                            only_xf = v ? atol(v) : -1; }
       if (only_xf >= 0 && (long)S.xf_mode != only_xf) return; }
     if (S.xf_mode == NV2A_XF_MODE_FIXED && texgen_note(n)) return;
@@ -5275,14 +5313,14 @@ static void do_draw_body(void)
      * by vertex programs (the characters') / by the fixed-function pipeline
      * (the scenery's): the batches that only count in the stencil buffer. */
     { static int sv = -1;
-      if (sv < 0) { const char *e = getenv("RECOMP_GL_SKIPVOL"); sv = e ? atoi(e) : 0; }
+      if (sv < 0) { const char *e = jsrf_getenv("RECOMP_GL_SKIPVOL"); sv = e ? atoi(e) : 0; }
       if (sv && S.stencil_en && S.stencil_func == 0x207
           && (S.stencil_op[2] == 0x1E02 || S.stencil_op[2] == 0x1E03)
           && (sv == 1) == (S.xf_mode != NV2A_XF_MODE_FIXED)) return; }
     /* RECOMP_GL_SKIP_LIT=1: leave out the fixed-function batches the T&L
      * unit lights (=ab: every other displayed frame), to see what they are. */
     { static int sk = -1;
-      if (sk < 0) { const char *k = getenv("RECOMP_GL_SKIP_LIT");
+      if (sk < 0) { const char *k = jsrf_getenv("RECOMP_GL_SKIP_LIT");
                     sk = !k ? 0 : (*k == 'a' || *k == 'A') ? 2 : 1; }
       if (sk && S.xf_mode == NV2A_XF_MODE_FIXED && S.ff_lighting
           && (sk == 1 || (S.frames & 1u))) return; }
@@ -5307,7 +5345,7 @@ static void do_draw_body(void)
      * empty frame. Five theories have died assuming the objects were
      * misplaced; not one of them checked that the world was complete. */
     { static int only_a0 = -2;
-      if (only_a0 == -2) { const char *v = getenv("RECOMP_GL_ONLY_A0");
+      if (only_a0 == -2) { const char *v = jsrf_getenv("RECOMP_GL_ONLY_A0");
                            only_a0 = v ? atoi(v) : -1; }
       if (only_a0 >= 0 && (g_pcache[slot].uses_a0 ? 1 : 0) != only_a0) return; }
 
@@ -5370,7 +5408,7 @@ static void do_draw_body(void)
      * attributes change. A line each for the first few, then a count per
      * attribute every 120 flips. */
     { static int sl = -1, nl; static uint32_t cnt[NUM_ATTRS], since = 0, any;
-      if (sl < 0) sl = getenv("RECOMP_GL_STICKYLOG") ? 1 : 0;
+      if (sl < 0) sl = jsrf_getenv("RECOMP_GL_STICKYLOG") ? 1 : 0;
       if (sl && const_mask) {
           for (i = 0; i < NUM_ATTRS; i++) {
               if (!(const_mask & (1u << i))) continue;
@@ -5432,7 +5470,7 @@ static void do_draw_body(void)
      */
     { static int dc = -1; static uint64_t tri[5], nd[5], zwin, nzheap;
       static uint32_t dlast, mark;
-      if (dc < 0) dc = getenv("RECOMP_GL_DMACENSUS") ? 1 : 0;
+      if (dc < 0) dc = jsrf_getenv("RECOMP_GL_DMACENSUS") ? 1 : 0;
       if (dc && !inl) {
           uint32_t off = S.attr[0].offset; int cls;
           mark = xbox_ContiguousAllocatedBytes();
@@ -5513,8 +5551,8 @@ static void do_draw_body(void)
      || (dump_big() > 0 && (long)out_n >= dump_big())) {
         static int done;
         static long want_n = -2, want_xf = -2;
-        if (want_n == -2) { const char *v = getenv("RECOMP_GL_DUMP_N");
-                            const char *x = getenv("RECOMP_GL_DUMP_XF");
+        if (want_n == -2) { const char *v = jsrf_getenv("RECOMP_GL_DUMP_N");
+                            const char *x = jsrf_getenv("RECOMP_GL_DUMP_XF");
                             want_n = v ? atol(v) : 1;
                             want_xf = x ? atol(x) : -1; }
         if (done < want_n && (want_xf < 0 || (long)S.xf_mode == want_xf)) {
@@ -5663,7 +5701,7 @@ static void do_draw_body(void)
         if (hi - lo < 1.8f && yhi - ylo < 1.8f) g_wide_squeeze = 1;
         /* RECOMP_WIDE_NOSQUEEZE=1 (test only): measure, never squeeze. */
         { static int nosq = -1;
-          if (nosq < 0) nosq = getenv("RECOMP_WIDE_NOSQUEEZE") ? 1 : 0;
+          if (nosq < 0) nosq = jsrf_getenv("RECOMP_WIDE_NOSQUEEZE") ? 1 : 0;
           if (nosq) g_wide_squeeze = 0; }
     }
     /*
@@ -5829,7 +5867,7 @@ static void do_draw_body(void)
      */
     { static int mode = -2;
       int use;
-      if (mode == -2) { const char *v = getenv("RECOMP_GL_POSMODE");
+      if (mode == -2) { const char *v = jsrf_getenv("RECOMP_GL_POSMODE");
                         mode = v ? atoi(v) : 0; }
       use = (mode == 9) ? (S.xf_mode == NV2A_XF_MODE_FIXED ? 0 : 1) : mode;
       if (uses(slot, NV2A_U_POSMODE))
@@ -5883,7 +5921,7 @@ static void do_draw_body(void)
      * search moves to the pushbuffer.
      */
     { static int tc = -1;
-      if (tc < 0) tc = getenv("RECOMP_GL_TINTCLIP") ? 1 : 0;
+      if (tc < 0) tc = jsrf_getenv("RECOMP_GL_TINTCLIP") ? 1 : 0;
       if (tc && uses(slot, NV2A_U_DRAWTINT) && out_n >= 3
              && S.xf_mode != NV2A_XF_MODE_FIXED) {
           Nv2aVshProgram vp;
@@ -5916,12 +5954,12 @@ static void do_draw_body(void)
       } }
     if (uses(slot, NV2A_U_DRAWTINT)) {
         static int drawid = -1;
-        if (drawid < 0) drawid = getenv("RECOMP_GL_DRAWID") ? 1 : 0;
+        if (drawid < 0) drawid = jsrf_getenv("RECOMP_GL_DRAWID") ? 1 : 0;
         static int tintxf = -1, tintge = -1;
-        if (tintxf < 0) { const char *v = getenv("RECOMP_GL_TINT_XF");
+        if (tintxf < 0) { const char *v = jsrf_getenv("RECOMP_GL_TINT_XF");
                           tintxf = v ? atoi(v) : 0;
                           if (v && !tintxf) tintxf = 1;
-                          tintge = getenv("RECOMP_GL_TINT_GEQUAL") ? 1 : 0; }
+                          tintge = jsrf_getenv("RECOMP_GL_TINT_GEQUAL") ? 1 : 0; }
         /* RECOMP_GL_TINT_GEQUAL: paint every draw that asks for the inverted
          * depth comparison red, and leave the rest alone.
          *
@@ -6001,7 +6039,7 @@ static void do_draw_body(void)
         /* RECOMP_GL_FF_LIGHT=<f>: how much light to add to a batch the title
          * asked the hardware to light. 0 keeps today's behaviour exactly. */
         static float amt = -1.0f;
-        if (amt < 0.0f) { const char *v = getenv("RECOMP_GL_FF_LIGHT");
+        if (amt < 0.0f) { const char *v = jsrf_getenv("RECOMP_GL_FF_LIGHT");
                           amt = v ? (float)atof(v) : 0.0f; }
         uni1f(NV2A_U_LITAMBIENT, amt);
     }
@@ -6055,7 +6093,7 @@ static void do_draw_body(void)
              * RECOMP_GL_FF_NUDGE=1 keeps it, as before. */
             static int keep = -1;
             float o[4];
-            if (keep < 0) { const char *v = getenv("RECOMP_GL_FF_NUDGE");
+            if (keep < 0) { const char *v = jsrf_getenv("RECOMP_GL_FF_NUDGE");
                             keep = v && *v && *v != '0'; }
             memcpy(o, S.vp_off_reg, sizeof o);
             if (!keep) { o[0] -= 0.53125f; o[1] -= 0.53125f; }
@@ -6293,7 +6331,7 @@ static void do_draw_body(void)
          * on it stayed exactly where it is -- which is the picture. */
         static int noalpha = -1;
         int af;
-        if (noalpha < 0) noalpha = getenv("RECOMP_GL_NOALPHATEST") ? 1 : 0;
+        if (noalpha < 0) noalpha = jsrf_getenv("RECOMP_GL_NOALPHATEST") ? 1 : 0;
         af = (S.alpha_test && !noalpha) ? (S.alpha_func - 0x0200 + 1) : 0;
         if (af != g_last.alpha_func || S.alpha_ref != g_last.alpha_ref) {
             G->uniform_i(NV2A_U_ALPHAFUNC, af);
@@ -6342,8 +6380,8 @@ static void do_draw_body(void)
          * buildings, the state is the bug and the census says which draws.
          */
         { static int census = -1, force = -1;
-          if (census < 0) { census = getenv("RECOMP_GL_DEPTHCENSUS") ? 1 : 0;
-                            force  = getenv("RECOMP_GL_FORCE_DEPTH") ? 1 : 0; }
+          if (census < 0) { census = jsrf_getenv("RECOMP_GL_DEPTHCENSUS") ? 1 : 0;
+                            force  = jsrf_getenv("RECOMP_GL_FORCE_DEPTH") ? 1 : 0; }
           if (census) {
               /* And WHICH SURFACE each class is drawn into.
                *
@@ -6403,7 +6441,7 @@ static void do_draw_body(void)
            * almost nowhere. So the whole class is being thrown away. If it
            * is the road decks, this puts them back under the buses. */
           { static int ge2le = -1;
-            if (ge2le < 0) ge2le = getenv("RECOMP_GL_GEQUAL_AS_LEQUAL") ? 1 : 0;
+            if (ge2le < 0) ge2le = jsrf_getenv("RECOMP_GL_GEQUAL_AS_LEQUAL") ? 1 : 0;
             if (ge2le && rs.depth_func == 0x206) rs.depth_func = 0x203; }
           /* Reversed depth: nearer is larger (zrev_start). */
           if (g_zrev) rs.depth_func = zrev_func((uint32_t)rs.depth_func);
@@ -6425,7 +6463,7 @@ static void do_draw_body(void)
          * resolution's scale; with reversed depth nearer is larger, and the
          * offset is turned round. RECOMP_GL_NOPOLYOFFSET=1: none, as before. */
         { static int nopo = -1;
-          if (nopo < 0) nopo = getenv("RECOMP_GL_NOPOLYOFFSET") ? 1 : 0;
+          if (nopo < 0) nopo = jsrf_getenv("RECOMP_GL_NOPOLYOFFSET") ? 1 : 0;
           if (!nopo && S.poly_off_fill
            && (S.poly_off_factor != 0.0f || S.poly_off_units != 0.0f)) {
               float sgn = g_zrev ? -1.0f : 1.0f;
@@ -6439,7 +6477,7 @@ static void do_draw_body(void)
           } }
         /* Stencil. RECOMP_GL_NOSTENCIL=1: ignore it, as before. */
         { static int nost = -1;
-          if (nost < 0) nost = getenv("RECOMP_GL_NOSTENCIL") ? 1 : 0;
+          if (nost < 0) nost = jsrf_getenv("RECOMP_GL_NOSTENCIL") ? 1 : 0;
           rs.stencil_test  = nost ? 0 : (S.stencil_en ? 1 : 0);
           rs.stencil_func  = S.stencil_func;
           rs.stencil_ref   = S.stencil_ref;
@@ -6455,7 +6493,7 @@ static void do_draw_body(void)
           /* In the title's pixels, the far edges exclusive. */
           uint32_t cx0 = 0, cy0 = 0, cx1 = g_fbo_w, cy1 = g_fbo_h;
           int clip = 0;
-          if (off < 0) off = getenv("RECOMP_GL_NOWCLIP") ? 1 : 0;
+          if (off < 0) off = jsrf_getenv("RECOMP_GL_NOWCLIP") ? 1 : 0;
           if (!off && S.wclip_valid && S.wclip_type == 0) {
               uint32_t x0 =  S.wclip_h[0]        & 0xFFFu;
               uint32_t x1 = (S.wclip_h[0] >> 16) & 0xFFFu;
@@ -6526,7 +6564,7 @@ static void do_draw_body(void)
      * matrix really does scale it and something else loses it. Multiplying one
      * real vertex by the matrix on the CPU says which, and costs one line. */
     { static int dz = -1; static int shown;
-      if (dz < 0) dz = getenv("RECOMP_GL_DUMP_Z") ? 1 : 0;
+      if (dz < 0) dz = jsrf_getenv("RECOMP_GL_DUMP_Z") ? 1 : 0;
       if (dz && shown < 10 && out_n > 16 && attr_at[0] == 0
           && S.xf_mode == NV2A_XF_MODE_FIXED && S.draws > 20000) {
           const float *v = &vbuf[0];
@@ -6609,7 +6647,7 @@ static void do_draw_body(void)
      */
     int curtain_skip = 0;
     { static int mode_c = -1;
-      if (mode_c < 0) { const char *v = getenv("RECOMP_GL_CURTAIN");
+      if (mode_c < 0) { const char *v = jsrf_getenv("RECOMP_GL_CURTAIN");
                         mode_c = !v ? 0 : !strcmp(v, "skip") ? 2 : 1; }
       if (mode_c && out_n == 4 && S.blend_enable
           && !S.tex[0].enabled && !S.tex[1].enabled
@@ -6678,7 +6716,7 @@ static void do_draw_body(void)
                * stencil test is the shadow pass, masked to the shadows: it
                * stays. One without it is a real fade, and is still skipped
                * under RECOMP_GL_CURTAIN=skip. */
-              if (mode_c == 2 && !(S.stencil_en && !getenv("RECOMP_GL_NOSTENCIL")))
+              if (mode_c == 2 && !(S.stencil_en && !jsrf_getenv("RECOMP_GL_NOSTENCIL")))
                   curtain_skip = 1;
           }
       } }
@@ -6859,7 +6897,7 @@ static void do_draw_body(void)
       extern uint32_t g_recomp_watch_lo, g_recomp_watch_span;
       uint32_t tab = *(const uint32_t *)guest(0x264BA4);
       double now_st = g_frame_clock;
-      if (armed_st < 0) armed_st = getenv("RECOMP_WATCH_SINTAB") ? 0 : 2;
+      if (armed_st < 0) armed_st = jsrf_getenv("RECOMP_WATCH_SINTAB") ? 0 : 2;
       if (tab && armed_st == 0) {
           g_recomp_watch_lo = tab; g_recomp_watch_span = 0x8000;
           armed_st = 1;
@@ -6934,7 +6972,7 @@ static void do_draw_body(void)
        * (a GPU stall) and prints a great deal, so it stays off in the build
        * that is actually played. */
       static int chardiag = -1;
-      if (chardiag < 0) chardiag = getenv("RECOMP_GL_CHARDIAG") ? 1 : 0;
+      if (chardiag < 0) chardiag = jsrf_getenv("RECOMP_GL_CHARDIAG") ? 1 : 0;
       if (chardiag && out_n >= 3 && slot >= 0 && S.xf_mode != NV2A_XF_MODE_FIXED
           /* Characters, not street furniture. Every burst so far was spent
            * on two-bone lamp posts and bollards, because they are drawn first
@@ -7631,7 +7669,7 @@ static void do_draw_body(void)
        * thing the counter above says. Off by default now that the counter
        * exists; RECOMP_GL_XRAY=1 turns it back on. */
       { static int xray = -1;
-        if (xray < 0) { const char *v = getenv("RECOMP_GL_XRAY");
+        if (xray < 0) { const char *v = jsrf_getenv("RECOMP_GL_XRAY");
                         xray = v ? atoi(v) : 0; }
         if (xray && is_mover && !curtain_skip && !g_surf_lost) {
             Nv2aRenderState xr = g_draw_rs;
@@ -7669,7 +7707,7 @@ static void do_draw_body(void)
     { static int hunt = -2; static uint32_t hunt_frame; static double prev_mean;
       static int hunt_tris = -2;
 #define hunt_at g_darkhunt_at
-      if (hunt == -2) { const char *v = getenv("RECOMP_GL_DARKHUNT");
+      if (hunt == -2) { const char *v = jsrf_getenv("RECOMP_GL_DARKHUNT");
                         hunt = v ? atoi(v) : -1;
                         hunt_frame = 0; }
       /* RECOMP_GL_DARKHUNT_TRIS=<n>: hunt in the first frame that has a scene
@@ -7681,7 +7719,7 @@ static void do_draw_body(void)
        * loading screen in the next -- and a loading screen has nothing to
        * darken. Triangles per frame separates a logo from a city by three
        * orders of magnitude and does not care how long the disc took. */
-      if (hunt_tris == -2) { const char *v = getenv("RECOMP_GL_DARKHUNT_TRIS");
+      if (hunt_tris == -2) { const char *v = jsrf_getenv("RECOMP_GL_DARKHUNT_TRIS");
                              hunt_tris = v ? atoi(v) : -1; }
       /* RECOMP_GL_DARKHUNT_AFTER=<presents>: don't arm before here.
        *
@@ -7694,7 +7732,7 @@ static void do_draw_body(void)
        * reports, so the frame to hunt can be read off a previous run's
        * screenshots rather than guessed. */
       { static int after = -2;
-        if (after == -2) { const char *v = getenv("RECOMP_GL_DARKHUNT_AFTER");
+        if (after == -2) { const char *v = jsrf_getenv("RECOMP_GL_DARKHUNT_AFTER");
                            after = v ? atoi(v) : 0; }
         if (after > 0 && S.flips < (uint32_t)after) hunt_tris = hunt_tris; /* not yet */
         else if (hunt_tris > 0 && hunt_at < 0 && S.frame_tris >= (uint32_t)hunt_tris
@@ -7849,7 +7887,7 @@ static void do_draw_body(void)
      * world origin is the whole bug in one line.
      */
     { static int on = -1; static uint32_t seen[64]; static int nseen;
-      if (on < 0) on = getenv("RECOMP_GL_OBJMAT") ? 1 : 0;
+      if (on < 0) on = jsrf_getenv("RECOMP_GL_OBJMAT") ? 1 : 0;
       if (on && slot >= 0 && nseen < 64 && out_n >= 3
              && S.xf_mode != NV2A_XF_MODE_FIXED) {
           int i, fresh = 1;
@@ -7990,7 +8028,7 @@ static void do_draw_body(void)
      * in the pixel path; coordinates off in the weeds means it is the matrix.
      */
     { static int mv = -1; static int shown; static uint32_t last_frame = ~0u;
-      if (mv < 0) { const char *v = getenv("RECOMP_GL_MOVERS");
+      if (mv < 0) { const char *v = jsrf_getenv("RECOMP_GL_MOVERS");
                     mv = v ? atoi(v) : 0; }
       if (S.frames != last_frame) { last_frame = S.frames; }
       if (mv > 0 && shown < mv && slot >= 0 && g_pcache[slot].uses_a0
@@ -8091,7 +8129,7 @@ static void do_draw_body(void)
 
     { static int wy = -1; static uint64_t hist[12]; static uint32_t wlast;
       static const float edges[11] = { -100,-20,-5,0,5,20,50,100,200,500,1000 };
-      if (wy < 0) wy = getenv("RECOMP_GL_WORLDY") ? 1 : 0;
+      if (wy < 0) wy = jsrf_getenv("RECOMP_GL_WORLDY") ? 1 : 0;
       if (wy && slot >= 0 && g_pcache[slot].uses_a0 && out_n >= 3
              && S.xf_mode != NV2A_XF_MODE_FIXED && (S.draws & 1u) == 0) {
           Nv2aVshProgram vp;
@@ -8156,9 +8194,9 @@ static void do_draw_body(void)
      */
     { static int wd = -1; static FILE *fp; static uint32_t start_flip; static int shot;
       extern int g_world_dump_pending;
-      if (wd < 0) wd = getenv("RECOMP_GL_DUMP_WORLD") ? 1 : 0;
+      if (wd < 0) wd = jsrf_getenv("RECOMP_GL_DUMP_WORLD") ? 1 : 0;
       if (wd && g_world_dump_pending && !fp) {
-          char name[256]; const char *pfx = getenv("RECOMP_GL_DUMP_FB");
+          char name[256]; const char *pfx = jsrf_getenv("RECOMP_GL_DUMP_FB");
           snprintf(name, sizeof name, "%s_world_%03d.txt", pfx ? pfx : "dump", shot++);
           fp = fopen(name, "w"); start_flip = S.flips;
           if (fp) { int r;
@@ -8259,7 +8297,7 @@ static void do_draw_body(void)
      * what this answers. */
     { static const char *dir = (const char *)1; static uint32_t seen[64]; static int nseen;
       static uint32_t seen_prog[64], seen_psh[64]; static int nprog, npsh;
-      if (dir == (const char *)1) dir = getenv("RECOMP_GL_CHARLOG");
+      if (dir == (const char *)1) dir = jsrf_getenv("RECOMP_GL_CHARLOG");
       if (dir && nseen < 40 && slot >= 0 && S.xf_mode != NV2A_XF_MODE_FIXED
           && g_pcache[slot].uses_a0 && out_n >= 30 && !vc_vb) {
           uint32_t ph = psh_hash(), key, i;
@@ -8351,7 +8389,7 @@ static void do_draw_body(void)
      * emitted. For a draw that comes out opaque black where the title meant
      * a soft streak, one of these is where the alpha went. */
     { static uint32_t spy; static int sinit, shown;
-      if (!sinit) { const char *v = getenv("RECOMP_GL_SPY_TEX"); sinit = 1;
+      if (!sinit) { const char *v = jsrf_getenv("RECOMP_GL_SPY_TEX"); sinit = 1;
                     spy = v ? (uint32_t)strtoul(v, 0, 16) : 0; }
       if (spy && shown < 4 && slot >= 0 && S.tex[0].offset == spy
           && S.xf_mode != NV2A_XF_MODE_FIXED) {
@@ -8423,7 +8461,7 @@ static void do_draw_body(void)
       } }
 
     { static int hg = -1; static int shown;
-      if (hg < 0) hg = getenv("RECOMP_GL_HUGE") ? 1 : 0;
+      if (hg < 0) hg = jsrf_getenv("RECOMP_GL_HUGE") ? 1 : 0;
       if (hg && shown < 40 && slot >= 0 && out_n >= 3 && out_n <= 96
              && S.xf_mode != NV2A_XF_MODE_FIXED) {
           Nv2aVshProgram vp;
@@ -8473,7 +8511,7 @@ static void do_draw_body(void)
     { static int dcen = -1;
       static uint64_t dw[2][8], dn[2][8]; static uint32_t dlast;
       static const float edges[7] = { 50, 100, 200, 400, 800, 1600, 3200 };
-      if (dcen < 0) dcen = getenv("RECOMP_GL_DISTCENSUS") ? 1 : 0;
+      if (dcen < 0) dcen = jsrf_getenv("RECOMP_GL_DISTCENSUS") ? 1 : 0;
       if (dcen && slot >= 0 && out_n >= 3 && (S.draws & 3u) == 0
              && S.xf_mode != NV2A_XF_MODE_FIXED) {
           Nv2aVshProgram vp;
@@ -8556,7 +8594,7 @@ static void do_draw_body(void)
     { static int on = -1; static int shown_pr;
       static uint32_t pr_seen[12]; static int pr_nseen;
       int pr_fresh = 1, pr_i;
-      if (on < 0) on = getenv("RECOMP_GL_POSRANGE") ? 1 : 0;
+      if (on < 0) on = jsrf_getenv("RECOMP_GL_POSRANGE") ? 1 : 0;
       /* One report per PROGRAM, not per draw.
        *
        * The first version took the first six draws that matched and all six
@@ -8623,7 +8661,7 @@ static void do_draw_body(void)
     { static int on = -1; static int shown;
       static uint64_t a0_draws, a0_bad; static uint32_t last_report;
       static uint64_t g_a0_hist[9];
-      if (on < 0) on = getenv("RECOMP_GL_SKINDBG") ? 1 : 0;
+      if (on < 0) on = jsrf_getenv("RECOMP_GL_SKINDBG") ? 1 : 0;
       if (on && slot >= 0 && g_pcache[slot].uses_a0) a0_draws++;
       if (on && S.draws - last_report >= 200000u) {
           int hb;
@@ -8931,10 +8969,10 @@ static void do_draw_body(void)
      * state from where it went blank. */
     {
         static long at = -2, at3d = -2, atflip = -2, atverts = -2; static int shown;
-        if (at == -2) { const char *v = getenv("RECOMP_GL_STATE_AT");
-                        const char *w = getenv("RECOMP_GL_STATE_AT3D");
-                        const char *f = getenv("RECOMP_GL_STATE_AT_FLIP");
-                        const char *n = getenv("RECOMP_GL_STATE_AT_VERTS");
+        if (at == -2) { const char *v = jsrf_getenv("RECOMP_GL_STATE_AT");
+                        const char *w = jsrf_getenv("RECOMP_GL_STATE_AT3D");
+                        const char *f = jsrf_getenv("RECOMP_GL_STATE_AT_FLIP");
+                        const char *n = jsrf_getenv("RECOMP_GL_STATE_AT_VERTS");
                         atverts = n ? atol(n) : -1;
                         at = v ? atol(v) : -1;
                         at3d = w ? atol(w) : -1;
@@ -8950,7 +8988,7 @@ static void do_draw_body(void)
          * viewport, blending on, and far more vertices than the little UI
          * quads that share that viewport. */
         { static long atov = -2;
-          if (atov == -2) { const char *v = getenv("RECOMP_GL_STATE_AT_OVERLAY");
+          if (atov == -2) { const char *v = jsrf_getenv("RECOMP_GL_STATE_AT_OVERLAY");
                             atov = v ? atol(v) : -1; }
           if (atov >= 0 && shown < 6 && (long)S.flips >= atov
            && S.u.vp_off[0] < 100.0f && out_n >= 40
@@ -8958,13 +8996,13 @@ static void do_draw_body(void)
            && S.tex[0].enabled)
               at = (long)S.draws; }
         { static long atsince = -2;
-          if (atsince == -2) { const char *v = getenv("RECOMP_GL_STATE_AT_SINCE");
+          if (atsince == -2) { const char *v = jsrf_getenv("RECOMP_GL_STATE_AT_SINCE");
                                atsince = v ? atol(v) : -1; }
           /* RECOMP_GL_STATE_AT_SEC=<s>: only from s seconds after the
            * renderer started -- a gate by time, for a phase whose draw
            * counts are not known in advance. */
           static double atsec = -2.0, t0;
-          if (atsec == -2.0) { const char *v = getenv("RECOMP_GL_STATE_AT_SEC");
+          if (atsec == -2.0) { const char *v = jsrf_getenv("RECOMP_GL_STATE_AT_SEC");
                                atsec = v ? atof(v) : -1.0; t0 = mono_now(); }
           if (atsince >= 0) {
               if ((long)S.since_present == atsince && shown < 6
@@ -8985,7 +9023,7 @@ static void do_draw_body(void)
          * identified by its input mask, and nothing else about the draw
          * distinguishes it from the family beside it that renders correctly. */
         { static long atin = -2;
-          if (atin == -2) { const char *v = getenv("RECOMP_GL_STATE_AT_INPUTS");
+          if (atin == -2) { const char *v = jsrf_getenv("RECOMP_GL_STATE_AT_INPUTS");
                             atin = v ? strtol(v, 0, 16) : -1; }
           if (atin >= 0 && (long)g_pcache[slot].inputs == atin && shown < 6)
               at = (long)S.draws; }
@@ -9115,10 +9153,10 @@ static void do_draw_body(void)
         static const char *cpfx; static int cinit;
         static long cat;
         static long cat3d = -1;
-        if (!cinit) { cinit = 1; cpfx = getenv("RECOMP_GL_CAPTURE");
-                      { const char *v = getenv("RECOMP_GL_STATE_AT");
+        if (!cinit) { cinit = 1; cpfx = jsrf_getenv("RECOMP_GL_CAPTURE");
+                      { const char *v = jsrf_getenv("RECOMP_GL_STATE_AT");
                         cat = v ? atol(v) : 0; }
-                      { const char *v = getenv("RECOMP_GL_CAPTURE_3D");
+                      { const char *v = jsrf_getenv("RECOMP_GL_CAPTURE_3D");
                         cat3d = v ? atol(v) : -1; } }
         /* When capturing the scene rather than bring-up, wait for a batch big
          * enough to be scenery: a twelve-vertex sprite replays fine and says
@@ -9159,7 +9197,7 @@ static void do_draw_body(void)
     {
         static int shots;
         static const char *pfx; static int init;
-        if (!init) { init = 1; pfx = getenv("RECOMP_GL_DUMP_DRAW"); }
+        if (!init) { init = 1; pfx = jsrf_getenv("RECOMP_GL_DUMP_DRAW"); }
         if (pfx && (S.draws % 4000) == 3999) dump_fbo(g_cur_rt, pfx, &shots, 12);
     }
     /* RECOMP_GL_DRAW_LOG=<n>: one line per draw for the first frame that
@@ -9261,7 +9299,7 @@ static void do_draw_body(void)
          * frame, every vertex: as sent, then through the composite matrix
          * (clip x y z w, and z/w). */
         { static int vd = -1;
-          if (vd < 0) vd = getenv("RECOMP_GL_VOLDUMP") ? 1 : 0;
+          if (vd < 0) vd = jsrf_getenv("RECOMP_GL_VOLDUMP") ? 1 : 0;
           if (vd && (long)S.flips <= g_draw_log_flip + 1 && S.xf_mode == NV2A_XF_MODE_FIXED
               && S.stencil_en && (S.stencil_op[2] == 0x1E02 || S.stencil_op[2] == 0x1E03)
               && attr_at[0] >= 0) {
@@ -9294,7 +9332,7 @@ static void do_draw_body(void)
         uint32_t k = g_ring_n % DRAW_RING, v;
         float mnx = 1e30f, mxx = -1e30f, mny = 1e30f, mxy = -1e30f;
         static int want = -1;
-        if (want < 0) want = getenv("RECOMP_GL_DUMP_FB") ? 1 : 0;
+        if (want < 0) want = jsrf_getenv("RECOMP_GL_DUMP_FB") ? 1 : 0;
         if (want && !vc_vb)
         for (v = 0; v < out_n; v++) {
             float x = vbuf[(size_t)v * stride_floats + 0];
@@ -9320,7 +9358,7 @@ static void do_draw_body(void)
      * lighting state of each lit fixed-function draw whenever it changes
      * (first 80 changes; directions and matrices are shown, not compared). */
     { static int on = -1, n; static float last[64]; static double from, t0;
-      if (on < 0) { const char *v = getenv("RECOMP_GL_LITLOG");
+      if (on < 0) { const char *v = jsrf_getenv("RECOMP_GL_LITLOG");
                     on = v ? 1 : 0; from = v ? atof(v) : 0.0; t0 = mono_now(); }
       if (on && n < 80 && S.xf_mode == NV2A_XF_MODE_FIXED && S.ff_lighting
           && mono_now() - t0 >= from) {
@@ -9375,7 +9413,7 @@ static void do_draw_body(void)
      * and off between neighbouring batches, and a log of changes was used up
      * on the first level frames. */
     { static int on = -1, n; static uint32_t seen[256][12];
-      if (on < 0) on = getenv("RECOMP_GL_FOGLOG") ? 1 : 0;
+      if (on < 0) on = jsrf_getenv("RECOMP_GL_FOGLOG") ? 1 : 0;
       if (on && n < 256) {
           uint32_t cur[12]; int k;
           cur[0] = S.fog_enable; cur[1] = S.fog_mode; cur[2] = S.fog_gen_mode; cur[3] = S.fog_color;
@@ -9418,7 +9456,7 @@ static void do_draw_body(void)
      * what is on screen, the translation is right and the data is wrong.
      */
     { static int on = -1; static int shown;
-      if (on < 0) on = getenv("RECOMP_GL_INTERP") ? 1 : 0;
+      if (on < 0) on = jsrf_getenv("RECOMP_GL_INTERP") ? 1 : 0;
       if (on && shown < 6 && out_n >= 3 && S.xf_mode != NV2A_XF_MODE_FIXED) {
           Nv2aVshProgram vp;
           uint32_t start = S.prog_start < NV2A_VSH_MAX_INSNS ? S.prog_start : 0;
@@ -9473,7 +9511,7 @@ static void do_draw_body(void)
     { static int on = -1;
       static uint32_t seen[2][8];
       static uint32_t n;
-      if (on < 0) on = getenv("RECOMP_GL_ATTRFMT") ? 1 : 0;
+      if (on < 0) on = jsrf_getenv("RECOMP_GL_ATTRFMT") ? 1 : 0;
       if (on) {
           int pipe = (S.xf_mode == NV2A_XF_MODE_FIXED) ? 0 : 1, j;
           for (j = 0; j < nlive; j++)
@@ -9631,14 +9669,14 @@ static void fliplog(const char *why)
     static int budget = -1;
     static uint32_t prev_draws;
     if (budget < 0) {
-        const char *e = getenv("RECOMP_GL_FLIPLOG");
+        const char *e = jsrf_getenv("RECOMP_GL_FLIPLOG");
         budget = e ? atoi(e) : 0;
     }
     /* RECOMP_GL_FLIPLOG_AFTER=<flips>: start counting the budget only once
      * this many presents have gone by -- the title scene is fifteen
      * thousand presents into a run. */
     { static long after = -1;
-      if (after < 0) { const char *a = getenv("RECOMP_GL_FLIPLOG_AFTER"); after = a ? atol(a) : 0; }
+      if (after < 0) { const char *a = jsrf_getenv("RECOMP_GL_FLIPLOG_AFTER"); after = a ? atol(a) : 0; }
       if ((long)S.flips < after) { prev_draws = S.draws; return; } }
     if (budget <= 0) { prev_draws = S.draws; return; }
     budget--;
@@ -9707,7 +9745,7 @@ static void frame_pace(void)
         static double deadline;
         double now;
         if (period < 0.0) {
-            const char *v = getenv("RECOMP_FPS");
+            const char *v = jsrf_getenv("RECOMP_FPS");
             double fps = v ? atof(v) : 60.0;
             period = (fps > 0.0) ? 1.0 / fps : 0.0;
         }
@@ -9815,7 +9853,7 @@ static void frame_pace(void)
                  * RECOMP_PACE_VBLANK=0: one sleep, as before, for A/B. */
                 static int service = -1;
                 if (service < 0) {
-                    const char *v = getenv("RECOMP_PACE_VBLANK");
+                    const char *v = jsrf_getenv("RECOMP_PACE_VBLANK");
                     service = (v ? atoi(v) : 1) && xbox_nv2a_vblank_service;
                 }
                 while (now < spin) {
@@ -9943,6 +9981,13 @@ static int g_perf_have_cpu;
 static void perf_frame_tick(void)
 {
     double now;
+    { static int probe;
+      if (!probe) {
+          const char *v = jsrf_getenv("RECOMP_GL_PROFILE");
+          probe = 1;
+          jsrf_dbg_log("probe: prop=%s env=%s\n", v ? v : "(null)",
+                       getenv("RECOMP_GL_PROFILE") ? "set" : "(unset)");
+      } }
     if (!atomic_load_explicit(&g_perf_enabled, memory_order_relaxed)) {
         g_perf_last_frame = 0.0;
         g_perf_frame_ema = 0.0;
@@ -10098,7 +10143,7 @@ static void present(int is_frame)
         static uint32_t fprev, dprev;
         static unsigned long vprev;
         if (pace < 0) {
-            pace = getenv("RECOMP_PACE") ? 1 : 0;
+            pace = jsrf_getenv("RECOMP_PACE") ? 1 : 0;
             clock_gettime(CLOCK_MONOTONIC, &t0);
             tprev = t0;
         }
@@ -10223,13 +10268,13 @@ static void present(int is_frame)
         int dump_due, chars_ok = 1;
 
         if (every < 0) {
-            const char *v = getenv("RECOMP_GL_READBACK");
-            const char *a = getenv("RECOMP_GL_DUMP_AFTER");
-            const char *e = getenv("RECOMP_GL_DUMP_EVERY");
-            const char *t = getenv("RECOMP_GL_DUMP_3D");
+            const char *v = jsrf_getenv("RECOMP_GL_READBACK");
+            const char *a = jsrf_getenv("RECOMP_GL_DUMP_AFTER");
+            const char *e = jsrf_getenv("RECOMP_GL_DUMP_EVERY");
+            const char *t = jsrf_getenv("RECOMP_GL_DUMP_3D");
             every = v ? atoi(v) : 1;
             if (every < 0) every = 0;
-            pfx = getenv("RECOMP_GL_DUMP_FB");
+            pfx = jsrf_getenv("RECOMP_GL_DUMP_FB");
             dump_after = a ? (uint32_t)strtoul(a, 0, 0) : 0;
             dump_every = e ? (uint32_t)strtoul(e, 0, 0) : 90;
             dump_3d = t ? (uint32_t)strtoul(t, 0, 0) : 0;
@@ -10240,7 +10285,7 @@ static void present(int is_frame)
          * triangles, so triangles-per-frame separates the two far better than
          * a flip count guessed in advance. */
         { static uint32_t prev_tris; static const char *tinit;
-          if (!tinit) { tinit = getenv("RECOMP_GL_DUMP_TRIS"); tinit = tinit ? tinit : ""; }
+          if (!tinit) { tinit = jsrf_getenv("RECOMP_GL_DUMP_TRIS"); tinit = tinit ? tinit : ""; }
           S.frame_tris = S.tris - prev_tris;
           prev_tris = S.tris;
           if (*tinit) dump_after_tris = (uint32_t)strtoul(tinit, 0, 0); }
@@ -10259,7 +10304,7 @@ static void present(int is_frame)
          * gets a frame in which the darkening is still happening. */
         { static int drop = -1; static double prev_mean = -1.0; static int armed;
           static int drop_tris = -1;
-          if (drop < 0) drop = getenv("RECOMP_GL_DARKHUNT_DROP") ? 1 : 0;
+          if (drop < 0) drop = jsrf_getenv("RECOMP_GL_DARKHUNT_DROP") ? 1 : 0;
           /* Only frames with a scene in them.
            *
            * The first attempt at this armed at present 1095, on a frame with
@@ -10268,7 +10313,7 @@ static void present(int is_frame)
            * is tens of thousands of triangles, so requiring a real scene on
            * both sides of the fall removes every logo, flash and fade between
            * menus without needing to know where any of them are. */
-          if (drop_tris < 0) { const char *v = getenv("RECOMP_GL_DARKHUNT_TRIS");
+          if (drop_tris < 0) { const char *v = jsrf_getenv("RECOMP_GL_DARKHUNT_TRIS");
                                drop_tris = v ? atoi(v) : 5000; }
           if (drop && !armed && S.frame_tris >= (uint32_t)drop_tris) {
               static uint8_t strip[64 * 48 * 4];
@@ -10297,7 +10342,7 @@ static void present(int is_frame)
          * batches in them, which is what a scene with characters in it looks
          * like and a menu or loading screen never does. */
         { static int cinit; static uint32_t want_chars;
-          if (!cinit) { const char *v = getenv("RECOMP_GL_DUMP_CHARS");
+          if (!cinit) { const char *v = jsrf_getenv("RECOMP_GL_DUMP_CHARS");
                         want_chars = v ? (uint32_t)strtoul(v, 0, 0) : 0;
                         cinit = 1; }
           chars_ok = !want_chars || g_frame_chars_prev >= want_chars; }
@@ -10314,7 +10359,7 @@ static void present(int is_frame)
         /* RECOMP_GL_DUMP_SECS=<s>: none before s seconds into the run --
          * flips are no clock, a loading screen runs hundreds a second. */
         { static double t0 = -1.0, after_s = -1.0;
-          if (t0 < 0.0) { const char *v = getenv("RECOMP_GL_DUMP_SECS");
+          if (t0 < 0.0) { const char *v = jsrf_getenv("RECOMP_GL_DUMP_SECS");
                           t0 = mono_now(); after_s = v ? atof(v) : 0.0; }
           if (dump_due && after_s > 0.0 && mono_now() - t0 < after_s) dump_due = 0; }
         /* RECOMP_GL_DUMP_SHOWN: a shot that falls on the end of a pass rather
@@ -10324,7 +10369,7 @@ static void present(int is_frame)
          * and every shot was spent writing nothing. */
         { static int so = -1, owed;
           int shows = is_frame && g_present_slot >= 0 && g_surf[g_present_slot].used;
-          if (so < 0) so = getenv("RECOMP_GL_DUMP_SHOWN") ? 1 : 0;
+          if (so < 0) so = jsrf_getenv("RECOMP_GL_DUMP_SHOWN") ? 1 : 0;
           if (so) {
               if (dump_due && !shows) { owed = 1; dump_due = 0; }
               else if (owed && shows && pfx && dump_shots < dump_max()) { owed = 0; dump_due = 1; }
@@ -10332,7 +10377,7 @@ static void present(int is_frame)
         /* RECOMP_GL_DUMP_PAIRS=1: each dump and the frame straight after it --
          * with RECOMP_GL_TEXGEN=ab, the same moment with and without. */
         { static int pairs = -1, second;
-          if (pairs < 0) pairs = getenv("RECOMP_GL_DUMP_PAIRS") ? 1 : 0;
+          if (pairs < 0) pairs = jsrf_getenv("RECOMP_GL_DUMP_PAIRS") ? 1 : 0;
           if (pairs && is_frame) {
               if (second && pfx && dump_shots < dump_max()) { dump_due = 1; second = 0; }
               else if (dump_due) second = 1;
@@ -10354,7 +10399,7 @@ static void present(int is_frame)
              * rather than at how it was made. */
             int k;
             static int shown_only = -1;
-            if (shown_only < 0) shown_only = getenv("RECOMP_GL_DUMP_SHOWN") ? 1 : 0;
+            if (shown_only < 0) shown_only = jsrf_getenv("RECOMP_GL_DUMP_SHOWN") ? 1 : 0;
             for (k = 0; k < SURF_CACHE && !shown_only; k++) {
                 char pf[256];
                 static int per_surf[SURF_CACHE];
@@ -10537,7 +10582,7 @@ static void zrev_row(float out[4])
 
 static void zrev_start(void)
 {
-    const char *v = getenv("RECOMP_GL_ZREV");
+    const char *v = jsrf_getenv("RECOMP_GL_ZREV");
     int want = v ? atoi(v) != 0 : 1;
     g_zrev = (want && G->zrev) ? (G->zrev(1) ? 1 : 0) : 0;
     nv2a_vsh_zrev = g_zrev;
@@ -10551,7 +10596,7 @@ static void zrev_start(void)
 static void split_batch_if_state_moved(void)
 {
     static int on = -1;
-    if (on < 0) { const char *v = getenv("RECOMP_GL_MIDBATCH");
+    if (on < 0) { const char *v = jsrf_getenv("RECOMP_GL_MIDBATCH");
                   on = v ? atoi(v) : 1; }
     if (!on) return;
     if (!S.consts_since_geom && !S.arrays_since_geom) return;
@@ -10596,7 +10641,7 @@ static void methval_note(uint32_t method, uint32_t param)
     static int on = -1; static double every, next;
     static uint32_t meth[NM], val[NM][NV], cnt[NM][NV]; static int nm, nv[NM];
     int i, j;
-    if (on < 0) { const char *v = getenv("RECOMP_GL_METHVAL");
+    if (on < 0) { const char *v = jsrf_getenv("RECOMP_GL_METHVAL");
                   on = v ? 1 : 0; every = v ? atof(v) : 0.0; if (every <= 0) every = 10.0;
                   next = mono_now() + every; }
     if (!on) return;
@@ -10644,7 +10689,7 @@ static uint32_t g_imm_n, g_imm_dropped;
 static int imm_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char *v = getenv("RECOMP_GL_IMMEDIATE"); on = v ? atoi(v) != 0 : 1; }
+    if (on < 0) { const char *v = jsrf_getenv("RECOMP_GL_IMMEDIATE"); on = v ? atoi(v) != 0 : 1; }
     return on;
 }
 
@@ -10861,7 +10906,7 @@ static void imm_draw(void)
      * the stencil buffer's contents over the area it covers: 1 red, 2 green,
      * 3 blue, 4 and more white, 0 left alone. */
     { static int vis = -1;
-      if (vis < 0) { const char *e = getenv("RECOMP_GL_STENCILVIS"); vis = e ? atoi(e) : 0; }
+      if (vis < 0) { const char *e = jsrf_getenv("RECOMP_GL_STENCILVIS"); vis = e ? atoi(e) : 0; }
       if (vis && S.stencil_en && S.stencil_func != 0x207) {
           static const float col[4][4] = { { 1, 0, 0, 1 }, { 0, 1, 0, 1 }, { 0, 0, 1, 1 }, { 1, 1, 1, 1 } };
           uint32_t f = S.stencil_func, r = S.stencil_ref, fm = S.stencil_fmask, o2 = S.stencil_op[2];
@@ -10903,7 +10948,7 @@ static void methtrace_note(uint32_t method, uint32_t param)
 {
     static int init; static long lo = -1, hi = -1;
     float f;
-    if (!init) { const char *v = getenv("RECOMP_GL_METHTRACE"); init = 1;
+    if (!init) { const char *v = jsrf_getenv("RECOMP_GL_METHTRACE"); init = 1;
                  if (v) { lo = atol(v); { const char *d = strchr(v, '-'); hi = d ? atol(d + 1) : lo; } } }
     if (lo < 0 || g_draw_log_flip < 0) return;
     if ((long)S.flips < g_draw_log_flip || (long)S.flips >= g_draw_log_flip + 2) return;
@@ -10914,6 +10959,74 @@ static void methtrace_note(uint32_t method, uint32_t param)
     fprintf(stderr, "[MT] f%u d%u %04X = %08X (%g)\n", S.flips, S.since_present, method, param, f);
 }
 
+/* Runs of transform state, appended whole.
+ *
+ * SET_TRANSFORM_PROGRAM (0x0B00..0x0B7C) and SET_TRANSFORM_CONSTANT
+ * (0x0B80..0x0BFC) arrive as runs of dwords, and the backend consumes them in
+ * the order they were written -- prog_load/prog_sub and const_load/const_sub,
+ * set by the LOAD variant that precedes the run -- not by address. A run can
+ * therefore be handed over in one call instead of dispatching each dword.
+ *
+ * On this title the constant uploads alone are four million dispatches a
+ * second, and every one of them walks the forty-five branch dispatch chain to
+ * end up doing one four-byte copy.
+ *
+ * The hooks that name a single slot (RECOMP_GL_WATCH_CONST, and the owner
+ * histogram behind RECOMP_GL_CONST_OWNER) keep the scalar path: they exist to
+ * observe individual writes, and a fast path that skipped them would quietly
+ * stop reporting.
+ *
+ * Returns 0 when the caller should fall back to nv2a_gl_method per word. */
+int nv2a_gl_transform_run(uint32_t method, const uint32_t *params, uint32_t count,
+                          int noninc)
+{
+    static int plain = -1;
+    uint32_t i, last = noninc ? method : method + (count - 1) * 4;
+    int is_prog  = method >= M_SET_TRANSFORM_PROGRAM
+                && method <= M_SET_TRANSFORM_PROGRAM + 0x7C
+                && last   <= M_SET_TRANSFORM_PROGRAM + 0x7C;
+    int is_const = method >= M_SET_TRANSFORM_CONSTANT
+                && method <= M_SET_TRANSFORM_CONSTANT + 0x7C
+                && last   <= M_SET_TRANSFORM_CONSTANT + 0x7C;
+
+    /* A run that spans the two ranges is left to the per-word path, which
+     * decides per address which of the two it is. */
+    if (!is_prog && !is_const) return 0;
+    /* RECOMP_PB_NO_BATCH=1 turns the whole thing off, so the same install can
+     * be measured with the batch path on and off in the same place. Its gain
+     * is small enough that only a same-spot comparison means anything. */
+    { static int off = -1;
+      if (off < 0) off = jsrf_getenv("RECOMP_PB_NO_BATCH") ? 1 : 0;
+      if (off) return 0; }
+    if (plain < 0)
+        plain = !jsrf_getenv("RECOMP_GL_WATCH_CONST") && !jsrf_getenv("RECOMP_GL_CONST_OWNER");
+    if (!plain || !count) return 0;
+    if (!nv2a_gl_enabled() || g_failed || !S.const_attr_init) return 0;
+
+    if (is_prog) {
+        for (i = 0; i < count; i++) {
+            if (S.prog_load >= NV2A_VSH_MAX_INSNS) break;
+            S.prog[S.prog_load * 4 + S.prog_sub] = params[i];
+            g_vsh_gen++;
+            if (++S.prog_sub == 4) { S.prog_sub = 0; S.prog_load++; S.prog_dirty = 1; }
+        }
+        return 1;
+    }
+    for (i = 0; i < count; i++) {
+        uint32_t k;
+        if (S.const_load >= NV2A_VSH_NUM_CONSTS) break;
+        k = S.const_load;
+        if (memcmp(&S.u.c[k][S.const_sub], &params[i], 4) != 0) {
+            memcpy(&S.u.c[k][S.const_sub], &params[i], 4);
+            const_changed(k);
+        }
+        if (++S.const_sub == 4) { S.const_sub = 0; S.const_load++; }
+    }
+    S.consts_dirty = 1;
+    S.consts_since_geom = 1;
+    return 1;
+}
+
 int nv2a_gl_method_run(uint32_t method, const uint32_t *params, uint32_t count)
 {
     static int allowed = -1;
@@ -10922,7 +11035,7 @@ int nv2a_gl_method_run(uint32_t method, const uint32_t *params, uint32_t count)
         method != M_INLINE_ARRAY) return 0;
     if (!count || !nv2a_gl_enabled() || g_failed || !S.const_attr_init) return 0;
     if (allowed < 0)
-        allowed = !getenv("RECOMP_PB_SOFT") && !getenv("RECOMP_GL_PACKET_SCALAR") &&
+        allowed = !jsrf_getenv("RECOMP_PB_SOFT") && !jsrf_getenv("RECOMP_GL_PACKET_SCALAR") &&
                   vc_debug_switch() == NULL;
     if (!allowed) return 0;
 
@@ -10956,6 +11069,7 @@ int nv2a_gl_method_run(uint32_t method, const uint32_t *params, uint32_t count)
 void nv2a_gl_method(uint32_t method, uint32_t param)
 {
     if (!nv2a_gl_enabled() || g_failed) return;
+    if (PROF_ON()) g_meth_count[(method >> 2) & 0x7FF]++;
     methval_note(method, param);
     methtrace_note(method, param);
 
@@ -11023,7 +11137,7 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
          * capture bug or a genuinely absent upload, and only watching the
          * slot separates the two. */
         { static int wc = -2;
-          if (wc == -2) { const char *v = getenv("RECOMP_GL_WATCH_CONST");
+          if (wc == -2) { const char *v = jsrf_getenv("RECOMP_GL_WATCH_CONST");
                           wc = v ? atoi(v) : -1; }
           if (wc >= 0 && (int)S.const_load == wc) {
               static int n;
@@ -11044,7 +11158,7 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
          * writes where settles it. */
         { static unsigned char who[NV2A_VSH_NUM_CONSTS];
           static int on = -1, reported;
-          if (on < 0) on = getenv("RECOMP_GL_CONST_OWNER") ? 1 : 0;
+          if (on < 0) on = jsrf_getenv("RECOMP_GL_CONST_OWNER") ? 1 : 0;
           if (on && S.const_load < NV2A_VSH_NUM_CONSTS) {
               who[S.const_load] |= 1;              /* written by the title */
               if (++reported % 200000 == 0) {
@@ -11126,7 +11240,7 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
          * something to be reasoned out from a convention -- RECOMP_GL_FF_T
          * swaps it, so both can be looked at rather than argued about. */
         static int tr = -1;
-        if (tr < 0) tr = getenv("RECOMP_GL_FF_T") ? 1 : 0;
+        if (tr < 0) tr = jsrf_getenv("RECOMP_GL_FF_T") ? 1 : 0;
         if (tr) memcpy(&S.u.ff_mat[k & 3][k / 4], &param, 4);
         else    memcpy(&S.u.ff_mat[k / 4][k & 3], &param, 4);
         S.ff_mats_dirty = 1;
@@ -11195,7 +11309,7 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
         /* (the inline vertex positions, 0x1500..0x152C, are left out) --
          * and every route to the normal's constant, attribute 2. */
         static int on = -1, n;
-        if (on < 0) on = getenv("RECOMP_GL_INLINELOG") ? 1 : 0;
+        if (on < 0) on = jsrf_getenv("RECOMP_GL_INLINELOG") ? 1 : 0;
         if (on && n < 200) { float fv; memcpy(&fv, &param, 4); n++;
             fprintf(stderr, "[INLINE] m %04X = %08X (%g) at draw %u flip %u\n", method, param, fv, S.draws, S.flips); }
     }
@@ -11334,7 +11448,7 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
          * reaching geometry they should not, and the real question becomes
          * what they are. */
         { static int force = -1;
-          if (force < 0) force = getenv("RECOMP_GL_VP_FORCE") ? 1 : 0;
+          if (force < 0) force = jsrf_getenv("RECOMP_GL_VP_FORCE") ? 1 : 0;
           if (force && sub < 2) {
               float fv; memcpy(&fv, &param, 4);
               if (fv < 100.0f && S.u.vp_scale[0] > 100.0f) return;
@@ -11574,7 +11688,7 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
          * the uploads up against the slots the programs read. */
         { static uint32_t hist[192], counts[192]; static uint32_t prev; static int have;
           static int on = -2;
-          if (on == -2) on = getenv("RECOMP_GL_CONST_MAP") ? 1 : 0;
+          if (on == -2) on = jsrf_getenv("RECOMP_GL_CONST_MAP") ? 1 : 0;
           if (on) {
               if (have && prev < 192) {
                   hist[prev]++;
@@ -11643,7 +11757,7 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
          * "The picture changed" is not the same claim as "the picture is
          * better", and only a pair of frames settles which. */
         static int last_only = -1;
-        if (last_only < 0) last_only = getenv("RECOMP_GL_DRAWARRAYS_LAST") ? 1 : 0;
+        if (last_only < 0) last_only = jsrf_getenv("RECOMP_GL_DRAWARRAYS_LAST") ? 1 : 0;
         if (last_only) S.idx_count = 0;
         for (q = 0; q < count && S.idx_count < MAX_INDICES; q++)
             S.idx[S.idx_count++] = first + q;
@@ -11748,7 +11862,7 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
              * to the wrong words. Paced, the two stay together. */
             static int pace_nodraw = -1;   /* RECOMP_PACE_NODRAW=0: the old way, for A/B */
             if (pace_nodraw < 0) {
-                const char *v = getenv("RECOMP_PACE_NODRAW");
+                const char *v = jsrf_getenv("RECOMP_PACE_NODRAW");
                 pace_nodraw = v ? atoi(v) : 1;
             }
             fliplog("stall(nodraw)");
@@ -11767,7 +11881,7 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
         { static unsigned char seen[0x800];
           static uint32_t count[0x800];
           static int on = -1, reported;
-          if (on < 0) on = getenv("RECOMP_GL_UNHANDLED") ? 1 : 0;
+          if (on < 0) on = jsrf_getenv("RECOMP_GL_UNHANDLED") ? 1 : 0;
           if (on) {
               uint32_t k = (method >> 2) & 0x7FF;
               seen[k] = 1; count[k]++;
@@ -11945,7 +12059,7 @@ static void seed_import(const char *dir, const char *tag, int msl)
 
     nv2a_sc_states_open(dir);
     nlocal = nv2a_sc_states_local();
-    { const char *e = getenv("JSRF_SHADER_SEED");
+    { const char *e = jsrf_getenv("JSRF_SHADER_SEED");
       FILE *sf = (e && *e) ? fopen(e, "rb") : NULL;
       if (sf) {
           long end = (!fseek(sf, 0, SEEK_END)) ? ftell(sf) : -1;
@@ -11954,7 +12068,7 @@ static void seed_import(const char *dir, const char *tag, int msl)
               fread(extra, 1, (size_t)end, sf) == (size_t)end) extra_len = (size_t)end;
           fclose(sf);
       } }
-    { const char *e = getenv("RECOMP_SHADER_SEED");
+    { const char *e = jsrf_getenv("RECOMP_SHADER_SEED");
       if (e && *e && !atoi(e)) g_seed_len = 0; }
     if (g_seed_data && g_seed_len) {
         nv2a_sc_states_add_blob(g_seed_data, g_seed_len);
@@ -12034,7 +12148,7 @@ static void seed_import(const char *dir, const char *tag, int msl)
  * never loaded, only left behind. RECOMP_SHADER_CACHE=0 turns it off. */
 static void shader_cache_start(void)
 {
-    const char *save = getenv("JSRF_SAVE_DIR"), *off = getenv("RECOMP_SHADER_CACHE");
+    const char *save = jsrf_getenv("JSRF_SAVE_DIR"), *off = jsrf_getenv("RECOMP_SHADER_CACHE");
     char dir[1024], tag[96];
     char *v, *f;
     uint64_t fp = 0;
@@ -12067,7 +12181,7 @@ extern int nv_window_pref_smaa(void) __attribute__((weak));
 extern int nv_window_pref_msaa(void) __attribute__((weak));
 static void aa_start(void)
 {
-    const char *vs = getenv("RECOMP_GL_SMAA"), *vm = getenv("RECOMP_GL_MSAA");
+    const char *vs = jsrf_getenv("RECOMP_GL_SMAA"), *vm = jsrf_getenv("RECOMP_GL_MSAA");
     int smaa = 0, msaa = 0;
 #if defined(NV2A_GL_USE_SDL)
     smaa = sdl_cfg_get("smaa", 0) != 0;
@@ -12095,7 +12209,7 @@ static void aa_start(void)
 
 static int gfx_init(uint32_t w, uint32_t h)
 {
-    const char *v = getenv("RECOMP_BACKEND");
+    const char *v = jsrf_getenv("RECOMP_BACKEND");
     int want_metal = 0, metal_window = 0;
 #if defined(NV2A_GL_USE_CGL)
     /* With a window, the window has already decided (it was made for one or
@@ -12103,7 +12217,7 @@ static int gfx_init(uint32_t w, uint32_t h)
      * environment can ask. */
     extern void *nv_window_metal_layer(void) __attribute__((weak));
     extern void  nv_window_use_gl(void) __attribute__((weak));
-    if (getenv("RECOMP_WINDOW") && nv_window_is_open())
+    if (jsrf_getenv("RECOMP_WINDOW") && nv_window_is_open())
         g_windowed = 1;
     metal_window = nv_window_metal_layer && nv_window_metal_layer() != NULL;
 #endif
