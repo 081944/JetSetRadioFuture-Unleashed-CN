@@ -230,30 +230,89 @@ final class TouchPadView extends View {
         drawPill(c, mGear, GEAR, 20, mGearDown);
     }
 
+    /* The performance panel, on a fixed grid.
+     *
+     * Every column is a constant, in dp from the panel's left edge: a label is
+     * drawn left aligned at its own x, and a number is drawn right aligned at
+     * its own x, so a value that gains or loses a digit grows to the left and
+     * never moves anything else. Laying the line out as one string would not do
+     * that: the string's width changes with its digits, and it would have to be
+     * a monospaced face to line up -- this device does not have one, "monospace"
+     * falls back to its own proportional font.
+     *
+     * The columns are wide enough for the widest value each field can report:
+     * "999.9" for the frame rate, "999.99" for a millisecond count. A reading
+     * that would not fit drops its decimals rather than run into the next
+     * label (see number()). */
     private void drawPerformance(Canvas c) {
         String stats = JsrfActivity.nativePerformanceStats();
-        if (stats == null) stats = "Performance stats unavailable";
-        String[] lines = stats.split("\\n");
+        String[] f = stats == null ? new String[0] : stats.split("\\t");
         float pad = 9 * dp, lineH = 16 * dp, textSize = 11 * dp;
-        mText.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        mText.setTextSize(textSize);
-        float width = 0;
-        for (String line : lines) width = Math.max(width, mText.measureText(line));
-        float left = getWidth() - mInR - width - pad * 2 - 8 * dp;
+        /* Width and placement are constants: the box is anchored to the top
+         * right corner and never resized. */
+        float boxW = 192 * dp;
+        float left = getWidth() - mInR - 8 * dp - boxW;
         float top = mInT + 8 * dp;
-        float right = left + width + pad * 2;
-        float bottom = top + lines.length * lineH + pad * 2;
+        float right = left + boxW;
+        float bottom = top + 2 * lineH + pad * 2;
         mFill.setColor(Color.argb(190, 18, 20, 24));
         c.drawRoundRect(left, top, right, bottom, 7 * dp, 7 * dp, mFill);
         mLine.setColor(Color.argb(120, 255, 255, 255));
         mLine.setStrokeWidth(1 * dp);
         c.drawRoundRect(left, top, right, bottom, 7 * dp, 7 * dp, mLine);
+
+        mText.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        mText.setTextSize(textSize);
         mText.setColor(Color.WHITE);
-        mText.setTextAlign(Paint.Align.LEFT);
-        for (int i = 0; i < lines.length; i++)
-            c.drawText(lines[i], left + pad, top + pad + (i + 1) * lineH - 3 * dp, mText);
+        float x = left + pad;
+        float y1 = top + pad + lineH - 4 * dp;
+        float y2 = y1 + lineH;
+
+        label(c, "FPS",       x,           y1);
+        value(c, f, 0, 1,     x +  53 * dp, y1);
+        label(c, "Frame",     x +  60 * dp, y1);
+        value(c, f, 1, 2,     x + 131 * dp, y1);
+        label(c, "ms",        x + 135 * dp, y1);
+
+        label(c, "CPU frame", x,           y2);
+        value(c, f, 2, 2,     x +  92 * dp, y2);
+        label(c, "ms",        x +  96 * dp, y2);
+        label(c, "GPU",       x + 118 * dp, y2);
+        value(c, f, 3, 2,     x + 173 * dp, y2);
+
+        /* The controls are drawn after this and centre their labels on their
+         * own centres, so the paint has to go back to centred text. */
         mText.setTextAlign(Paint.Align.CENTER);
         postInvalidateDelayed(250);
+    }
+
+    private void label(Canvas c, String s, float x, float y) {
+        mText.setTextAlign(Paint.Align.LEFT);
+        c.drawText(s, x, y, mText);
+    }
+
+    /* Right aligned on a fixed x, so the number's right edge -- and the decimal
+     * point inside it -- stays where it is whatever the value does. */
+    private void value(Canvas c, String[] f, int i, int decimals, float x, float y) {
+        mText.setTextAlign(Paint.Align.RIGHT);
+        c.drawText(number(f, i, decimals), x, y, mText);
+        mText.setTextAlign(Paint.Align.LEFT);
+    }
+
+    /* "-1" is "no sample yet", "-2" is "the timer has not reported yet". A
+     * count big enough to overrun its column drops the decimals. */
+    private static String number(String[] f, int i, int decimals) {
+        if (i >= f.length) return "--";
+        float v;
+        try {
+            v = Float.parseFloat(f[i].trim());
+        } catch (NumberFormatException e) {
+            return "--";
+        }
+        if (v < -1.5f) return "…";
+        if (v < 0) return "--";
+        if (v >= 1000f) return String.format(Locale.ROOT, "%.0f", v);
+        return String.format(Locale.ROOT, "%." + decimals + "f", v);
     }
 
     private static int white(float a) {

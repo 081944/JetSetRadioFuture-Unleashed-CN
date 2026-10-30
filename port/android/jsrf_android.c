@@ -282,20 +282,19 @@ Java_com_jumatt_jsrfunleashed_JsrfActivity_nativePerformanceStats(JNIEnv *env, j
 {
     unsigned fps = 0, frame_us = 0, cpu_us = 0;
     int gpu_us = -1, gpu_supported = 0;
-    char text[128];
+    char text[96];
     (void)cls;
     nv2a_gl_performance_stats(&fps, &frame_us, &cpu_us, &gpu_us, &gpu_supported);
-    if (fps == 0) {
-        snprintf(text, sizeof text, "FPS --   Frame --\nCPU frame --   GPU %s",
-                 gpu_supported ? "pending" : "n/a");
-    } else if (gpu_us >= 0) {
-        snprintf(text, sizeof text, "FPS %.1f   Frame %.2f ms\nCPU frame %.2f ms   GPU %.2f ms",
-                 fps / 1000.0, frame_us / 1000.0, cpu_us / 1000.0, gpu_us / 1000.0);
-    } else {
-        snprintf(text, sizeof text, "FPS %.1f   Frame %.2f ms\nCPU frame %.2f ms   GPU %s",
-                 fps / 1000.0, frame_us / 1000.0, cpu_us / 1000.0,
-                 gpu_supported ? "pending" : "n/a");
-    }
+    /* Four numbers, tab separated, no layout: the panel puts each one right
+     * aligned on its own fixed column. Formatting them into one string here
+     * meant the width of the line, and so the width of the panel, followed
+     * whichever digits happened to be showing.
+     * A negative value means that sample is not available yet. */
+    snprintf(text, sizeof text, "%.1f\t%.2f\t%.2f\t%.2f",
+             fps ? fps / 1000.0 : -1.0,
+             fps ? frame_us / 1000.0 : -1.0,
+             fps ? cpu_us / 1000.0 : -1.0,
+             gpu_us >= 0 ? gpu_us / 1000.0 : (gpu_supported ? -2.0 : -1.0));
     return (*env)->NewStringUTF(env, text);
 }
 
