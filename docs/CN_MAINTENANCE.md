@@ -20,17 +20,28 @@
 
 已核对 XBE 哈希、生成器及运行时模板、手写函数声明与入口钩子均未变化，因此复用原生成 C，重新编译更新后的引擎。字体及转换的本地回归、实际生成字体 C 的全部 65,536 个输入、手柄四种组合检查通过。
 
-原生和 APK 构建脚本现使用一致的 `-Version`，打包时检查版本匹配。可用 `-OutputDir` 将不同版本存入不同的本地构建目录；签名身份默认始终保存在原 `build-cn-apk/`，不随输出目录改变，也不提交到仓库。
+原生和 APK 构建脚本共用 `tools/cn_compat/version.json` 作为版本号唯一来源，命令行不再需要传 `-Version`；打包时检查原生回执、兼容数据、生成代码三者一致。可用 `-OutputDir` 将不同版本存入不同的本地构建目录；签名身份默认始终保存在原 `build-cn-apk/`，不随输出目录改变，也不提交到仓库。
 
 ## 0.5.10-cn.2 发布
 
 `0.5.10-cn.2` / versionCode 5 在 0.5.10 基线上加了几何命令包快路径（`src/kernel/nv2a_pb_scan.c`、`src/nv2a_gl/nv2a_gl.c`）、可选性能浮层，并把内嵌文字从 409 处补齐到 534 处。因为文本属于数据改动，`port/recomp/gen` 生成的 C 与上一版逐字节相同，只有 `cn_codegen.sha256` 指向新的 `target_sha256`：`d523d10e60e759d1a7f71d27aeb4ea4d64c0cf1837a7c4cb5fd55292c2fc04d3`。
 
-打包此版本需要 SDK 的 `build-tools;36.0.0` 与 `platforms;android-36`（`build_apk.ps1` 硬编码这两个路径），以及 PowerShell 7：Windows PowerShell 5.1 的默认执行策略会拒绝运行脚本。
+打包此版本需要 SDK 的 `build-tools;36.0.0` 与 `platforms;android-36`（脚本固定使用这两个组件，缺失时直接报错并给出 `sdkmanager` 命令），以及 PowerShell 7：Windows PowerShell 5.1 的默认执行策略会拒绝运行脚本。
 
 验证记录：汉化单测 10 项通过；`verify_codegen` 覆盖 1,545 个映射编码与全部 65,536 个输入；Android 构建通过；APK 覆盖安装到骁龙 865 设备后日志版本为 `0.5.10-cn.2`，实测 40–60 帧浮动（该平台低于上游建议的骁龙 8 Gen 1）。目标设备为骁龙 8 Gen 2 及以上。
 
 不要把另一台机器的 `build*/` 目录复制过来复用：CMake 缓存里记录的是绝对路径，跨机器会直接报 `CMakeCache.txt ... different than the directory`，必须清空重建。
+
+## 版本、签名与构建报告
+
+两台机器交替开发时，靠记忆对齐版本号、签名和环境并不可靠。以下四点由脚本强制，不再依赖人工约定：
+
+- **版本号单一来源**：`tools/cn_compat/version.json` 同时保存 `version` 与 `versionCode`，`build_native.ps1`、`build_apk.ps1` 都从这里读取；命令行传不同值会被拒绝（`-AllowVersionOverride` 只用于一次性本地验证，并且会写进报告）。发新版本只改这一个文件。
+- **签名身份单一**：`tools/cn_compat/signing.json` 记录发布证书的 SHA256 指纹与 DN。keystore 不存在时脚本直接报错，不再静默新建；`-AllowNewIdentity` 才会生成一次性身份，并明确提示该包装不上已有安装。签名后从 APK 里读回证书指纹与 `signing.json` 比对，不一致就拒绝产出。
+- **构建报告**：`build_apk.ps1` 结束时写出 `build-cn-apk/build-report.json` 和同名 `.apk.sha256`，含 `source_commit` / `source_dirty` / 分支、`profile_target_sha256`、`gen_stamp`、`libmain.so` 哈希、`cert_sha256`、版本与 `versionCode`、NDK 与 build-tools 版本、构建机与时间。两台机器各跑一次再对比报告，即可判断产物是否同源。
+- **已发布版本号不可复用**：若 `v<version>` 标签存在且不是 HEAD 的祖先，脚本拒绝打包，必须先改 `version.json`。标签之后的文档提交不影响重打包，这与「标签钉构建提交」的既有约定一致。
+
+回执中的 `gen_stamp` 让 `build_apk.ps1` 能拒绝「兼容数据与生成代码不同源」的组合；旧回执缺少该字段时会提示重跑 `build_native.ps1`。`build-report.json`、`.apk.sha256` 与 keystore 都在忽略目录，只做本地溯源，不提交 Git。
 
 ## 同步流程
 

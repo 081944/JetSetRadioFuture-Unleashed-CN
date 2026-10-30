@@ -29,8 +29,11 @@
 
 - `prepare.py`：构造局部移植后的重编译输入和内存转换表。
 - `generate.py`：执行 XBE 解析、反汇编、函数识别、ABI 分析和 C 生成；不生成 APK。
+- `version.json`：版本号与 `versionCode` 的唯一来源，两个构建脚本都从这里读。
+- `version.ps1`：被两个脚本点源引用的公共函数（版本读取、Git 状态、JSON 输出）。
+- `signing.json`：发布签名证书的 SHA256 指纹，用于校验构建机上的 keystore 是否仍是同一身份。
 - `build_native.ps1`：通过 PowerShell 进行 Android ARM64 原生库编译；不打包 APK。
-- `build_apk.ps1`：把匹配当前兼容数据的原生库打成签名测试 APK，直接调用 SDK 的 Java 入口，避免执行 `.bat`。测试签名保存在本地输出目录，供后续更新使用。
+- `build_apk.ps1`：把匹配当前兼容数据的原生库打成签名 APK，直接调用 SDK 的 Java 入口，避免执行 `.bat`。签名保存在本地输出目录，供后续更新使用；打包结束后自动写出 `build-report.json` 与 `.apk.sha256`。
 - `test_local.py`：使用 Unicorn 执行实际 x86 补丁，检查映射、绘制选择、资源生命周期和栈。
 - `verify_codegen.py`：把字体查找/取用实际转译成 C，使用运行时头文件和 GCC 编译执行，再对比原汉化 x86。
 - `test_loader.c`：测试真实 ISO 预检查、完整内存转换、拒绝损坏/不匹配输入及关闭功能后的行为。
@@ -60,6 +63,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Code generation failed' }
 ```
 
 `test_local.py` 及 `verify_codegen.py` 通过 `JSRF_US_XBE`、`JSRF_CN_XBE` 读取构建者提供的输入。未设置环境变量时保留早期工作区 `../analysis/us.xbe` 与 `../analysis/cn.xbe` 的兼容路径。这些文件不属于仓库源码；`prepare.py` 可直接读取 ISO。
+
+版本号和 `versionCode` 由 `version.json` 提供，两个脚本默认读取，不需要再传 `-Version`；传了不同的值会直接报错（`-AllowVersionOverride` 仅供一次性本地验证）。签名身份缺失时脚本报错而不是新建，`signing.json` 里的证书指纹用来确认 keystore 没被换掉。打包结束会写出 `build-report.json` 与 `.apk.sha256`，可供两台机器对比产物是否同源。更换机器时把 `build-cn-apk/` 下的 keystore 与 `.pass` 用离线方式拷过去即可，构建目录 `build*/` 必须重建。
 
 原生构建必须同时设置：
 
