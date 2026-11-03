@@ -13107,6 +13107,12 @@ static int gfx_init(uint32_t w, uint32_t h)
      * frees them; nothing here touches the renderer. */
     { extern int nv2a_vk_probe(void);
       if (jsrf_getenv("RECOMP_VK_PROBE")) nv2a_vk_probe(); }
+    /* RECOMP_VK_DRIVER_PROBE=1: the first question of the backend that will
+     * replace GL ES is whether a driver with the 1.3 features exists here at
+     * all. Turnip, loaded through libadrenotools, is that driver on an Adreno
+     * whose own stops at 1.1 (port/vk_driver_probe.c). */
+    { extern int nv2a_vk_driver_probe(void);
+      if (jsrf_getenv("RECOMP_VK_DRIVER_PROBE")) nv2a_vk_driver_probe(); }
     /* There is no second window to open: on Android SDL has one, and making a
      * Vulkan one before the GL one (then destroying it) leaves the GL context
      * without a surface -- measured, it dies in the guest at the first frame.

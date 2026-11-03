@@ -77,3 +77,9 @@ cn_codegen.sha256
 *.o
 .env
 .env.*
+
+# Vulkan 驱动与 libadrenotools 的构建产物（见 prebuilt/*README.md）
+prebuilt/*
+!prebuilt/*README.md
+
+

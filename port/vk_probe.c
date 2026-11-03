@@ -12,8 +12,15 @@
  * RECOMP_VK_PROBE=1 runs it once at start-up (setprop
  * debug.jsrf.recomp_vk_probe 1 on a device) and says so in the log. Nothing
  * here touches the renderer: it makes its own objects and frees them.
+ *
+ * It is off unless NV2A_VK_SYSTEM_LOADER is defined, and that is the point:
+ * calling the vk* functions by name makes libmain.so depend on the system's
+ * libvulkan.so, which loads that loader before libadrenotools can put Turnip
+ * in its place -- measured, the driver probe then gets no entry points out of
+ * the patched loader. The driver probe (vk_driver_probe.c) needs no such
+ * dependency and covers the same ground through whichever driver is chosen.
  */
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) && defined(NV2A_VK_SYSTEM_LOADER)
 
 #include <stdarg.h>
 #include <stdint.h>

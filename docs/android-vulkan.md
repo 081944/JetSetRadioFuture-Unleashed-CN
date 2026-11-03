@@ -48,7 +48,29 @@
 所以 dynamic rendering、synchronization2、push descriptor 这些 1.3 特性在原厂驱动上都没有。
 同样的结论在 NGPort 项目里也有记录：Adreno 6xx 的原厂驱动缺这些，渲染器需要它们。
 
-## Turnip：方案已经确定，缺的是二进制
+## Turnip：已验证可用（2026-11-03）
+
+在 OnePlus 8（Adreno 650）上跑通，走 libadrenotools + TurnipZ 0.3.0
+（`debug.jsrf.recomp_vk_driver_probe 1`，`port/vk_driver_probe.c`）：
+
+```
+[VKD] native dir /data/app/.../lib/arm64/
+[VKD] temp dir   /data/user/0/com.jumatt.jsrfunleashed/files
+[VKD] gipa(NULL): create 0x77747e4014, instance extensions 0x77747e5470, instance version 0x77747e6030
+[VKD] device 0: Turnip Adreno (TM) 650 (Vulkan 1.3.363, driver 0x06863063)
+[VKD] OK: Turnip loads and reports Vulkan 1.3 or newer
+```
+
+两条踩过的坑，写下来免得再犯：
+
+- **`libmain.so` 不能硬依赖 `libvulkan.so`**。只要按名字调用 `vk*` 函数，链接就会写进
+  `DT_NEEDED`，系统 loader 在 libadrenotools 打补丁之前就被加载，补丁失效——现象是
+  `gipa(NULL, "vkCreateInstance")` 拿不到入口。所以 `port/vk_probe.c`（那个走系统 loader 的）
+  现在只在定义 `NV2A_VK_SYSTEM_LOADER` 时才编译。
+- **实例级函数要用 `gipa(instance, …)` 取**，`gipa(NULL, …)` 只给 `vkCreateInstance`、
+  `vkEnumerateInstanceExtensionProperties` 这类全局入口。第一版探针在这上面误判过一次。
+
+## Turnip：方案（NGPort 已验证的配方）
 
 NGPort（`E:\HH\NGPort\zh-work`）已经把这套跑通了，可以照搬：
 

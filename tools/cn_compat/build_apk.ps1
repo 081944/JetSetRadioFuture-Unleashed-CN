@@ -138,11 +138,26 @@ Invoke-Tool $java @('-cp', "$bt/lib/d8.jar", 'com.android.tools.r8.D8', '--relea
     '--lib', $androidJar, '--output', "$work/dex", "@$work/classes.txt")
 Copy-Item -LiteralPath "$native/engine/libmain.so" -Destination "$work/lib/arm64-v8a/libmain.so"
 Copy-Item -LiteralPath "$native/sdl-install/lib/libSDL2.so" -Destination "$work/lib/arm64-v8a/libSDL2.so"
+# AdrenoTools' hooks and, when present, the Turnip driver: native libraries
+# like any other, and Android extracts them because extractNativeLibs is true,
+# which is exactly the folder libadrenotools is told to install its hooks in.
+# They are not built here -- prebuilt/README.md says where they come from.
+$extraLibs = @()
+$prebuiltDir = Join-Path $repoRoot 'prebuilt/arm64-v8a'
+if (Test-Path -LiteralPath $prebuiltDir) {
+    foreach ($f in Get-ChildItem -LiteralPath $prebuiltDir -Filter '*.so') {
+        Copy-Item -LiteralPath $f.FullName -Destination "$work/lib/arm64-v8a/$($f.Name)"
+        $extraLibs += $f.Name
+    }
+    Write-Host ("Prebuilt libraries: " + ($extraLibs -join ', '))
+}
 Invoke-Tool $strip @('--strip-unneeded', "$work/lib/arm64-v8a/libmain.so", "$work/lib/arm64-v8a/libSDL2.so")
 Copy-Item -LiteralPath "$work/base.apk" -Destination "$work/unsigned.apk"
 $archive = [IO.Compression.ZipFile]::Open("$work/unsigned.apk", [IO.Compression.ZipArchiveMode]::Update)
 try {
-    foreach ($name in @('dex/classes.dex', 'lib/arm64-v8a/libmain.so', 'lib/arm64-v8a/libSDL2.so')) {
+    $entries = @('dex/classes.dex', 'lib/arm64-v8a/libmain.so', 'lib/arm64-v8a/libSDL2.so')
+    foreach ($n in $extraLibs) { $entries += "lib/arm64-v8a/$n" }
+    foreach ($name in $entries) {
         $entry = if ($name -eq 'dex/classes.dex') { 'classes.dex' } else { $name }
         [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, "$work/$name", $entry,
             [IO.Compression.CompressionLevel]::Optimal) | Out-Null

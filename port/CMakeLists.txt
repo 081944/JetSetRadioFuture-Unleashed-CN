@@ -156,14 +156,32 @@ if(ANDROID)
         cn_compat.c
         android/jsrf_android.c
         vk_probe.c
+        vk_driver_probe.c
         ios/xiso.c
         ${JSRF_GEN_SOURCES}
     )
     set_target_properties(jsrf_recomp PROPERTIES OUTPUT_NAME main)
-    # The Vulkan smoke test (port/vk_probe.c). The NDK ships the headers and
-    # the loader stub, so whether a Vulkan backend can exist here is a question
-    # a device can answer before one is written.
-    target_link_libraries(jsrf_recomp PRIVATE vulkan)
+    # No link against libvulkan: calling the vk* functions by name would put a
+    # DT_NEEDED on the system loader, which then loads before libadrenotools can
+    # put Turnip in its place -- measured, the patched loader hands out no entry
+    # points. Everything Vulkan here goes through libadrenotools' own loader.
+    # (port/vk_probe.c, the one probe that did link it, is off unless
+    # NV2A_VK_SYSTEM_LOADER is defined.)
+    # libadrenotools, built from bylaws/libadrenotools at 8fae8ce with the same
+    # NDK (prebuilt/adrenotools; see prebuilt/README.md). It is how Turnip gets
+    # loaded -- the system's loader opening another driver for this app alone --
+    # and the hooks it installs are native libraries that travel in the APK.
+    set(JSRF_ADRENOTOOLS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../prebuilt/adrenotools")
+    if(EXISTS "${JSRF_ADRENOTOOLS_DIR}/lib/libadrenotools.a")
+        target_include_directories(jsrf_recomp PRIVATE "${JSRF_ADRENOTOOLS_DIR}/include")
+        target_link_libraries(jsrf_recomp PRIVATE
+            "${JSRF_ADRENOTOOLS_DIR}/lib/libadrenotools.a"
+            "${JSRF_ADRENOTOOLS_DIR}/lib/liblinkernsbypass.a"
+            c++_static c++abi dl)
+        message(STATUS "AdrenoTools: ${JSRF_ADRENOTOOLS_DIR}")
+    else()
+        message(STATUS "AdrenoTools: absent (Turnip cannot be loaded; see prebuilt/README.md)")
+    endif()
 else()
     add_executable(jsrf_recomp
         main.c
