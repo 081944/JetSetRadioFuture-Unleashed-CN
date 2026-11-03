@@ -21,6 +21,27 @@
 取 `build-adrenotools/libadrenotools.a`、`lib/linkernsbypass/liblinkernsbypass.a`、
 `include/adrenotools/`，以及 `src/hook/` 下四个 `.so`。
 
+
+## glslang/
+
+`libglslang.a`、`libglslang-default-resource-limits.a` 和 `include/glslang/`，来自
+
+    github.com/KhronosGroup/glslang 16.0.0
+
+同样用本项目的 NDK 编（静态、关掉优化器，能省一半体积）：
+
+    cmake -S glslang-16.0.0 -B build-glslang -G Ninja \
+      -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+      -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 \
+      -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+      -DENABLE_OPT=OFF -DENABLE_HLSL=ON -DGLSLANG_TESTS=OFF
+    cmake --build build-glslang --target install
+
+装完用 `llvm-strip --strip-debug` 过一遍（76 MB → 7 MB）。
+
+Vulkan 要 SPIR-V，而渲染器是运行时按状态拼 GLSL，所以编译器必须在引擎里：
+`port/vk_shader.c`。`setprop debug.jsrf.recomp_vk_spirv_test 1` 会在启动时编一对
+测试着色器并报字数。
 ## arm64-v8a/
 
 - `libmain_hook.so`、`libhook_impl.so`、`libgsl_alloc_hook.so`、`libfile_redirect_hook.so`

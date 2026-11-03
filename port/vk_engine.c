@@ -143,6 +143,8 @@ int nv2a_vk_engine_start(int want_w, int want_h)
     (void)want_w;
     (void)want_h;
 
+    {   extern int nv2a_vk_spirv_test(void);
+        if (vke_switch_on("RECOMP_VK_SPIRV_TEST")) nv2a_vk_spirv_test(); }
     if (!vke_native_dir(lib_dir, sizeof lib_dir)) { vke("no native dir"); return 0; }
     handle = adrenotools_open_libvulkan(RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM,
                                         NULL, lib_dir, lib_dir, VKE_LIB, NULL, NULL);

@@ -160,6 +160,7 @@ if(ANDROID)
         vk_demo.c
         vk_engine.c
         nv2a_vk_gfx.c
+        vk_shader.c
         ios/xiso.c
         ${JSRF_GEN_SOURCES}
     )
@@ -184,6 +185,19 @@ if(ANDROID)
         message(STATUS "AdrenoTools: ${JSRF_ADRENOTOOLS_DIR}")
     else()
         message(STATUS "AdrenoTools: absent (Turnip cannot be loaded; see prebuilt/README.md)")
+    endif()
+    # glslang, built from KhronosGroup/glslang 16.0.0 with this project's NDK
+    # (prebuilt/README.md). Vulkan takes SPIR-V and the renderer generates GLSL
+    # at run time, so the compiler has to travel in the engine.
+    set(JSRF_GLSLANG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../prebuilt/glslang")
+    if(EXISTS "${JSRF_GLSLANG_DIR}/lib/libglslang.a")
+        target_include_directories(jsrf_recomp PRIVATE "${JSRF_GLSLANG_DIR}/include")
+        target_link_libraries(jsrf_recomp PRIVATE
+            "${JSRF_GLSLANG_DIR}/lib/libglslang.a"
+            "${JSRF_GLSLANG_DIR}/lib/libglslang-default-resource-limits.a")
+        message(STATUS "glslang: ${JSRF_GLSLANG_DIR}")
+    else()
+        message(STATUS "glslang: absent (Vulkan shaders cannot be compiled; see prebuilt/README.md)")
     endif()
 else()
     add_executable(jsrf_recomp
