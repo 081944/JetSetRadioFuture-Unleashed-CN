@@ -494,6 +494,7 @@ static int g_imm_drawing;
  */
 typedef struct {
     double tex, verts, vbo, unif, draw, state;
+    double hash;            /* the vertex cache's content hash, per draw */
     double whole_draw;      /* all of do_draw, the above included */
     double present, pace;   /* at the flip: showing the frame, waiting for its time */
     unsigned n_draws, n_const_upload, n_prog_switch, n_tex_upload, n_tex_lookup;
@@ -566,16 +567,18 @@ static void prof_report(void)
         d.unif  = g_prof.unif  - prev.unif;
         d.draw  = g_prof.draw  - prev.draw;
         d.state = g_prof.state - prev.state;
+        d.hash  = g_prof.hash  - prev.hash;
         d.whole_draw = g_prof.whole_draw - prev.whole_draw;
         d.present = g_prof.present - prev.present;
         d.pace    = g_prof.pace    - prev.pace;
         jsrf_dbg_log(
             "[GLPROF] %.0f draws/s | tex %4.1f%%  verts %4.1f%%  vbo %4.1f%%  "
-            "uniforms %4.1f%%  glDraw %4.1f%%  state %4.1f%%  (rest %4.1f%%)\n",
+            "uniforms %4.1f%%  glDraw %4.1f%%  state %4.1f%%  hash %4.1f%%  (rest %4.1f%%)\n",
             (g_prof.n_draws - prev.n_draws) / dt,
             100 * d.tex / dt, 100 * d.verts / dt, 100 * d.vbo / dt,
             100 * d.unif / dt, 100 * d.draw / dt, 100 * d.state / dt,
-            100 * (dt - d.tex - d.verts - d.vbo - d.unif - d.draw - d.state) / dt);
+            100 * d.hash / dt,
+            100 * (dt - d.tex - d.verts - d.vbo - d.unif - d.draw - d.state - d.hash) / dt);
         /* Where the rest goes: the draws' own work outside the calls above
          * (finding the program, the uniforms by name, the bookkeeping), and
          * the flip -- showing the frame, and waiting for its moment. */
@@ -586,7 +589,7 @@ static void prof_report(void)
             (g_prof.n_draws - prev.n_draws)
                 ? 1e6 * d.whole_draw / (g_prof.n_draws - prev.n_draws) : 0.0,
             (g_prof.n_draws - prev.n_draws)
-                ? 1e6 * (d.whole_draw - d.tex - d.verts - d.vbo - d.unif - d.draw - d.state)
+                ? 1e6 * (d.whole_draw - d.tex - d.verts - d.vbo - d.unif - d.draw - d.state - d.hash)
                   / (g_prof.n_draws - prev.n_draws) : 0.0,
             100 * d.present / dt, 100 * d.pace / dt);
         /* The remainder from the line above, split into the three stretches
@@ -662,6 +665,30 @@ static void prof_report(void)
         jsrf_dbg_log( "[GLPROF]   geometry packet path: %lu packets, %lu words per second\n",
                 (unsigned long)((g_prof.geometry_packets - prev.geometry_packets) / dt),
                 (unsigned long)((g_prof.geometry_words - prev.geometry_words) / dt));
+        /* Where the walk's words went: the three run paths, and one dispatch
+         * per word. The last is the only one a per-method change can reach. */
+        { static unsigned long lp, lt, li, ls;
+          unsigned long pp = 0, pt = 0, pi = 0, ps = 0;
+          extern void nv2a_pb_word_split(unsigned long *, unsigned long *,
+                                         unsigned long *, unsigned long *);
+          nv2a_pb_word_split(&pp, &pt, &pi, &ps);
+          jsrf_dbg_log("[GLPROF]   words/s: packet %lu, transform %lu, indices %lu, "
+                       "per-word %lu\n",
+                       (unsigned long)((pp - lp) / dt), (unsigned long)((pt - lt) / dt),
+                       (unsigned long)((pi - li) / dt), (unsigned long)((ps - ls) / dt));
+          lp = pp; lt = pt; li = pi; ls = ps; }
+        /* RECOMP_PB_TIMESPLIT=1: how long each of those paths took, in
+         * milliseconds a second -- the walk's share of the frame, split. */
+        { static double tp, tt, ti, ts;
+          double d0 = 0.0, d1 = 0.0, d2 = 0.0, d3 = 0.0;
+          extern void nv2a_pb_time_split(double *, double *, double *, double *);
+          nv2a_pb_time_split(&d0, &d1, &d2, &d3);
+          jsrf_dbg_log("[GLPROF]   walk ms/s: packet %.1f, transform %.1f, "
+                       "indices %.1f, per-word %.1f (of %.1f)\n",
+                       1000.0 * (d0 - tp), 1000.0 * (d1 - tt), 1000.0 * (d2 - ti),
+                       1000.0 * (d3 - ts),
+                       1000.0 * ((d0 - tp) + (d1 - tt) + (d2 - ti) + (d3 - ts)));
+          tp = d0; tt = d1; ti = d2; ts = d3; }
         fflush(stderr);
         last = now; prev = g_prof;
     }
@@ -5055,9 +5082,16 @@ static struct {
 
 static uint64_t vc_rotl(uint64_t x, int r) { return (x << r) | (x >> (64 - r)); }
 
+#if defined(NV2A_HASH_WIDE)
+static void vc_hash_check(void);
+static int  vc_hash_check_wanted(void);
+static int  vc_hash_scalar_wanted(void);
+#endif
+
 /* A 64-bit hash of n bytes, four lanes wide (xxHash64's round): a few GB/s,
  * which is what makes checking the source of every kept draw affordable.
- * From NV2A_HASH_MIN bytes on x86-64, the wider one in nv2a_hash.h. */
+ * From NV2A_HASH_MIN bytes on x86-64 and arm64, the wider one in
+ * nv2a_hash.h. */
 static uint64_t vc_hash(const void *data, size_t n, uint64_t seed)
 {
     const uint64_t P1 = 0x9E3779B185EBCA87ull, P2 = 0xC2B2AE3D27D4EB4Full,
@@ -5066,7 +5100,9 @@ static uint64_t vc_hash(const void *data, size_t n, uint64_t seed)
     uint64_t a = seed + P1 + P2, b = seed + P2, c = seed, d = seed - P1, h, w;
     size_t len = n;
 #if defined(NV2A_HASH_WIDE)
-    if (n >= NV2A_HASH_MIN) return nv2a_hash_wide(data, n, seed);
+    if (vc_hash_check_wanted()) vc_hash_check();
+    if (n >= NV2A_HASH_MIN && !vc_hash_scalar_wanted())
+        return nv2a_hash_wide(data, n, seed);
 #endif
     while (n >= 32) {
         uint64_t w0, w1, w2, w3;
@@ -5089,6 +5125,53 @@ static uint64_t vc_hash(const void *data, size_t n, uint64_t seed)
     h ^= h >> 33; h *= P2; h ^= h >> 29; h *= P3; h ^= h >> 32;
     return h;
 }
+
+#if defined(NV2A_HASH_WIDE)
+/* RECOMP_VC_HASH_CHECK=1: once, the wider hash is computed both by the path
+ * this build runs and by the plain-C steps it is defined to be (nv2a_hash.h),
+ * over lengths a draw's vertices take, at three alignments. One line either
+ * way: the lengths agree, or the first one that does not. */
+static void vc_hash_check(void)
+{
+    static int done;
+    static uint8_t buf[NV2A_HASH_MIN * 24 + 3];
+    size_t n, off, i;
+
+    if (done) return;
+    done = 1;
+    for (i = 0; i < sizeof buf; i++) buf[i] = (uint8_t)(i * 131u + 7u);
+    for (off = 0; off < 3; off++) {
+        for (n = NV2A_HASH_MIN; n <= sizeof buf - off; n += 37) {
+            uint64_t a = nv2a_hash_wide(buf + off, n, 0x1234567890ABCDEFull);
+            uint64_t b = nv2a_hash_ref(buf + off, n, 0x1234567890ABCDEFull);
+            if (a != b) {
+                jsrf_dbg_log("[VC] hash check: MISMATCH at %u bytes (offset %u): %016llx vs %016llx\n",
+                             (unsigned)n, (unsigned)off,
+                             (unsigned long long)a, (unsigned long long)b);
+                return;
+            }
+        }
+    }
+    jsrf_dbg_log("[VC] hash check: the vector path and the plain-C steps agree from %u to %u bytes\n",
+                 (unsigned)NV2A_HASH_MIN, (unsigned)(sizeof buf - 2));
+}
+
+static int vc_hash_check_wanted(void)
+{
+    static int want = -1;
+    if (want < 0) want = jsrf_getenv("RECOMP_VC_HASH_CHECK") ? 1 : 0;
+    return want;
+}
+
+/* RECOMP_VC_HASH_SCALAR=1: the narrower loop, as arm64 had it before the
+ * vector path, so the two can be measured against each other in one install. */
+static int vc_hash_scalar_wanted(void)
+{
+    static int want = -1;
+    if (want < 0) want = jsrf_getenv("RECOMP_VC_HASH_SCALAR") ? 1 : 0;
+    return want;
+}
+#endif
 
 static uint64_t vc_mix(uint64_t h, uint64_t v)
 {
@@ -5317,10 +5400,12 @@ static uint64_t vc_content(const VtxLive *live, int nlive, uint32_t lo, uint32_t
             ns++;
         }
     }
-    for (s = 0; s < ns; s++) {
-        h = vc_hash(sp[s].from, (size_t)(sp[s].to - sp[s].from), h);
-        g_vc_st.hashed += (unsigned long long)(sp[s].to - sp[s].from);
-    }
+    { PROF_T0();
+      for (s = 0; s < ns; s++) {
+          h = vc_hash(sp[s].from, (size_t)(sp[s].to - sp[s].from), h);
+          g_vc_st.hashed += (unsigned long long)(sp[s].to - sp[s].from);
+      }
+      PROF_ADD(hash); }
     return h;
 }
 
@@ -5386,7 +5471,9 @@ static uint32_t vc_prepare(const VtxLive *live, int nlive, uint32_t stride_float
     key = vc_mix(key, lo | ((uint64_t)nuniq << 32));
     key = vc_mix(key, n);
     if (!seq) {
+        PROF_T0();
         key = vc_mix(key, vc_hash(ix, (size_t)n * 4, key));
+        PROF_ADD(hash);
         g_vc_st.hashed += (unsigned long long)n * 4;
     }
     /* ...and whether what it is made of is still what it was. */

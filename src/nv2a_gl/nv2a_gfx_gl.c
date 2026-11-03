@@ -1092,6 +1092,13 @@ static int glx_uniform_f_part(int id, int first, const float *v, int n)
 static uint32_t g_tex_unit[TEXUNITS];
 static int      g_tex_unit_set[TEXUNITS];
 
+/* The vertex array object bound now, so a draw that keeps the one before it
+ * does not ask the driver to validate a bind it already has. Every other
+ * per-draw GL object here is cached this way (programs, textures, uniforms);
+ * this one was bound on every draw, and on a phone a redundant VAO bind is a
+ * pipeline re-validation inside the driver, not a no-op. */
+static GLuint g_cur_vao;
+
 static void glx_texture_invalidate(void)
 {
     memset(g_tex_unit_set, 0, sizeof g_tex_unit_set);
@@ -1187,6 +1194,7 @@ static void glx_state_invalidate(void)
     g_last_stencil_reset = 1;
     g_last_clamp = -1;
     g_last_poff = -1;
+    g_cur_vao = 0;                  /* whatever is bound, it is not known now */
 }
 
 /* The per-draw state, still compared against what was last set rather than
@@ -1428,13 +1436,28 @@ static void set_consts(uint32_t draw_layout, uint32_t const_mask,
     }
 }
 
+/* The vertex array object bound now: see g_cur_vao. */
+static void bind_vao(GLuint vao)
+{
+    if (vao == g_cur_vao) return;
+    glBindVertexArray(vao);
+    g_cur_vao = vao;
+}
+
+/* Binding past the cache: the bound object is no longer known. */
+static void binda_vao(GLuint vao)
+{
+    glBindVertexArray(vao);
+    g_cur_vao = 0;
+}
+
 static void glx_vertices(const float *v, uint32_t nverts, uint32_t stride_floats,
                          const int attr_at[16], uint32_t const_mask,
                          const float const_attr[16][4])
 {
     uint32_t layout;
 
-    glBindVertexArray(g_vao);
+    bind_vao(g_vao);
     glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
     glBufferData(GL_ARRAY_BUFFER,
                  (GLsizeiptr)nverts * stride_floats * sizeof(float),
@@ -1519,7 +1542,7 @@ static void glx_vbuf_fill(uint32_t h, const float *v, uint32_t vbytes,
         if (!g_vb[h - 1].ibo) {
             glGenBuffers(1, &g_vb[h - 1].ibo);
             /* The index buffer is vertex-array state: attached once. */
-            glBindVertexArray(g_vb[h - 1].vao);
+            binda_vao(g_vb[h - 1].vao);
             glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_vb[h - 1].ibo);
         }
         glBindBuffer(GL_COPY_WRITE_BUFFER, g_vb[h - 1].ibo);
@@ -1535,7 +1558,7 @@ static void glx_vbuf_bind(uint32_t h, uint32_t stride_floats, const int attr_at[
     uint32_t layout;
     if (!vb_ok(h)) return;
     layout = layout_of(stride_floats, attr_at);
-    glBindVertexArray(g_vb[h - 1].vao);
+    bind_vao(g_vb[h - 1].vao);
     if (!g_vb[h - 1].laid_out || g_vb[h - 1].layout != layout) {
         glBindBuffer(GL_ARRAY_BUFFER, g_vb[h - 1].vbo);
         set_pointers(stride_floats, attr_at);
@@ -1634,7 +1657,7 @@ static int glx_init(void)
 {
     glGenVertexArrays(1, &g_vao);
     glGenBuffers(1, &g_vbo);
-    glBindVertexArray(g_vao);
+    binda_vao(g_vao);
     glx_state_invalidate();
     /* AMD's driver on Mesa (radeonsi): the programs without the invariant
      * position, which has been found to do more harm than good there (not
@@ -1883,7 +1906,7 @@ static uint32_t glx_target_smaa(uint32_t h)
     glDisable(GL_CULL_FACE);
     glDisable(GL_SCISSOR_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glBindVertexArray(g_sm.vao);
+    binda_vao(g_sm.vao);
     glViewport(0, 0, (GLsizei)pw, (GLsizei)ph);
     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
 

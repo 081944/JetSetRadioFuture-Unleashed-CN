@@ -25,7 +25,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "../nv2a_gl/nv2a_gl.h"
+#include "../nv2a_gl/jsrf_debug_env.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -39,6 +41,49 @@ static int s_seen_count;
  * looking method numbers out of parameter data, and the counts then describe
  * nothing. Unrecognised words are the tell. */
 static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
+
+/* How many words each path took, counted by the walk itself. The walk's share
+ * of the frame is the biggest single line in the profile, and "words a second"
+ * alone cannot say whether that time is the geometry packet path, the
+ * transform run, the index run, or one dispatch per word -- which is the only
+ * one a per-method optimisation can help. */
+static unsigned long s_words_packet, s_words_transform, s_words_indices, s_words_slow;
+static double s_time_packet, s_time_transform, s_time_indices, s_time_slow;
+
+/* Only under RECOMP_PB_TIMESPLIT: two clock reads a packet would otherwise be
+ * taken out of the very time being measured. */
+static int s_timeit = -1;
+#define PB_TIME_ON() (s_timeit < 0 \
+        ? (s_timeit = jsrf_getenv("RECOMP_PB_TIMESPLIT") != NULL ? 1 : 0) : s_timeit)
+
+static double pb_now(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+
+void nv2a_pb_word_split(unsigned long *packet, unsigned long *transform,
+                        unsigned long *indices, unsigned long *slow);
+void nv2a_pb_word_split(unsigned long *packet, unsigned long *transform,
+                        unsigned long *indices, unsigned long *slow)
+{
+    *packet    = s_words_packet;
+    *transform = s_words_transform;
+    *indices   = s_words_indices;
+    *slow      = s_words_slow;
+}
+
+void nv2a_pb_time_split(double *packet, double *transform, double *indices,
+                        double *slow);
+void nv2a_pb_time_split(double *packet, double *transform, double *indices,
+                        double *slow)
+{
+    *packet    = s_time_packet;
+    *transform = s_time_transform;
+    *indices   = s_time_indices;
+    *slow      = s_time_slow;
+}
 
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
@@ -196,9 +241,9 @@ uint32_t nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
      * -- thousands a second -- and getenv walks the environment doing a string
      * compare per entry every time it is called. */
     if (s_exec_enabled < 0)
-        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
+        s_exec_enabled = jsrf_getenv("RECOMP_PB_EXEC") != NULL;
     if (s_scan_enabled < 0)
-        s_scan_enabled = getenv("RECOMP_PB_SCAN") != NULL;
+        s_scan_enabled = jsrf_getenv("RECOMP_PB_SCAN") != NULL;
     if (!(s_scan_enabled || s_exec_enabled) || end_va <= start_va)
         return 0;
 
@@ -235,7 +280,7 @@ uint32_t nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         if ((w & 3u) == 2u) {
             static int nocall = -1;
             uint32_t tgt = 0x80000000u | ((w & ~3u) & 0x0FFFFFFFu);
-            if (nocall < 0) nocall = getenv("RECOMP_PB_NOCALL") != NULL;
+            if (nocall < 0) nocall = jsrf_getenv("RECOMP_PB_NOCALL") != NULL;
             s_tot_calls++;
             if (s_tot_calls <= 12 || (s_tot_calls & (s_tot_calls - 1)) == 0)
                 fprintf(stderr, "[PB] call #%u at %08X -> %08X%s\n", s_tot_calls,
@@ -264,11 +309,17 @@ uint32_t nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             /* A complete geometry payload has no register changes between its
              * words. Preserve the inventory/software/debug paths verbatim. */
             if (noninc && subch == 0 && s_exec_enabled && !s_scan_enabled &&
-                count > 1 && count <= (end_va - va) / 4 &&
-                nv2a_gl_method_run(method, (const uint32_t *)(mem + va), count)) {
-                va += count * 4;
-                words += count;
-                continue;
+                count > 1 && count <= (end_va - va) / 4) {
+                int took;
+                double t0 = PB_TIME_ON() ? pb_now() : 0.0;
+                took = nv2a_gl_method_run(method, (const uint32_t *)(mem + va), count);
+                if (PB_TIME_ON()) s_time_packet += pb_now() - t0;
+                if (took) {
+                    s_words_packet += count;
+                    va += count * 4;
+                    words += count;
+                    continue;
+                }
             }
 
             /* A run of transform program (0B00-0B7C) or constant (0B80-0BFC)
@@ -283,12 +334,18 @@ uint32_t nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
              * out costs more than the two comparisons. */
             if (subch == 0 && s_exec_enabled && !s_scan_enabled && count > 1
                 && method >= 0x0B00 && method <= 0x0BFC
-                && count <= (end_va - va) / 4
-                && nv2a_gl_transform_run(method, (const uint32_t *)(mem + va),
-                                         count, noninc)) {
-                va += count * 4;
-                words += count;
-                continue;
+                && count <= (end_va - va) / 4) {
+                int took;
+                double t0 = PB_TIME_ON() ? pb_now() : 0.0;
+                took = nv2a_gl_transform_run(method, (const uint32_t *)(mem + va),
+                                             count, noninc);
+                if (PB_TIME_ON()) s_time_transform += pb_now() - t0;
+                if (took) {
+                    s_words_transform += count;
+                    va += count * 4;
+                    words += count;
+                    continue;
+                }
             }
 
             /* A run of index words goes to the executor whole: more than half
@@ -311,11 +368,16 @@ uint32_t nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
                 if (n > count) n = count;
                 if (n)
                     nv2a_pb_exec_indices(subch, method, (const uint32_t *)(mem + va), n);
+                s_words_indices += n;
                 va += n * 4;
                 words += n;
                 continue;
             }
-            for (uint32_t i = 0; i < count && va < end_va; i++) {
+            { int per_word = s_exec_enabled && !(noninc && subch == 0 &&
+                  count > 1 && count <= (end_va - va) / 4);
+              double t0 = (per_word && PB_TIME_ON()) ? pb_now() : 0.0;
+              for (uint32_t i = 0; i < count && va < end_va; i++) {
+                s_words_slow++;
                 uint32_t m = noninc ? method : method + i * 4;
                 /* The inventory is only ever printed under RECOMP_PB_SCAN, so
                  * when nobody is going to read it, do not build it. */
@@ -328,7 +390,8 @@ uint32_t nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
                                         *(const uint32_t *)(mem + va));
                 va += 4;
                 words++;
-            }
+              }
+              if (per_word && PB_TIME_ON()) s_time_slow += pb_now() - t0; }
             continue;
         }
         unknown++;

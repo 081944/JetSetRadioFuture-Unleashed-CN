@@ -34,13 +34,23 @@
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(_M_AMD64)
 #define NV2A_HASH_WIDE 1
+#define NV2A_HASH_X86 1
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#define NV2A_HASH_WIDE 1
+#define NV2A_HASH_NEON 1
 #endif
 
 #if defined(NV2A_HASH_WIDE)
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
+#if defined(NV2A_HASH_X86)
 #include <emmintrin.h>
+#endif
+#if defined(NV2A_HASH_NEON)
+#include <arm_neon.h>
+#endif
 #if (defined(__GNUC__) || defined(__clang__)) && ((defined(__linux__) && !defined(__ANDROID__)) || defined(_WIN32))
 #define NV2A_HASH_AVX2 1
 #include <immintrin.h>
@@ -101,6 +111,7 @@ static inline uint64_t nv2a_hash_end(const uint64_t lane[8], size_t n)
     return h;
 }
 
+#if defined(NV2A_HASH_X86)
 /* With SSE2, two lanes to a register, four registers. A step's 16 bytes
  * into a register's two lanes: */
 static inline __m128i nv2a_hash_step(__m128i acc, const uint8_t *p, const uint64_t *k)
@@ -153,6 +164,7 @@ static inline uint64_t nv2a_hash_sse2(const void *data, size_t n, uint64_t seed)
     _mm_storeu_si128((__m128i *)(void *)(lane + 6), a3);
     return nv2a_hash_end(lane, n);
 }
+#endif /* NV2A_HASH_X86 */
 
 #if defined(NV2A_HASH_AVX2)
 /* The same with AVX2, four lanes to a register, two registers. */
@@ -210,15 +222,119 @@ static uint64_t nv2a_hash_avx2(const void *data, size_t n, uint64_t seed)
 }
 #endif
 
+#if defined(NV2A_HASH_NEON)
+/* The same steps on arm64: two lanes to a 128-bit register, four registers,
+ * as SSE2 has them. A 32-by-32-bit product is vmull_u32 (two 64-bit results
+ * from two 32-bit lanes); the two lanes' data swapped, which SSE2 gets from a
+ * shuffle, is vextq_u64(d, d, 1).
+ *
+ * 300 MB a second of hashing on a phone is where this pays: the scalar loop
+ * it replaces asks for every byte twice and multiplies 64 bits at a time. */
+static inline uint64x2_t nv2a_hash_step_neon(uint64x2_t acc, const uint8_t *p,
+                                             const uint64_t *k)
+{
+    uint64x2_t d  = vld1q_u64((const uint64_t *)(const void *)p);
+    uint64x2_t dk = veorq_u64(d, vld1q_u64((const uint64_t *)(const void *)k));
+    /* Each lane's low 32 bits times its high 32: the 32-by-32 multiply. */
+    uint64x2_t prod = vmull_u32(vmovn_u64(dk), vmovn_u64(vshrq_n_u64(dk, 32)));
+    uint64x2_t sw = vextq_u64(d, d, 1);            /* the two lanes swapped */
+    return vaddq_u64(acc, vaddq_u64(prod, sw));
+}
+
+static inline uint64x2_t nv2a_hash_scramble_neon(uint64x2_t acc, const uint64_t *k)
+{
+    const uint32x2_t mul = vdup_n_u32(NV2A_HASH_MUL);
+    uint64x2_t a  = veorq_u64(veorq_u64(acc, vshrq_n_u64(acc, 47)),
+                              vld1q_u64((const uint64_t *)(const void *)k));
+    uint64x2_t lo = vmull_u32(vmovn_u64(a), mul);
+    uint64x2_t hi = vmull_u32(vmovn_u64(vshrq_n_u64(a, 32)), mul);
+    return vaddq_u64(lo, vshlq_n_u64(hi, 32));
+}
+
+#define NV2A_HASH_STEP_NEON(p, k) do { \
+        a0 = nv2a_hash_step_neon(a0, (p), (k));          a1 = nv2a_hash_step_neon(a1, (p) + 16, (k) + 2); \
+        a2 = nv2a_hash_step_neon(a2, (p) + 32, (k) + 4); a3 = nv2a_hash_step_neon(a3, (p) + 48, (k) + 6); \
+    } while (0)
+
+static inline uint64_t nv2a_hash_neon(const void *data, size_t n, uint64_t seed)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    const uint64_t *k = nv2a_hash_key, *ks = k + NV2A_HASH_SCRAMBLE;
+    const size_t block = (size_t)NV2A_HASH_STEP * NV2A_HASH_STEPS;
+    size_t blocks = (n - 1) / block, steps = (n - 1) % block / NV2A_HASH_STEP, b, s;
+    uint64x2_t a0 = vdupq_n_u64(seed), a1 = a0, a2 = a0, a3 = a0;
+    uint64_t lane[8];
+    for (b = 0; b < blocks; b++, p += block) {
+        for (s = 0; s < NV2A_HASH_STEPS; s++)
+            NV2A_HASH_STEP_NEON(p + s * NV2A_HASH_STEP, k + s);
+        a0 = nv2a_hash_scramble_neon(a0, ks);
+        a1 = nv2a_hash_scramble_neon(a1, ks + 2);
+        a2 = nv2a_hash_scramble_neon(a2, ks + 4);
+        a3 = nv2a_hash_scramble_neon(a3, ks + 6);
+    }
+    for (s = 0; s < steps; s++)
+        NV2A_HASH_STEP_NEON(p + s * NV2A_HASH_STEP, k + s);
+    NV2A_HASH_STEP_NEON((const uint8_t *)data + n - NV2A_HASH_STEP, k + NV2A_HASH_LAST);
+    vst1q_u64(lane + 0, a0);
+    vst1q_u64(lane + 2, a1);
+    vst1q_u64(lane + 4, a2);
+    vst1q_u64(lane + 6, a3);
+    return nv2a_hash_end(lane, n);
+}
+#endif /* NV2A_HASH_NEON */
+
+/* The same steps in plain C, one lane at a time: what the vector paths are
+ * checked against (RECOMP_VC_HASH_CHECK=1), and the definition they must
+ * agree with. Written from the SSE2 code above, lane for lane. */
+static inline uint64_t nv2a_hash_ref(const void *data, size_t n, uint64_t seed)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    const uint64_t *k = nv2a_hash_key, *ks = k + NV2A_HASH_SCRAMBLE;
+    const size_t block = (size_t)NV2A_HASH_STEP * NV2A_HASH_STEPS;
+    size_t blocks = (n - 1) / block, steps = (n - 1) % block / NV2A_HASH_STEP, b, s;
+    uint64_t a[8], lane[8];
+    int i;
+    for (i = 0; i < 8; i++) a[i] = seed;
+
+#define NV2A_HASH_REF_STEP(pp, kk) do { \
+        uint64_t d[8], dk[8]; \
+        for (i = 0; i < 8; i++) memcpy(&d[i], (pp) + i * 8, 8); \
+        for (i = 0; i < 8; i++) { \
+            dk[i] = d[i] ^ (kk)[i]; \
+            lane[i] = (uint64_t)(uint32_t)dk[i] * (uint64_t)(dk[i] >> 32) + d[i ^ 1]; \
+        } \
+        for (i = 0; i < 8; i++) a[i] += lane[i]; \
+    } while (0)
+
+    for (b = 0; b < blocks; b++, p += block) {
+        for (s = 0; s < NV2A_HASH_STEPS; s++)
+            NV2A_HASH_REF_STEP(p + s * NV2A_HASH_STEP, k + s);
+        for (i = 0; i < 8; i++) {
+            uint64_t x = (a[i] ^ (a[i] >> 47)) ^ ks[i];
+            a[i] = (uint64_t)(uint32_t)x * NV2A_HASH_MUL
+                 + (((uint64_t)(uint32_t)(x >> 32) * NV2A_HASH_MUL) << 32);
+        }
+    }
+    for (s = 0; s < steps; s++)
+        NV2A_HASH_REF_STEP(p + s * NV2A_HASH_STEP, k + s);
+    NV2A_HASH_REF_STEP((const uint8_t *)data + n - NV2A_HASH_STEP, k + NV2A_HASH_LAST);
+#undef NV2A_HASH_REF_STEP
+    return nv2a_hash_end(a, n);
+}
+
 /* A 64-bit hash of n bytes, n at least NV2A_HASH_MIN. */
 static inline uint64_t nv2a_hash_wide(const void *data, size_t n, uint64_t seed)
 {
+#if defined(NV2A_HASH_NEON)
+    return nv2a_hash_neon(data, n, seed);
+#else
 #if defined(NV2A_HASH_AVX2)
     static int avx2 = -1;
     if (avx2 < 0) avx2 = __builtin_cpu_supports("avx2") ? 1 : 0;
     if (avx2) return nv2a_hash_avx2(data, n, seed);
 #endif
     return nv2a_hash_sse2(data, n, seed);
+#endif
 }
 
 #endif /* NV2A_HASH_WIDE */
