@@ -10909,6 +10909,28 @@ static void present(int is_frame)
       } }
 #endif
     if (!g_ready || !g_fbo_w || !g_fbo_h || !S.color_offset) return;
+#if defined(NV2A_GLES)
+    /* The rest of this copies the render target's read-back into the title's
+     * surface memory, and there is no read-back without a GL target: the
+     * buffer is made in gl_init, which a Vulkan run never calls. Guarding
+     * here rather than at the copy is what keeps a frame from walking into a
+     * NULL buffer if it arrives before (or instead of) the engine's present
+     * (measured: it did). */
+    { extern int nv2a_vk_engine_active(void);
+      static int said;
+      if (!g_readback) {
+          if (!said) {
+              said = 1;
+              fprintf(stderr, "  [GL] present without a read-back buffer: no GL target "
+                              "(vulkan engine active %d) -- frame counted, nothing copied\n",
+                      nv2a_vk_engine_active());
+          }
+          if (is_frame) S.frames++;
+          S.flips++;
+          S.since_present = 0;
+          return;
+      } }
+#endif
 #ifdef NV2A_GL_HAVE_GL
     /* The frame's GL errors, asked once (see after the draw). */
     if (is_frame && g_is_gl && g_gl_err_reports < 8 && !gl_err_per_draw()) {
@@ -13156,8 +13178,12 @@ static int gfx_init(uint32_t w, uint32_t h)
      * clear until drawing lands. */
     if (v && !strcmp(v, "vulkan")) {
         extern int nv2a_vk_engine_start(int, int);
+        extern int nv2a_vk_engine_active(void);
         extern const Nv2aGfx *nv2a_vk_stub_gfx(void);
-        if (nv2a_vk_engine_start((int)w, (int)h)) {
+        /* Started already, on the thread SDL wants for its window (main.c),
+         * when it could be: this call is on the pushbuffer thread, where
+         * Android will not make a second window. */
+        if (nv2a_vk_engine_active() || nv2a_vk_engine_start((int)w, (int)h)) {
             G = nv2a_vk_stub_gfx();
             g_is_gl = 0;
             fprintf(stderr, "  [GL] backend: %s\n", G->name);

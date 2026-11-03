@@ -600,6 +600,7 @@ void nv2a_vk_engine_frame(void)
         ri.layerCount = 1;
         ri.colorAttachmentCount = 1;
         ri.pColorAttachments = &att;
+        { static int st; if (!st) { st = 1; vke("f1: rendering begin"); } }
         p_begin_rendering(w_cmd, &ri);
         vp.x = 0.0f; vp.y = 0.0f;
         vp.width = (float)w_extent.width;
@@ -610,7 +611,9 @@ void nv2a_vk_engine_frame(void)
         sc.extent = w_extent;
         p_scissor(w_cmd, 0, 1, &sc);
         p_bind_pipeline(w_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, w_pipe);
+        { static int st2; if (!st2) { st2 = 1; vke("f1: draw"); } }
         p_cmd_draw(w_cmd, 3, 1, 0, 0);
+        { static int st3; if (!st3) { st3 = 1; vke("f1: end rendering"); } }
         p_end_rendering(w_cmd);
         b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         b.dstAccessMask = 0;
@@ -640,7 +643,9 @@ void nv2a_vk_engine_frame(void)
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &w_done;
     p_reset(w_dev, 1, &w_fence);
+    { static int st5; if (!st5) { st5 = 1; vke("f1: submit"); } }
     if (p_submit(w_queue, 1, &si, w_fence) != VK_SUCCESS) return;
+    { static int st6; if (!st6) { st6 = 1; vke("f1: wait"); } }
     if (p_wait(w_dev, 1, &w_fence, VK_TRUE, 1000000000ull) != VK_SUCCESS) return;
 
     memset(&pi, 0, sizeof pi);

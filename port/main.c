@@ -32,6 +32,7 @@
  */
 
 #include <stddef.h>
+#include "../src/nv2a_gl/jsrf_debug_env.h"
 #include <stdint.h>
 #include <signal.h>
 #if defined(_WIN32)
@@ -1109,6 +1110,16 @@ int SDL_main(int argc, char **argv);
 int main(int argc, char **argv)
 {
 #if defined(__ANDROID__)
+    /* RECOMP_BACKEND=vulkan: the window, the instance and the swapchain are
+     * made HERE, on the thread SDL wants for a window, not where the renderer
+     * starts (ensure_ready, on the pushbuffer thread: measured, making the
+     * window there produced a surface the driver faulted on at the first
+     * frame). gfx_init then finds the engine already up. */
+    { extern int nv2a_vk_engine_start(int, int);
+      extern int nv2a_vk_engine_active(void);
+      const char *be = jsrf_getenv("RECOMP_BACKEND");
+      if (be && !strcmp(be, "vulkan") && !nv2a_vk_engine_active())
+          nv2a_vk_engine_start(0, 0); }
     /* RECOMP_VK_DEMO=1: the app on Vulkan alone -- its own window taken with
      * SDL_WINDOW_VULKAN, an instance on Turnip's loader, a surface, a
      * swapchain and cleared frames presented -- instead of the game. The
