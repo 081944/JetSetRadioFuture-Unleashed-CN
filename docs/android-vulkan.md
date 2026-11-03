@@ -138,6 +138,30 @@ surface + swapchain，连续 present 清屏帧：
 
 剩下的就是后端本体：把 stub 的 `Nv2aGfx` 接进引擎，让游戏跑在这套 instance/swapchain 上，
 然后 SPIR-V → 管线 → pushbuffer draw。
+
+## 引擎跑在 Vulkan 上（2026-11-03）
+
+`RECOMP_BACKEND=vulkan`（`setprop debug.jsrf.recomp_backend vulkan`）现在走通了：
+
+```
+[GL] backend: Vulkan (window and swapchain; drawing not yet)
+[VKE] device Turnip Adreno (TM) 650 (1.3.363)
+[VKE] swapchain 2400x1080, format 37, 3 images
+```
+
+XBE 加载、目标线程全部在跑；截屏中心与 71% 屏幕是 `(15, 26, 56) = (0.06, 0.10, 0.22)×255`，
+即 `port/vk_engine.c` 的清屏色 —— **帧确实经 Turnip 上屏**。
+
+三处接进引擎的地方：
+
+1. `gfx_init`（[nv2a_gl.c](../../src/nv2a_gl/nv2a_gl.c)）新增 `vulkan` 分支：调
+   `nv2a_vk_engine_start()`，成功后 `G = nv2a_vk_stub_gfx()`、`g_is_gl = 0`；
+2. `present(is_frame)` 开头早退：Vulkan 模式下直接 `nv2a_vk_engine_frame()` 并返回，
+   GL 的 surface 回读、presenter 线程一概不参与（它们也从未启动，因为没走 `gl_init`）；
+3. `port/nv2a_vk_gfx.c` 的 `present` 是空转 —— 帧只由 `present()` 这一处驱动，避免重复上屏。
+
+还没有的：一个 draw 都还没画。`Nv2aGfx` 表里的目标/纹理/程序都是空实现，所以画面是纯清屏色。
+下一步是 SPIR-V 与管线。
 ## 下一步
 
 1. 窗口接管：`RECOMP_BACKEND=vulkan` → `SDL_WINDOW_VULKAN` + instance + surface + swapchain（默认仍走 GL）；

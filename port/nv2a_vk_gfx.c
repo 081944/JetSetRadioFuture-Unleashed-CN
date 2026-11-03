@@ -58,13 +58,11 @@ static void     stub_clear(unsigned mask, const float rgba[4], float depth,
                            uint32_t stencil, const uint32_t rect[4])
 { (void)mask; (void)rgba; (void)depth; (void)stencil; (void)rect; }
 
-/* The present is the one call that is not a stub: it is where the Vulkan
- * window gets its frame. port/vk_engine.c owns the swapchain, and until it
- * exists this is only a weak symbol -- the table still links, and the first
- * frame presents nothing. */
-extern void nv2a_vk_engine_frame(void) __attribute__((weak));
+/* Presenting is not this table's job: nv2a_gl.c's present() hands the frame to
+ * port/vk_engine.c when the Vulkan backend is active, so a call here would put
+ * the same frame up twice. */
 static void     stub_present(uint32_t rt, uint32_t pw, uint32_t ph)
-{ (void)rt; (void)pw; (void)ph; if (nv2a_vk_engine_frame) nv2a_vk_engine_frame(); }
+{ (void)rt; (void)pw; (void)ph; }
 
 static void     stub_report(void) { }
 

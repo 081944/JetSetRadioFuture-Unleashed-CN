@@ -1,0 +1,475 @@
+/*
+ * The Vulkan backend's window and swapchain: the part that has nothing to do
+ * with the title's drawing.
+ *
+ * OpenGL keeps all of this inside nv2a_gl.c -- it makes the SDL window with
+ * SDL_WINDOW_OPENGL, owns the GL context, runs a presenter thread that copies
+ * the frame and swaps. Vulkan cannot share any of it: the window has to be
+ * made with SDL_WINDOW_VULKAN, the instance is Turnip's (libadrenotools),
+ * and the swapchain is ours. So this file owns the window, the instance, the
+ * surface, the device and the swapchain, and nv2a_gl.c asks it for a frame.
+ *
+ * The first milestone is a present that clears: the engine boots, the title
+ * runs, and the screen shows a colour rather than the picture. Drawing comes
+ * after, through nv2a_vk_gfx.c's table.
+ *
+ * What this file knows that was expensive to learn (docs/android-vulkan.md):
+ * one SDL window on Android and it is the one the app was given; the loader
+ * must be Turnip's, so no SDL_Vulkan_LoadLibrary and no system libvulkan; and
+ * VK_USE_PLATFORM_ANDROID_KHR has to precede vulkan.h.
+ */
+#if defined(__ANDROID__)
+
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dlfcn.h>
+
+#define VK_USE_PLATFORM_ANDROID_KHR 1
+#define VK_NO_PROTOTYPES 1
+#include <vulkan/vulkan.h>
+#include <SDL.h>
+#include <SDL_syswm.h>
+#include <android/native_window.h>
+
+#include <adrenotools/driver.h>
+
+#include "../src/nv2a_gl/jsrf_debug_env.h"
+
+#define VKE_LIB "libvulkan_freedreno.so"
+
+static void vke(const char *fmt, ...)
+{
+    char line[400];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    jsrf_dbg_log("[VKE] %s\n", line);
+}
+
+int nv2a_vk_engine_active(void);
+void nv2a_vk_engine_frame(void);
+void nv2a_vk_engine_stop(void);
+
+/* ---- state ------------------------------------------------------------- */
+
+static SDL_Window      *w_win;
+static ANativeWindow   *w_native;
+static VkInstance       w_inst;
+static VkSurfaceKHR     w_surf;
+static VkPhysicalDevice w_phys;
+static VkDevice         w_dev;
+static VkQueue          w_queue;
+static VkSwapchainKHR   w_sc;
+static VkCommandPool    w_pool;
+static VkCommandBuffer  w_cmd;
+static VkSemaphore      w_acq, w_done;
+static VkFence          w_fence;
+static VkImage          w_img[8];
+static VkImageLayout    w_layout[8];
+static uint32_t         w_nimg;
+static VkExtent2D       w_extent;
+static int              w_active;
+
+static PFN_vkGetInstanceProcAddr p_gipa;
+static PFN_vkDestroyInstance              p_destroy_instance;
+static PFN_vkGetDeviceQueue               p_get_queue;
+static PFN_vkDeviceWaitIdle               p_device_idle;
+static PFN_vkDestroySurfaceKHR            p_destroy_surface;
+static PFN_vkDestroySwapchainKHR          p_destroy_swapchain;
+static PFN_vkGetSwapchainImagesKHR        p_sc_images;
+static PFN_vkAcquireNextImageKHR          p_acquire;
+static PFN_vkQueuePresentKHR              p_present;
+static PFN_vkCreateSemaphore              p_sem_new;
+static PFN_vkDestroySemaphore             p_sem_free;
+static PFN_vkCreateFence                  p_fence_new;
+static PFN_vkDestroyFence                 p_fence_free;
+static PFN_vkWaitForFences                p_wait;
+static PFN_vkResetFences                  p_reset;
+static PFN_vkDestroyCommandPool           p_pool_free;
+static PFN_vkBeginCommandBuffer           p_begin;
+static PFN_vkEndCommandBuffer             p_end;
+static PFN_vkCmdPipelineBarrier           p_barrier;
+static PFN_vkCmdClearColorImage           p_clear;
+static PFN_vkQueueSubmit                  p_submit;
+static PFN_vkDestroyDevice                p_destroy_device;
+
+static int vke_switch_on(const char *name)
+{
+    const char *v = jsrf_getenv(name);
+    if (!v || !*v) return 0;
+    return !(v[0] == '0' && !v[1]);
+}
+
+static int vke_native_dir(char *out, size_t n)
+{
+    Dl_info info;
+    char *slash;
+    if (!dladdr((void *)vke_native_dir, &info) || !info.dli_fname) return 0;
+    snprintf(out, n, "%s", info.dli_fname);
+    slash = strrchr(out, '/');
+    if (!slash) return 0;
+    slash[1] = '\0';
+    return 1;
+}
+
+/* ---- start ------------------------------------------------------------- */
+
+int nv2a_vk_engine_start(int want_w, int want_h)
+{
+    char lib_dir[512];
+    void *handle;
+    PFN_vkCreateInstance p_create_instance;
+    PFN_vkEnumeratePhysicalDevices p_enum;
+    PFN_vkGetPhysicalDeviceProperties p_props;
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties p_qf;
+    PFN_vkGetPhysicalDeviceSurfaceSupportKHR p_support;
+    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR p_caps;
+    PFN_vkGetPhysicalDeviceSurfaceFormatsKHR p_formats;
+    PFN_vkGetPhysicalDeviceSurfacePresentModesKHR p_modes;
+    PFN_vkCreateDevice p_create_device;
+    PFN_vkCreateSwapchainKHR p_sc_new;
+    PFN_vkCreateCommandPool p_pool_new;
+    PFN_vkAllocateCommandBuffers p_cmds;
+    uint32_t family = UINT32_MAX, i, n;
+    VkSurfaceFormatKHR fmt;
+    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+    VkResult r;
+    int ok = 0;
+
+    (void)want_w;
+    (void)want_h;
+
+    if (!vke_native_dir(lib_dir, sizeof lib_dir)) { vke("no native dir"); return 0; }
+    handle = adrenotools_open_libvulkan(RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM,
+                                        NULL, lib_dir, lib_dir, VKE_LIB, NULL, NULL);
+    if (!handle) { vke("no %s in %s", VKE_LIB, lib_dir); return 0; }
+    p_gipa = (PFN_vkGetInstanceProcAddr)dlsym(handle, "vkGetInstanceProcAddr");
+    if (!p_gipa) { vke("no vkGetInstanceProcAddr"); return 0; }
+
+    if (SDL_Init(SDL_INIT_VIDEO) != 0 && SDL_WasInit(SDL_INIT_VIDEO) == 0) {
+        vke("SDL video would not start: %s", SDL_GetError());
+        return 0;
+    }
+    w_win = SDL_CreateWindow("JSRF Unleashed", SDL_WINDOWPOS_CENTERED,
+                             SDL_WINDOWPOS_CENTERED, 0, 0,
+                             SDL_WINDOW_VULKAN | SDL_WINDOW_FULLSCREEN_DESKTOP
+                           | SDL_WINDOW_ALLOW_HIGHDPI);
+    if (!w_win) { vke("SDL_CreateWindow(VULKAN): %s", SDL_GetError()); return 0; }
+    {   SDL_SysWMinfo wmi;
+        SDL_VERSION(&wmi.version);
+        if (!SDL_GetWindowWMInfo(w_win, &wmi) || wmi.subsystem != SDL_SYSWM_ANDROID) {
+            vke("no WM info: %s", SDL_GetError());
+            goto fail;
+        }
+        w_native = wmi.info.android.window;
+    }
+    if (!w_native) { vke("SDL has no native window"); goto fail; }
+
+    {   const char *exts[] = { VK_KHR_SURFACE_EXTENSION_NAME,
+                               VK_KHR_ANDROID_SURFACE_EXTENSION_NAME };
+        VkApplicationInfo app;
+        VkInstanceCreateInfo ici;
+        memset(&app, 0, sizeof app);
+        app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+        app.pApplicationName = "JSRF Unleashed";
+        app.apiVersion = VK_API_VERSION_1_3;
+        memset(&ici, 0, sizeof ici);
+        ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+        ici.pApplicationInfo = &app;
+        ici.enabledExtensionCount = 2;
+        ici.ppEnabledExtensionNames = exts;
+        p_create_instance = (PFN_vkCreateInstance)p_gipa(NULL, "vkCreateInstance");
+        if (!p_create_instance) { vke("no vkCreateInstance"); goto fail; }
+        r = p_create_instance(&ici, NULL, &w_inst);
+        if (r != VK_SUCCESS) { vke("vkCreateInstance -> %d", (int)r); goto fail; }
+    }
+    p_destroy_instance = (PFN_vkDestroyInstance)p_gipa(w_inst, "vkDestroyInstance");
+    p_enum = (PFN_vkEnumeratePhysicalDevices)p_gipa(w_inst, "vkEnumeratePhysicalDevices");
+    p_props = (PFN_vkGetPhysicalDeviceProperties)p_gipa(w_inst, "vkGetPhysicalDeviceProperties");
+    p_qf = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)p_gipa(w_inst, "vkGetPhysicalDeviceQueueFamilyProperties");
+    p_support = (PFN_vkGetPhysicalDeviceSurfaceSupportKHR)p_gipa(w_inst, "vkGetPhysicalDeviceSurfaceSupportKHR");
+    p_caps = (PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)p_gipa(w_inst, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+    p_formats = (PFN_vkGetPhysicalDeviceSurfaceFormatsKHR)p_gipa(w_inst, "vkGetPhysicalDeviceSurfaceFormatsKHR");
+    p_modes = (PFN_vkGetPhysicalDeviceSurfacePresentModesKHR)p_gipa(w_inst, "vkGetPhysicalDeviceSurfacePresentModesKHR");
+    p_destroy_surface = (PFN_vkDestroySurfaceKHR)p_gipa(w_inst, "vkDestroySurfaceKHR");
+    {   PFN_vkCreateAndroidSurfaceKHR p_as =
+            (PFN_vkCreateAndroidSurfaceKHR)p_gipa(w_inst, "vkCreateAndroidSurfaceKHR");
+        VkAndroidSurfaceCreateInfoKHR aci;
+        if (!p_as) { vke("no vkCreateAndroidSurfaceKHR"); goto fail; }
+        memset(&aci, 0, sizeof aci);
+        aci.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
+        aci.window = w_native;
+        r = p_as(w_inst, &aci, NULL, &w_surf);
+        if (r != VK_SUCCESS) { vke("vkCreateAndroidSurfaceKHR -> %d", (int)r); goto fail; }
+    }
+    n = 0;
+    if (!p_enum || p_enum(w_inst, &n, NULL) != VK_SUCCESS || !n) { vke("no device"); goto fail; }
+    if (n > 4) n = 4;
+    {   VkPhysicalDevice devs[4];
+        p_enum(w_inst, &n, devs);
+        w_phys = devs[0];
+        {   VkPhysicalDeviceProperties pr;
+            p_props(w_phys, &pr);
+            vke("device %s (%u.%u.%u)", pr.deviceName,
+                (unsigned)VK_VERSION_MAJOR(pr.apiVersion),
+                (unsigned)VK_VERSION_MINOR(pr.apiVersion),
+                (unsigned)VK_VERSION_PATCH(pr.apiVersion)); } }
+    {   uint32_t nq = 0, k;
+        VkQueueFamilyProperties qp[8];
+        p_qf(w_phys, &nq, NULL);
+        if (nq > 8) nq = 8;
+        p_qf(w_phys, &nq, qp);
+        for (k = 0; k < nq; k++) {
+            VkBool32 sup = VK_FALSE;
+            if (!(qp[k].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
+            p_support(w_phys, k, w_surf, &sup);
+            if (sup) { family = k; break; }
+        } }
+    if (family == UINT32_MAX) { vke("no graphics+present queue"); goto fail; }
+    p_create_device = (PFN_vkCreateDevice)p_gipa(w_inst, "vkCreateDevice");
+    p_destroy_device = (PFN_vkDestroyDevice)p_gipa(w_inst, "vkDestroyDevice");
+    p_get_queue = (PFN_vkGetDeviceQueue)p_gipa(w_inst, "vkGetDeviceQueue");
+    p_device_idle = (PFN_vkDeviceWaitIdle)p_gipa(w_inst, "vkDeviceWaitIdle");
+    {   VkDeviceCreateInfo dci;
+        VkDeviceQueueCreateInfo qci;
+        const char *dev_ext[1];
+        float prio = 1.0f;
+        dev_ext[0] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+        memset(&qci, 0, sizeof qci);
+        qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        qci.queueFamilyIndex = family;
+        qci.queueCount = 1;
+        qci.pQueuePriorities = &prio;
+        memset(&dci, 0, sizeof dci);
+        dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        dci.queueCreateInfoCount = 1;
+        dci.pQueueCreateInfos = &qci;
+        dci.enabledExtensionCount = 1;
+        dci.ppEnabledExtensionNames = dev_ext;
+        r = p_create_device(w_phys, &dci, NULL, &w_dev);
+        if (r != VK_SUCCESS) { vke("vkCreateDevice -> %d", (int)r); goto fail; }
+    }
+    p_get_queue(w_dev, family, 0, &w_queue);
+    p_sc_new = (PFN_vkCreateSwapchainKHR)p_gipa(w_inst, "vkCreateSwapchainKHR");
+    p_destroy_swapchain = (PFN_vkDestroySwapchainKHR)p_gipa(w_inst, "vkDestroySwapchainKHR");
+    p_sc_images = (PFN_vkGetSwapchainImagesKHR)p_gipa(w_inst, "vkGetSwapchainImagesKHR");
+    p_acquire = (PFN_vkAcquireNextImageKHR)p_gipa(w_inst, "vkAcquireNextImageKHR");
+    p_present = (PFN_vkQueuePresentKHR)p_gipa(w_inst, "vkQueuePresentKHR");
+    p_sem_new = (PFN_vkCreateSemaphore)p_gipa(w_inst, "vkCreateSemaphore");
+    p_sem_free = (PFN_vkDestroySemaphore)p_gipa(w_inst, "vkDestroySemaphore");
+    p_fence_new = (PFN_vkCreateFence)p_gipa(w_inst, "vkCreateFence");
+    p_fence_free = (PFN_vkDestroyFence)p_gipa(w_inst, "vkDestroyFence");
+    p_wait = (PFN_vkWaitForFences)p_gipa(w_inst, "vkWaitForFences");
+    p_reset = (PFN_vkResetFences)p_gipa(w_inst, "vkResetFences");
+    p_pool_new = (PFN_vkCreateCommandPool)p_gipa(w_inst, "vkCreateCommandPool");
+    p_pool_free = (PFN_vkDestroyCommandPool)p_gipa(w_inst, "vkDestroyCommandPool");
+    p_cmds = (PFN_vkAllocateCommandBuffers)p_gipa(w_inst, "vkAllocateCommandBuffers");
+    p_begin = (PFN_vkBeginCommandBuffer)p_gipa(w_inst, "vkBeginCommandBuffer");
+    p_end = (PFN_vkEndCommandBuffer)p_gipa(w_inst, "vkEndCommandBuffer");
+    p_barrier = (PFN_vkCmdPipelineBarrier)p_gipa(w_inst, "vkCmdPipelineBarrier");
+    p_clear = (PFN_vkCmdClearColorImage)p_gipa(w_inst, "vkCmdClearColorImage");
+    p_submit = (PFN_vkQueueSubmit)p_gipa(w_inst, "vkQueueSubmit");
+    {   VkSurfaceCapabilitiesKHR caps;
+        uint32_t nf = 0, nm = 0;
+        VkSurfaceFormatKHR fmts[32];
+        VkPresentModeKHR modes[8];
+        p_caps(w_phys, w_surf, &caps);
+        p_formats(w_phys, w_surf, &nf, NULL);
+        if (nf > 32) nf = 32;
+        p_formats(w_phys, w_surf, &nf, fmts);
+        p_modes(w_phys, w_surf, &nm, NULL);
+        if (nm > 8) nm = 8;
+        p_modes(w_phys, w_surf, &nm, modes);
+        if (!nf) { vke("no surface formats"); goto fail; }
+        fmt = fmts[0];
+        for (i = 0; i < nf; i++)
+            if (fmts[i].format == VK_FORMAT_R8G8B8A8_UNORM
+             || fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM) { fmt = fmts[i]; break; }
+        for (i = 0; i < nm; i++) if (modes[i] == VK_PRESENT_MODE_FIFO_KHR) mode = modes[i];
+        w_extent = caps.currentExtent;
+        if (w_extent.width == 0xFFFFFFFFu) {
+            w_extent.width = 480; w_extent.height = 320;
+            if (w_extent.width > caps.maxImageExtent.width) w_extent.width = caps.maxImageExtent.width;
+            if (w_extent.height > caps.maxImageExtent.height) w_extent.height = caps.maxImageExtent.height;
+        }
+        {   VkSwapchainCreateInfoKHR sci;
+            memset(&sci, 0, sizeof sci);
+            sci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+            sci.surface = w_surf;
+            sci.minImageCount = caps.minImageCount + 1;
+            if (caps.maxImageCount && sci.minImageCount > caps.maxImageCount)
+                sci.minImageCount = caps.maxImageCount;
+            sci.imageFormat = fmt.format;
+            sci.imageColorSpace = fmt.colorSpace;
+            sci.imageExtent = w_extent;
+            sci.imageArrayLayers = 1;
+            sci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            sci.preTransform = caps.currentTransform;
+            sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+            sci.presentMode = mode;
+            sci.clipped = VK_TRUE;
+            r = p_sc_new(w_dev, &sci, NULL, &w_sc);
+            if (r != VK_SUCCESS) { vke("vkCreateSwapchainKHR -> %d", (int)r); goto fail; }
+        }
+    }
+    if (p_sc_images(w_dev, w_sc, &w_nimg, NULL) != VK_SUCCESS || !w_nimg) {
+        vke("no swapchain images"); goto fail;
+    }
+    if (w_nimg > 8) w_nimg = 8;
+    p_sc_images(w_dev, w_sc, &w_nimg, w_img);
+    for (i = 0; i < w_nimg; i++) w_layout[i] = VK_IMAGE_LAYOUT_UNDEFINED;
+    {   VkCommandPoolCreateInfo pci;
+        VkCommandBufferAllocateInfo cbi;
+        VkFenceCreateInfo fci;
+        VkSemaphoreCreateInfo sci;
+        memset(&pci, 0, sizeof pci);
+        pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pci.queueFamilyIndex = family;
+        if (p_pool_new(w_dev, &pci, NULL, &w_pool) != VK_SUCCESS) { vke("pool"); goto fail; }
+        memset(&cbi, 0, sizeof cbi);
+        cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cbi.commandPool = w_pool;
+        cbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbi.commandBufferCount = 1;
+        if (p_cmds(w_dev, &cbi, &w_cmd) != VK_SUCCESS) { vke("cmd"); goto fail; }
+        memset(&fci, 0, sizeof fci);
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        p_fence_new(w_dev, &fci, NULL, &w_fence);
+        memset(&sci, 0, sizeof sci);
+        sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        p_sem_new(w_dev, &sci, NULL, &w_acq);
+        p_sem_new(w_dev, &sci, NULL, &w_done);
+    }
+    w_active = 1;
+    vke("swapchain %ux%u, format %d, %u images", w_extent.width, w_extent.height,
+        (int)fmt.format, w_nimg);
+    ok = 1;
+    goto done;
+
+fail:
+    vke("engine start failed");
+done:
+    if (!ok) nv2a_vk_engine_stop();
+    return ok;
+}
+
+int nv2a_vk_engine_active(void) { return w_active; }
+
+void nv2a_vk_engine_frame(void)
+{
+    uint32_t idx = 0, i;
+    VkCommandBufferBeginInfo bi;
+    VkClearColorValue clr;
+    VkImageSubresourceRange rg;
+    VkImageMemoryBarrier b;
+    VkSubmitInfo si;
+    VkPresentInfoKHR pi;
+    VkResult r;
+
+    if (!w_active) return;
+    r = p_acquire(w_dev, w_sc, 1000000000ull, w_acq, VK_NULL_HANDLE, &idx);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) return;
+    if (r != VK_SUCCESS || idx >= w_nimg) { vke("acquire -> %d", (int)r); return; }
+
+    memset(&bi, 0, sizeof bi);
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    p_begin(w_cmd, &bi);
+    memset(&b, 0, sizeof b);
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.oldLayout = w_layout[idx];
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = w_img[idx];
+    b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    b.subresourceRange.levelCount = 1;
+    b.subresourceRange.layerCount = 1;
+    p_barrier(w_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    memset(&clr, 0, sizeof clr);
+    /* A colour that says the window is alive: the frame has no picture yet. */
+    clr.float32[0] = 0.06f;
+    clr.float32[1] = 0.10f;
+    clr.float32[2] = 0.22f;
+    clr.float32[3] = 1.0f;
+    memset(&rg, 0, sizeof rg);
+    rg.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    rg.levelCount = 1;
+    rg.layerCount = 1;
+    p_clear(w_cmd, w_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clr, 1, &rg);
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = 0;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    p_barrier(w_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+              VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    p_end(w_cmd);
+    w_layout[idx] = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+    memset(&si, 0, sizeof si);
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.waitSemaphoreCount = 1;
+    si.pWaitSemaphores = &w_acq;
+    {   VkPipelineStageFlags st = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        si.pWaitDstStageMask = &st; }
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &w_cmd;
+    si.signalSemaphoreCount = 1;
+    si.pSignalSemaphores = &w_done;
+    p_reset(w_dev, 1, &w_fence);
+    if (p_submit(w_queue, 1, &si, w_fence) != VK_SUCCESS) return;
+    if (p_wait(w_dev, 1, &w_fence, VK_TRUE, 1000000000ull) != VK_SUCCESS) return;
+
+    memset(&pi, 0, sizeof pi);
+    pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    pi.waitSemaphoreCount = 1;
+    pi.pWaitSemaphores = &w_done;
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &w_sc;
+    pi.pImageIndices = &idx;
+    p_present(w_queue, &pi);
+    for (i = 0; i < w_nimg; i++)
+        if (w_layout[i] != VK_IMAGE_LAYOUT_UNDEFINED) break;
+}
+
+void nv2a_vk_engine_stop(void)
+{
+    w_active = 0;
+    if (w_dev) {
+        if (p_device_idle) p_device_idle(w_dev);
+        if (w_fence && p_fence_free) p_fence_free(w_dev, w_fence, NULL);
+        if (w_acq && p_sem_free) p_sem_free(w_dev, w_acq, NULL);
+        if (w_done && p_sem_free) p_sem_free(w_dev, w_done, NULL);
+        if (w_pool && p_pool_free) p_pool_free(w_dev, w_pool, NULL);
+        if (w_sc && p_destroy_swapchain) p_destroy_swapchain(w_dev, w_sc, NULL);
+        if (p_destroy_device) p_destroy_device(w_dev, NULL);
+    }
+    if (w_surf && p_destroy_surface) p_destroy_surface(w_inst, w_surf, NULL);
+    if (w_inst && p_destroy_instance) p_destroy_instance(w_inst, NULL);
+    if (w_win) SDL_DestroyWindow(w_win);
+    w_dev = VK_NULL_HANDLE; w_inst = VK_NULL_HANDLE; w_sc = VK_NULL_HANDLE;
+    w_surf = VK_NULL_HANDLE; w_pool = VK_NULL_HANDLE; w_win = NULL;
+}
+
+int nv2a_vk_engine_requested(void)
+{
+    return vke_switch_on("RECOMP_BACKEND_VULKAN") || vke_switch_on("RECOMP_VK_ENGINE");
+}
+
+#else
+
+int nv2a_vk_engine_start(int w, int h) { (void)w; (void)h; return 0; }
+int nv2a_vk_engine_active(void) { return 0; }
+void nv2a_vk_engine_frame(void) { }
+void nv2a_vk_engine_stop(void) { }
+int nv2a_vk_engine_requested(void) { return 0; }
+
+#endif

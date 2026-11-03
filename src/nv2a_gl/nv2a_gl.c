@@ -10895,6 +10895,19 @@ static void present(int is_frame)
     uint32_t va, bpp, x, y;
     uint8_t *dst;
 
+#if defined(NV2A_GLES)
+    /* The Vulkan backend presents from here. There is no GL context to read
+     * the surface back from and no GL presenter thread (none was started:
+     * gl_init is not the path this backend came up through), so the frame
+     * ends in port/vk_engine.c's acquire, clear and present. */
+    { extern int  nv2a_vk_engine_active(void);
+      extern void nv2a_vk_engine_frame(void);
+      if (nv2a_vk_engine_active()) {
+          if (is_frame) { S.frames++; g_frame_clock = mono_now(); }
+          nv2a_vk_engine_frame();
+          return;
+      } }
+#endif
     if (!g_ready || !g_fbo_w || !g_fbo_h || !S.color_offset) return;
 #ifdef NV2A_GL_HAVE_GL
     /* The frame's GL errors, asked once (see after the draw). */
@@ -13133,6 +13146,28 @@ static int gfx_init(uint32_t w, uint32_t h)
     want_metal = (v && *v) ? !strcmp(v, "metal") : metal_window;
 #if defined(NV2A_GL_USE_NONE)
     want_metal = 1;                   /* there is nothing else */
+#endif
+#if defined(NV2A_GLES)
+    /* RECOMP_BACKEND=vulkan: the window, the instance and the swapchain are
+     * port/vk_engine.c's (Turnip's loader, SDL_WINDOW_VULKAN on the app's one
+     * window), and the table it draws through is
+     * port/nv2a_vk_gfx.c -- a backend that answers every call and draws
+     * nothing yet. The engine boots and the title runs; the screen shows the
+     * clear until drawing lands. */
+    if (v && !strcmp(v, "vulkan")) {
+        extern int nv2a_vk_engine_start(int, int);
+        extern const Nv2aGfx *nv2a_vk_stub_gfx(void);
+        if (nv2a_vk_engine_start((int)w, (int)h)) {
+            G = nv2a_vk_stub_gfx();
+            g_is_gl = 0;
+            fprintf(stderr, "  [GL] backend: %s\n", G->name);
+            zrev_start();
+            aa_start();
+            shader_cache_start();
+            return 1;
+        }
+        fprintf(stderr, "  [GL] the Vulkan backend would not start; using OpenGL\n");
+    }
 #endif
     if (want_metal) {
         const Nv2aGfx *m = nv2a_gfx_metal();
