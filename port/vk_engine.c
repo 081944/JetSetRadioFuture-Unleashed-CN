@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <unistd.h>
 
 #define VK_USE_PLATFORM_ANDROID_KHR 1
 #define VK_NO_PROTOTYPES 1
@@ -399,6 +400,25 @@ int nv2a_vk_engine_start(int want_w, int want_h)
     w_active = 1;
     vke("swapchain %ux%u, format %d, %u images", w_extent.width, w_extent.height,
         (int)fmt.format, w_nimg);
+    /* RECOMP_VK_MAINFRAMES=<n>: a few frames here, on the thread that made the
+     * window, before the engine ever asks for one. It separates "these calls
+     * work from this thread" from "they work from the pushbuffer thread",
+     * which is the difference the crash has left. */
+    vke("fn acquire %p, begin %p, barrier %p, clear %p, submit %p, wait %p, present %p",
+        (void *)p_acquire, (void *)p_begin, (void *)p_barrier, (void *)p_clear,
+        (void *)p_submit, (void *)p_wait, (void *)p_present);
+    /* The surface may not be attached to the window yet. Give Android a
+     * moment before the first acquire: a swapchain whose surface the driver
+     * has not been told about would explain a fault inside the driver. */
+    usleep(600000);
+    {   const char *v = jsrf_getenv("RECOMP_VK_MAINFRAMES");
+        int n = v ? atoi(v) : 0, k;
+        for (k = 0; k < n; k++) {
+            vke("main-thread frame %d", k + 1);
+            nv2a_vk_engine_frame();
+        }
+        if (n) vke("main-thread frames done (%d)", n);
+    }
     ok = 1;
     goto done;
 
