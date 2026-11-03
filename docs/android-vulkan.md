@@ -70,6 +70,23 @@
 - **实例级函数要用 `gipa(instance, …)` 取**，`gipa(NULL, …)` 只给 `vkCreateInstance`、
   `vkEnumerateInstanceExtensionProperties` 这类全局入口。第一版探针在这上面误判过一次。
 
+
+### 后端可用的特性基线（Turnip 1.3.363，Adreno 650）
+
+```
+ext VK_KHR_dynamic_rendering      -    （1.3 核心，不以扩展形式出现）
+ext VK_KHR_synchronization2       -    （同上）
+ext VK_KHR_timeline_semaphore     yes
+ext VK_KHR_push_descriptor        yes
+ext VK_EXT_descriptor_indexing    yes
+ext VK_KHR_buffer_device_address  yes
+ext VK_KHR_swapchain              yes
+feat dynamicRendering 1, synchronization2 1, timelineSemaphore 1
+```
+
+结论：后端按 **Vulkan 1.3 核心**写即可——`vkCmdBeginRendering` 代替 render pass，
+`vkQueueSubmit2` 代替旧同步。原厂驱动（1.1.128）上这些都没有，所以 Vulkan 后端
+**必须**走 Turnip，不能只在系统驱动上做。
 ## Turnip：方案（NGPort 已验证的配方）
 
 NGPort（`E:\HH\NGPort\zh-work`）已经把这套跑通了，可以照搬：

@@ -177,6 +177,53 @@ int nv2a_vk_driver_probe(void)
                         (unsigned)VK_VERSION_MINOR(pr.apiVersion),
                         (unsigned)VK_VERSION_PATCH(pr.apiVersion),
                         (unsigned)pr.driverVersion);
+                /* What a backend would be written against: 1.3's dynamic
+                 * rendering (no render passes), synchronized submission and
+                 * timeline semaphores, and the ones a draw-heavy renderer
+                 * leans on -- push descriptors, descriptor indexing, buffer
+                 * device address. */
+                {   PFN_vkEnumerateDeviceExtensionProperties p_ext =
+                        (PFN_vkEnumerateDeviceExtensionProperties)gipa(inst, "vkEnumerateDeviceExtensionProperties");
+                    PFN_vkGetPhysicalDeviceFeatures2 p_feat2 =
+                        (PFN_vkGetPhysicalDeviceFeatures2)gipa(inst, "vkGetPhysicalDeviceFeatures2");
+                    static const char *const want[] = {
+                        "VK_KHR_dynamic_rendering", "VK_KHR_synchronization2",
+                        "VK_KHR_timeline_semaphore", "VK_KHR_push_descriptor",
+                        "VK_EXT_descriptor_indexing", "VK_KHR_buffer_device_address",
+                        "VK_KHR_swapchain", "VK_KHR_android_surface"
+                    };
+                    uint32_t ne = 0, j;
+                    if (!p_feat2) p_feat2 = (PFN_vkGetPhysicalDeviceFeatures2)gipa(inst, "vkGetPhysicalDeviceFeatures2KHR");
+                    if (p_ext && p_ext(devs[i], NULL, &ne, NULL) >= 0 && ne) {
+                        VkExtensionProperties *ep = calloc(ne, sizeof *ep);
+                        if (ep && p_ext(devs[i], NULL, &ne, ep) >= 0) {
+                            for (j = 0; j < sizeof want / sizeof want[0]; j++) {
+                                uint32_t e;
+                                for (e = 0; e < ne; e++)
+                                    if (!strcmp(ep[e].extensionName, want[j])) break;
+                                vkd_say("  ext %-32s %s", want[j], e < ne ? "yes" : "-");
+                            }
+                        }
+                        free(ep);
+                    }
+                    if (p_feat2) {
+                        VkPhysicalDeviceVulkan13Features f13;
+                        VkPhysicalDeviceVulkan12Features f12;
+                        VkPhysicalDeviceFeatures2 f2;
+                        memset(&f13, 0, sizeof f13);
+                        f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+                        memset(&f12, 0, sizeof f12);
+                        f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+                        f13.pNext = &f12;
+                        memset(&f2, 0, sizeof f2);
+                        f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+                        f2.pNext = &f13;
+                        p_feat2(devs[i], &f2);
+                        vkd_say("  feat dynamicRendering %d, synchronization2 %d, timelineSemaphore %d",
+                                (int)f13.dynamicRendering, (int)f13.synchronization2,
+                                (int)f12.timelineSemaphore);
+                    }
+                }
                 if (VK_VERSION_MAJOR(pr.apiVersion) >= 1
                     && VK_VERSION_MINOR(pr.apiVersion) >= 3) ok = 1;
             }
