@@ -96,6 +96,30 @@ static PFN_vkCmdPipelineBarrier           p_barrier;
 static PFN_vkCmdClearColorImage           p_clear;
 static PFN_vkQueueSubmit                  p_submit;
 static PFN_vkDestroyDevice                p_destroy_device;
+static PFN_vkCreateImageView              p_view_new;
+static PFN_vkDestroyImageView             p_view_free;
+static PFN_vkCreateShaderModule           p_shader_new;
+static PFN_vkDestroyShaderModule          p_shader_free;
+static PFN_vkCreatePipelineLayout         p_layout_new;
+static PFN_vkDestroyPipelineLayout        p_layout_free;
+static PFN_vkCreateGraphicsPipelines      p_pipe_new;
+static PFN_vkDestroyPipeline              p_pipe_free;
+static PFN_vkCmdBeginRendering            p_begin_rendering;
+static PFN_vkCmdEndRendering              p_end_rendering;
+static PFN_vkCmdBindPipeline              p_bind_pipeline;
+static PFN_vkCmdDraw                      p_cmd_draw;
+static PFN_vkCmdSetViewport               p_viewport;
+static PFN_vkCmdSetScissor                p_scissor;
+static int vke_pipeline(void);
+
+/* What the first pipeline needs: a view per swapchain image, the two shader
+ * modules glslang compiled, and the pipeline itself. Dynamic rendering takes
+ * no render pass, which is why this is so little for Vulkan 1.3. */
+static VkImageView      w_view[8];
+static VkShaderModule   w_vs, w_fs;
+static VkPipelineLayout w_pl;
+static VkPipeline       w_pipe;
+static int              w_draw_ready;
 
 static int vke_switch_on(const char *name)
 {
@@ -250,9 +274,18 @@ int nv2a_vk_engine_start(int want_w, int want_h)
         dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
-        dci.enabledExtensionCount = 1;
-        dci.ppEnabledExtensionNames = dev_ext;
-        r = p_create_device(w_phys, &dci, NULL, &w_dev);
+        {   /* Dynamic rendering and synchronized submission are core in 1.3;
+             * without the feature enabled vkCmdBeginRendering is not legal. */
+            static VkPhysicalDeviceVulkan13Features f13;
+            memset(&f13, 0, sizeof f13);
+            f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+            f13.dynamicRendering = VK_TRUE;
+            f13.synchronization2 = VK_TRUE;
+            dci.pNext = &f13;
+            dci.enabledExtensionCount = 1;
+            dci.ppEnabledExtensionNames = dev_ext;
+            r = p_create_device(w_phys, &dci, NULL, &w_dev);
+        }
         if (r != VK_SUCCESS) { vke("vkCreateDevice -> %d", (int)r); goto fail; }
     }
     p_get_queue(w_dev, family, 0, &w_queue);
@@ -275,6 +308,20 @@ int nv2a_vk_engine_start(int want_w, int want_h)
     p_barrier = (PFN_vkCmdPipelineBarrier)p_gipa(w_inst, "vkCmdPipelineBarrier");
     p_clear = (PFN_vkCmdClearColorImage)p_gipa(w_inst, "vkCmdClearColorImage");
     p_submit = (PFN_vkQueueSubmit)p_gipa(w_inst, "vkQueueSubmit");
+    p_view_new = (PFN_vkCreateImageView)p_gipa(w_inst, "vkCreateImageView");
+    p_view_free = (PFN_vkDestroyImageView)p_gipa(w_inst, "vkDestroyImageView");
+    p_shader_new = (PFN_vkCreateShaderModule)p_gipa(w_inst, "vkCreateShaderModule");
+    p_shader_free = (PFN_vkDestroyShaderModule)p_gipa(w_inst, "vkDestroyShaderModule");
+    p_layout_new = (PFN_vkCreatePipelineLayout)p_gipa(w_inst, "vkCreatePipelineLayout");
+    p_layout_free = (PFN_vkDestroyPipelineLayout)p_gipa(w_inst, "vkDestroyPipelineLayout");
+    p_pipe_new = (PFN_vkCreateGraphicsPipelines)p_gipa(w_inst, "vkCreateGraphicsPipelines");
+    p_pipe_free = (PFN_vkDestroyPipeline)p_gipa(w_inst, "vkDestroyPipeline");
+    p_begin_rendering = (PFN_vkCmdBeginRendering)p_gipa(w_inst, "vkCmdBeginRendering");
+    p_end_rendering = (PFN_vkCmdEndRendering)p_gipa(w_inst, "vkCmdEndRendering");
+    p_bind_pipeline = (PFN_vkCmdBindPipeline)p_gipa(w_inst, "vkCmdBindPipeline");
+    p_cmd_draw = (PFN_vkCmdDraw)p_gipa(w_inst, "vkCmdDraw");
+    p_viewport = (PFN_vkCmdSetViewport)p_gipa(w_inst, "vkCmdSetViewport");
+    p_scissor = (PFN_vkCmdSetScissor)p_gipa(w_inst, "vkCmdSetScissor");
     {   VkSurfaceCapabilitiesKHR caps;
         uint32_t nf = 0, nm = 0;
         VkSurfaceFormatKHR fmts[32];
@@ -325,6 +372,7 @@ int nv2a_vk_engine_start(int want_w, int want_h)
     if (w_nimg > 8) w_nimg = 8;
     p_sc_images(w_dev, w_sc, &w_nimg, w_img);
     for (i = 0; i < w_nimg; i++) w_layout[i] = VK_IMAGE_LAYOUT_UNDEFINED;
+    vke_pipeline();
     {   VkCommandPoolCreateInfo pci;
         VkCommandBufferAllocateInfo cbi;
         VkFenceCreateInfo fci;
@@ -361,6 +409,131 @@ done:
     return ok;
 }
 
+/* Views, shaders and the pipeline the first draw needs. The SPIR-V comes from
+ * port/vk_shader.c, so this is also the proof that the run-time compiler's
+ * output is accepted by the driver. */
+static int vke_pipeline(void)
+{
+    extern int nv2a_vk_glsl_to_spirv(const char *glsl, int stage,
+                                     uint32_t **words, size_t *nwords);
+    static const char *vs =
+        "#version 450\n"
+        "void main() {\n"
+        "    vec2 p = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2));\n"
+        "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+        "}\n";
+    static const char *fs =
+        "#version 450\n"
+        "layout(location = 0) out vec4 o;\n"
+        "void main() { o = vec4(0.95, 0.55, 0.15, 1.0); }\n";
+    uint32_t *wv = NULL, *wf = NULL;
+    size_t nv = 0, nf = 0;
+    VkShaderModuleCreateInfo smi;
+    VkPipelineLayoutCreateInfo pli;
+    VkPipelineShaderStageCreateInfo stages[2];
+    VkPipelineVertexInputStateCreateInfo vi;
+    VkPipelineInputAssemblyStateCreateInfo ia;
+    VkPipelineViewportStateCreateInfo vp;
+    VkPipelineRasterizationStateCreateInfo rs;
+    VkPipelineMultisampleStateCreateInfo ms;
+    VkPipelineColorBlendAttachmentState cba;
+    VkPipelineColorBlendStateCreateInfo cb;
+    VkPipelineRenderingCreateInfoKHR ri;
+    VkGraphicsPipelineCreateInfo gp;
+    uint32_t i;
+
+    /* RECOMP_VK_NO_DRAW=1: keep the clear path. It separates a crash in the
+     * dynamic-rendering path from one the engine has regardless. */
+    { extern int not_here(void); }
+    if (vke_switch_on("RECOMP_VK_NO_DRAW")) return 0;
+    if (!p_view_new || !p_shader_new || !p_pipe_new || !p_begin_rendering) return 0;
+    for (i = 0; i < w_nimg; i++) {
+        VkImageViewCreateInfo vci;
+        memset(&vci, 0, sizeof vci);
+        vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        vci.image = w_img[i];
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+        vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        vci.subresourceRange.levelCount = 1;
+        vci.subresourceRange.layerCount = 1;
+        if (p_view_new(w_dev, &vci, NULL, &w_view[i]) != VK_SUCCESS) return 0;
+    }
+    if (!nv2a_vk_glsl_to_spirv(vs, 0, &wv, &nv) || !nv2a_vk_glsl_to_spirv(fs, 1, &wf, &nf)) {
+        vke("the test shaders did not compile");
+        free(wv); free(wf);
+        return 0;
+    }
+    memset(&smi, 0, sizeof smi);
+    smi.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    smi.codeSize = nv * 4; smi.pCode = wv;
+    if (p_shader_new(w_dev, &smi, NULL, &w_vs) != VK_SUCCESS) { vke("vertex module"); return 0; }
+    smi.codeSize = nf * 4; smi.pCode = wf;
+    if (p_shader_new(w_dev, &smi, NULL, &w_fs) != VK_SUCCESS) { vke("fragment module"); return 0; }
+    free(wv); free(wf);
+
+    memset(&pli, 0, sizeof pli);
+    pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    if (p_layout_new(w_dev, &pli, NULL, &w_pl) != VK_SUCCESS) { vke("layout"); return 0; }
+
+    memset(stages, 0, sizeof stages);
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = w_vs;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = w_fs;
+    stages[1].pName = "main";
+    memset(&vi, 0, sizeof vi);
+    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    memset(&ia, 0, sizeof ia);
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    memset(&vp, 0, sizeof vp);
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    memset(&rs, 0, sizeof rs);
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+    memset(&ms, 0, sizeof ms);
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    memset(&cba, 0, sizeof cba);
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                       | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    memset(&cb, 0, sizeof cb);
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+    memset(&ri, 0, sizeof ri);
+    ri.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachmentFormats = &(VkFormat){ VK_FORMAT_R8G8B8A8_UNORM };
+    memset(&gp, 0, sizeof gp);
+    gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gp.pNext = &ri;
+    gp.stageCount = 2;
+    gp.pStages = stages;
+    gp.pVertexInputState = &vi;
+    gp.pInputAssemblyState = &ia;
+    gp.pViewportState = &vp;
+    gp.pRasterizationState = &rs;
+    gp.pMultisampleState = &ms;
+    gp.pColorBlendState = &cb;
+    gp.layout = w_pl;
+    if (p_pipe_new(w_dev, VK_NULL_HANDLE, 1, &gp, NULL, &w_pipe) != VK_SUCCESS) {
+        vke("graphics pipeline"); return 0;
+    }
+    w_draw_ready = 1;
+    vke("pipeline ready (dynamic rendering, SPIR-V from glslang)");
+    return 1;
+}
+
 int nv2a_vk_engine_active(void) { return w_active; }
 
 void nv2a_vk_engine_frame(void)
@@ -385,9 +558,11 @@ void nv2a_vk_engine_frame(void)
     p_begin(w_cmd, &bi);
     memset(&b, 0, sizeof b);
     b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = w_draw_ready ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                                    : VK_ACCESS_TRANSFER_WRITE_BIT;
     b.oldLayout = w_layout[idx];
-    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = w_draw_ready ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                                : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = w_img[idx];
@@ -395,26 +570,64 @@ void nv2a_vk_engine_frame(void)
     b.subresourceRange.levelCount = 1;
     b.subresourceRange.layerCount = 1;
     p_barrier(w_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+              VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+              0, b.dstAccessMask, NULL, 0, NULL, 1, &b);
     memset(&clr, 0, sizeof clr);
-    /* A colour that says the window is alive: the frame has no picture yet. */
+    /* A colour that says the window is alive underneath whatever is drawn. */
     clr.float32[0] = 0.06f;
     clr.float32[1] = 0.10f;
     clr.float32[2] = 0.22f;
     clr.float32[3] = 1.0f;
-    memset(&rg, 0, sizeof rg);
-    rg.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    rg.levelCount = 1;
-    rg.layerCount = 1;
-    p_clear(w_cmd, w_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clr, 1, &rg);
-    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    b.dstAccessMask = 0;
-    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    if (w_draw_ready) {
+        /* Vulkan 1.3: no render pass, no framebuffer -- the attachment is
+         * named here and the clear rides along with it. */
+        VkRenderingAttachmentInfo att;
+        VkRenderingInfo ri;
+        VkViewport vp;
+        VkRect2D sc;
+        memset(&att, 0, sizeof att);
+        att.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        att.imageView = w_view[idx];
+        att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        att.clearValue.color = clr;
+        memset(&ri, 0, sizeof ri);
+        ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        ri.renderArea.offset.x = 0;
+        ri.renderArea.offset.y = 0;
+        ri.renderArea.extent = w_extent;
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachments = &att;
+        p_begin_rendering(w_cmd, &ri);
+        vp.x = 0.0f; vp.y = 0.0f;
+        vp.width = (float)w_extent.width;
+        vp.height = (float)w_extent.height;
+        vp.minDepth = 0.0f; vp.maxDepth = 1.0f;
+        p_viewport(w_cmd, 0, 1, &vp);
+        sc.offset.x = 0; sc.offset.y = 0;
+        sc.extent = w_extent;
+        p_scissor(w_cmd, 0, 1, &sc);
+        p_bind_pipeline(w_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, w_pipe);
+        p_cmd_draw(w_cmd, 3, 1, 0, 0);
+        p_end_rendering(w_cmd);
+        b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        b.dstAccessMask = 0;
+        b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    } else {
+        memset(&rg, 0, sizeof rg);
+        rg.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        rg.levelCount = 1;
+        rg.layerCount = 1;
+        p_clear(w_cmd, w_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clr, 1, &rg);
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = 0;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    }
     b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    p_barrier(w_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-              VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &b);
-    p_end(w_cmd);
-    w_layout[idx] = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    p_barrier(w_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+              VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, b.srcAccessMask, 0, NULL, 0, NULL, 1, &b);
 
     memset(&si, 0, sizeof si);
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -437,7 +650,10 @@ void nv2a_vk_engine_frame(void)
     pi.swapchainCount = 1;
     pi.pSwapchains = &w_sc;
     pi.pImageIndices = &idx;
-    p_present(w_queue, &pi);
+    if (p_present(w_queue, &pi) == VK_SUCCESS) {
+        static int shown;
+        if (!shown) { shown = 1; vke("first frame presented (triangle drawn with dynamic rendering)"); }
+    }
     for (i = 0; i < w_nimg; i++)
         if (w_layout[i] != VK_IMAGE_LAYOUT_UNDEFINED) break;
 }
