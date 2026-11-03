@@ -65,9 +65,19 @@ static int vkd_dir(char *out, size_t n)
     return 1;
 }
 
+/* A switch is on unless it says otherwise: "0" and empty are off. Every probe
+ * here is read from a system property, and a property cannot be removed from
+ * adb, so `setprop debug.jsrf.recomp_vk_demo 0` has to mean off. */
+static int vk_switch_on(const char *name)
+{
+    const char *v = jsrf_getenv(name);
+    if (!v || !*v) return 0;
+    return !(v[0] == '0' && !v[1]);
+}
+
 int nv2a_vk_demo_requested(void)
 {
-    return jsrf_getenv("RECOMP_VK_DEMO") != NULL;
+    return vk_switch_on("RECOMP_VK_DEMO");
 }
 
 int nv2a_vk_demo(void)
