@@ -615,6 +615,7 @@ static void vke_frame_body(void)
     VkResult r;
 
     if (!w_active) return;
+    { static int st; if (!st) { st = 1; vke("f1: acquire"); } }
     r = p_acquire(w_dev, w_sc, 1000000000ull, w_acq, VK_NULL_HANDLE, &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) return;
     if (r != VK_SUCCESS || idx >= w_nimg) { vke("acquire -> %d", (int)r); return; }
@@ -622,7 +623,9 @@ static void vke_frame_body(void)
     memset(&bi, 0, sizeof bi);
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    { static int st; if (!st) { st = 1; vke("f1: record begin"); } }
     p_begin(w_cmd, &bi);
+    { static int st; if (!st) { st = 1; vke("f1: barrier"); } }
     memset(&b, 0, sizeof b);
     b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     b.dstAccessMask = w_draw_ready ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
@@ -636,9 +639,10 @@ static void vke_frame_body(void)
     b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     b.subresourceRange.levelCount = 1;
     b.subresourceRange.layerCount = 1;
+    { static int st; if (!st) { st = 1; vke("f1: barrier call"); } }
     p_barrier(w_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
               VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-              0, b.dstAccessMask, NULL, 0, NULL, 1, &b);
+              0, 0, NULL, 0, NULL, 1, &b);            /* dependencyFlags, barriers, buffers, images */
     memset(&clr, 0, sizeof clr);
     /* A colour that says the window is alive underneath whatever is drawn. */
     clr.float32[0] = 0.06f;
@@ -690,14 +694,16 @@ static void vke_frame_body(void)
         rg.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         rg.levelCount = 1;
         rg.layerCount = 1;
+    { static int st; if (!st) { st = 1; vke("f1: clear call"); } }
         p_clear(w_cmd, w_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clr, 1, &rg);
+    { static int st; if (!st) { st = 1; vke("f1: clear done"); } }
         b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         b.dstAccessMask = 0;
         b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     }
     b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     p_barrier(w_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-              VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, b.srcAccessMask, 0, NULL, 0, NULL, 1, &b);
+              VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &b);
 
     memset(&si, 0, sizeof si);
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
