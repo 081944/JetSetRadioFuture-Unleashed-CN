@@ -29,8 +29,11 @@ public class JsrfActivity extends SDLActivity
     static native void nativeTouch(int buttons, int analog, int x, int y, boolean stick, boolean shown);
     static native boolean nativeWidescreen();
     static native void nativeSetWidescreen(boolean on);
-    static native boolean nativeRstickCamera();
-    static native void nativeSetRstickCamera(boolean on);
+static native int nativeRstickCamera();            /* 0 off, 1 the camera, 2 tracking */
+    static native void nativeSetRstickCamera(int mode);
+    static native void nativePhotoMode();
+    static native String[] nativeMapNames();          /* the map selector (jsrf_maps.h) */
+    static native void nativeGoToMap(int index);
     static native void nativeSetPerformanceOverlay(boolean on);
     static native String nativePerformanceStats();
     static native void nativeSetControllerMapping(boolean swapTriggers, boolean nintendo);
@@ -179,17 +182,19 @@ public class JsrfActivity extends SDLActivity
     public void onSettings() {
         final boolean wide = nativeWidescreen();
         final boolean touch = touchPref();
-        final boolean rcam = nativeRstickCamera();
+final int rcam = nativeRstickCamera();
         final boolean perf = mPerformanceOverlay;
         final int scale = Settings.get(this, "scale", 2);
         String[] items = {
             "Widescreen: " + (wide ? "on" : "off"),
             "On-screen controls: " + (touch ? "shown" : "hidden"),
             "Resolution: " + scale + "x",
-            "Camera on the right stick: " + (rcam ? "on" : "off"),
+            "Camera on the right stick: " + (rcam == 2 ? "tracking" : rcam != 0 ? "on" : "off"),
             "肩键/扳机互换 (LB↔LT、RB↔RT)：" + (mSwapTriggers ? "开" : "关"),
             "ABXY 布局：" + (mNintendo ? "任天堂" : "微软"),
             "性能叠层：" + (perf ? "开" : "关"),
+            "Photo mode",
+            "Go to a map",
             "Controls",
         };
         mPad.reset();
@@ -207,7 +212,7 @@ public class JsrfActivity extends SDLActivity
                     pickScale(scale);
                     break;
                 case 3:
-                    nativeSetRstickCamera(!rcam);
+                    pickRstickCamera(rcam);
                     break;
                 case 4:
                     setControllerMapping(!mSwapTriggers, mNintendo);
@@ -221,12 +226,43 @@ public class JsrfActivity extends SDLActivity
                     nativeSetPerformanceOverlay(mPerformanceOverlay);
                     mPad.setPerformanceOverlay(mPerformanceOverlay);
                     break;
+                case 7:
+                    nativePhotoMode();
+                    break;
+                case 8:
+                    pickMap();
+                    break;
                 default:
                     showControls();
                     break;
                 }
             })
             .setNegativeButton("Close", null)
+            .show();
+    }
+
+    /* The map selector: straight to a map, to skate it freely. */
+    private void pickMap() {
+        String[] items = nativeMapNames();
+        if (items == null) return;
+        dialog().setTitle("Go to a map")
+            .setItems(items, (d, which) -> nativeGoToMap(which))
+            .setNegativeButton("Cancel", null)
+            .show();
+    }
+
+    /* The camera on the right stick: on (the skater goes where it looks),
+     * tracking (it only looks around: the skater keeps his heading), or off
+     * (the game's own camera). */
+    private void pickRstickCamera(int now) {
+        String[] names = { "Off (the game's camera)", "On", "Tracking (look around, keep going)" };
+        String[] items = new String[3];
+        int[] modes = { 1, 2, 0 };
+        for (int i = 0; i < 3; i++)
+            items[i] = names[modes[i]] + (modes[i] == now ? "  ✓" : "");
+        dialog().setTitle("Camera on the right stick")
+            .setItems(items, (d, which) -> nativeSetRstickCamera(modes[which]))
+            .setNegativeButton("Cancel", null)
             .show();
     }
 
@@ -279,7 +315,11 @@ public class JsrfActivity extends SDLActivity
                 + "Start and Back are at the top.\n\n"
                 + "With the camera on the right stick (the settings), a controller's right stick "
                 + "turns the camera around you and it eases back behind you when let go; "
-                + "L trigger puts it straight behind at once.\n\n"
+                + "L trigger puts it straight behind at once. Set to tracking, it only looks "
+                + "around: you keep going the way you were.\n\n"
+                + "Photo mode (the settings, or hold Back on a controller): move the camera freely with "
+                + "the sticks, the triggers lower and raise it, Y hides the HUD, A the help, B goes back "
+                + "to the game.\n\n"
                 + "A keyboard: WASD (by position) moves, arrows the camera, Space jump, E spray, "
                 + "Enter Start, Esc Back.\n\n"
                 + "A new resolution is used the next time the game starts.")

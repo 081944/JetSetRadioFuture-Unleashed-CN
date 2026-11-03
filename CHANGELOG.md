@@ -10,6 +10,230 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.6.6 — 2 November 2026
+
+A map selector. Every platform is new in 0.6.6.
+
+- **Go straight to any map.** The 14 maps, under the game's own names and
+  grouped by district (Shibuya-cho, Kogane-cho, Benten-cho), each loaded as
+  the free skating that comes after the story: no timer, nothing to race or
+  chase. On the Mac and Windows it is the **Maps** menu; on iPhone and
+  Android, **Go to a map** in the settings; **F6** on Windows and Linux (and
+  **Maps › Map Selector** on the Mac) shows the same list on screen, gone
+  through with the pad or the keyboard (up and down, **A** or Return to go,
+  **B** or Esc to close). Choose a map while skating, or at the title screen: it goes there once you press Start.
+  Each map is reached the way the game itself goes from one mission to the
+  next; a map asked for while another loads waits until it is done. These
+  are the game's last missions: if it offers to save while you explore, say
+  no, or keep a copy of your save.
+- Tested on a Mac: all 14 maps, one after the other, from play; the list
+  on screen opened at the title, Skyscraper District chosen with A and gone
+  to once Start was pressed; out of the garage to Skyscraper District. On
+  Linux: F6, the list drawn on screen, chosen with the arrows and Return.
+  Windows, the iPhone and Android: built and checked, not run.
+
+## 0.6.5 — 2 November 2026
+
+Photo mode now freezes the world. Every platform is new in 0.6.5.
+
+- **Photo mode stops everything.** In 0.6.4 the game kept running while you
+  framed a shot: the skater's idle, the people, the cars, the spray cans
+  turning. Now the whole city holds still the moment photo mode starts, and
+  goes on from where it was when you go back to the game. The game's frame
+  runs the world's update and then a second pass where the poses and the
+  cans' turn are worked out; while photo mode is on both are left out, all
+  but the camera, so the scene is drawn exactly as it stood. Music and sound
+  carry on. `JSRF_PHOTO_FREEZE=0`: the world runs on, as in 0.6.4.
+- Tested on a Mac in Skyscraper District: with the camera still, pictures
+  taken two and four seconds apart in photo mode were the same (about 20
+  pixels in 1.2 million, against about 7,000 before); the camera turned
+  freely; after B the world went on. 60 fps throughout. Windows, Linux, the
+  iPhone and Android: built and checked, not run.
+
+## 0.6.4 — 2 November 2026
+
+Photo mode, and further draw distance in Skyscraper District. Every platform
+is new in 0.6.4.
+
+- **Photo mode.** Hold **Back** (Esc on a keyboard) for about a second while
+  skating, or choose **Controls › Photo Mode** (⌘ P on the Mac, the Controls
+  menu on Windows, the settings on iPhone and Android). The camera leaves the
+  skater: the left stick moves it, the right stick turns it, the triggers
+  lower and raise it; **Y** hides the HUD, **A** the help, and **B** or
+  **Back** goes back to the game. A panel at the bottom left of the screen
+  lists the controls, with the keyboard's keys. The game keeps running around
+  you while the skater waits; on a phone it needs a controller, for the right
+  stick.
+- **Skyscraper District: no more towers popping in.** The game draws a map
+  area by area, only those it judges visible from where you are, so the
+  towers and satellite dishes on the way to 99th Street appeared as you came
+  close — on the Xbox too. In Skyscraper District the areas drawn now reach
+  two steps further, as Miggas worked out in his
+  [JSRF-Recomp](https://github.com/Miggas/JSRF-Recomp) (thank you). Only the
+  drawing changes; the game's own areas still decide everything else. It
+  costs a few frames a second there (about 6 on a Mac); elsewhere nothing
+  changes. `RECOMP_DRAW_AREAS=game`: as on the Xbox.
+- Tested on a Mac in Skyscraper District: photo mode started by holding Back,
+  flew the camera over the rooftops, hid the HUD and went back to the game;
+  the further draw distance showed the distant light pillars the game leaves
+  out. The help panel on Linux. Windows, the iPhone and Android: built and
+  checked, not run.
+
+## 0.6.3 — 2 November 2026
+
+The brake sparks and smoke, as on the console. Every platform is new in 0.6.3.
+
+- **Brake sparks and smoke every time.** Braking — the stick forward, then
+  back — throws red sparks and smoke from the skates. Here, as in xemu, they
+  came out only now and then, and stayed at a fixed spot instead of following
+  the skates. Miggas found why in his JSRF-Recomp
+  ([Miggas/JSRF-Recomp](https://github.com/Miggas/JSRF-Recomp), thank you):
+  the console's Pentium III answers one kind of square-root instruction
+  (`rsqrtss`) with a 12-bit approximation, and the recompiled code computed it
+  exactly. One place needs the console's value — the routine that normalises
+  a vector, which the effect goes through — and now gets it, bit for bit, on
+  every CPU (his table, MIT licensed, credited in NOTICE).
+  `RECOMP_SSE_P3=0`: the exact value, as before.
+- Tested: the Linux build through the title and its demo (the new routine in
+  use, no crash); the Windows build and the Mac, iPhone and Android apps were
+  built and checked, not run.
+
+## 0.6.2 — 1 November 2026
+
+A second way to have the camera on the right stick, from players' feedback,
+and Game Mode on the Mac. Every platform is new in 0.6.2.
+
+- **The camera on the right stick, tracking** ([#44](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/issues/44)).
+  The camera on the right stick turns the view around the skater, and until
+  now the skater turned with it: up on the left stick goes where the camera
+  looks, so panning to look at something steered you towards it. Tracking
+  only looks around: the skater keeps going the way they were, and up on the
+  left stick is still straight ahead of them. Let go and the view eases back
+  behind, as before. On the Mac **Controls › Camera on the Right Stick
+  (Tracking)**, beside **Camera on the Right Stick** (choose the one that is
+  on again to turn the camera off); on Windows the same in the **Controls**
+  menu; **F7** on Windows and Linux goes round on, tracking and off; and the
+  iPhone's and the Android app's settings have the three. The camera on the
+  right stick stays on by default; `RECOMP_RSTICK_CAMERA=2` for tracking.
+- **Mac: Game Mode in full screen** ([#54](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/pull/54),
+  thank you, danielgpinheiro). The app now says it is a game, so macOS puts it
+  in Game Mode while it is in full screen — the CPU and GPU first, and
+  lower-latency Bluetooth for controllers — and takes it back when it leaves.
+- Tested on a Mac: in Shibuya Terminal the right stick turned the view about
+  half a turn, with the camera on and with tracking; on, the skater's heading
+  turned with it, and tracking left it as the game had it. Off, the game's own
+  camera stayed (Dogenzaka Hill). The title ran at 60 fps on Metal and OpenGL,
+  and macOS put the game in Game Mode in full screen. Windows (under Wine) and
+  Linux: F7, and on Windows the Controls menu, go round on, tracking and off
+  and keep the choice; the Android and iPhone builds were built and checked,
+  not run.
+
+## 0.6.1 — 31 October 2026
+
+Widescreen: a 21:9 picture for ultrawide screens on Mac, Windows and Linux,
+the HUD at the edges of the screen, and the boost's heat haze over the whole
+picture. Every platform is new in 0.6.1.
+
+- **21:9 on Mac, Windows and Linux.** The Video menu has three pictures now:
+  **4:3**, **Widescreen (16:9)** and **Ultrawide (21:9)** — ⇧ ⌘ W and ⇧ ⌘ U on
+  the Mac, **Video › Picture** on Windows, and **F10** goes round the three on
+  Windows and Linux. On an ultrawide screen 21:9 is the screen's own shape
+  (2560×1080 and 5120×2160 are 2.37:1, 3440×1440 2.39:1, up to 2.4:1), so in
+  full screen the picture fills it; on any other screen it shows 21:9 between
+  bars above and below. As with 16:9 it is a wider view, not a stretch: the
+  camera sees more of the city at the sides and the game culls against it. The
+  choice is remembered (`widescreen=` and `ultrawide=` in the settings on
+  Windows and Linux).
+- **The HUD at the screen's edges.** In widescreen the HUD stayed where it
+  was on a 4:3 screen, in the middle of the wider one: the health bar ended
+  82% of the way across a 16:9 screen and 74% across 21:9. The health bar,
+  the spray cans, a race's rival and the gauge now sit at the right edge, as
+  far from it as on the console; the timer stays at the top centre, and
+  menus, dialogue and their text stay in the middle. On every widescreen
+  picture: the iPhone's Fill the screen and Android's 16:9 too.
+  `RECOMP_WIDE_HUD=0` puts the HUD back in the middle.
+- **The boost's heat haze over the whole picture.** The boost dash bends the
+  scene behind you through a quad sized to fill a 4:3 view; in widescreen it
+  covered only the middle 4:3, and its edges showed as two vertical lines. It
+  now fills the screen, on every platform.
+- Tested on a Mac, against 0.6.0: City Rush with the boost at 16:9 and 21:9
+  on Metal and on OpenGL (the haze's edges gone, the HUD at the right edge,
+  60 frames a second throughout) and in 4:3 (unchanged), the Fortified
+  Residential Zone with the timer and a dialogue box (whole, in the middle),
+  Dogenzaka Hill, the pause screen (unchanged), and the picture switched
+  while playing, 16:9 → 21:9 → 4:3 → 16:9. Linux, and Windows under Wine, on
+  a 2560×1080 screen: the window opens at 21:9 from the stored choice, F10
+  goes round the three, full screen. The Android and iPhone builds were
+  built and checked, not run.
+
+## 0.6.0 — 30 October 2026
+
+Faster where the game used to stall: the textures and shaders made while you
+play, and the work done for every drawing command. These are six of the speed
+fixes [spriteice](https://github.com/spriteice) found by measuring where the
+time goes on a ROG Xbox Ally X, ported here -- thank you, spriteice! Every
+platform is new in 0.6.0.
+
+- **Entering an area, on Windows and Linux.** A new area brings 50 to 110
+  textures in one frame, and each was decoded to plain pixels before the
+  graphics driver got it. Most of the game's textures are DXT (S3TC)
+  compressed, which every desktop graphics driver takes as it is: they now go
+  to it that way, their mipmaps included -- nothing to decode, and a quarter
+  to an eighth of the bytes to hand over. On spriteice's Ally X, a run's
+  textures took 82 to 89 ms to make instead of 576 to 600, and the frames
+  entering a level came in under 27 ms instead of 42 to 111. Apple's OpenGL
+  takes them too, but in testing two frames there stalled for 130 and 157 ms
+  where 0.5.10 took 27 and 38, so the Mac decodes them as before for now --
+  as Metal, phones, and computers drawing without a graphics card (Mesa's
+  llvmpipe and the like, where a texture decoded once draws faster) do.
+  Every texture that is still decoded is decoded by a loop of its own for
+  its format, texel for texel as before. `RECOMP_GL_DXT=0` decodes them all,
+  `RECOMP_GL_DXT=1` hands them over wherever the driver takes them.
+- **Fades no longer build shaders.** Each combiner stage reads two constant
+  colours, and they were written into the shader itself, so every shade of a
+  fade -- the spray can's effects, the sewer's splashes -- was a new shader,
+  built in the middle of a frame: up to three a frame, about 8 ms each, on
+  spriteice's machine. The shader now reads them as values it is handed
+  (uniforms), so a whole fade is one shader. Because the shaders' text
+  changed, the shader cache starts afresh once: the first start builds them
+  again, ahead of time -- in the background on Metal, on quiet frames on
+  OpenGL.
+- **Drawing commands.** More than half of what the game sends the GPU are
+  vertex indices, up to 2,047 in one command, and each went through three
+  function calls on its own before landing in a list: a whole run of them is
+  now appended in one go (1.4 ns an index instead of 11.5 in the engine's
+  test). On Windows and Linux, the check that a kept draw's vertices haven't
+  changed hashes them about twice as fast (SSE2, or AVX2 where the processor
+  has it).
+- **Linux: less time spinning.** To show a frame at exactly the right moment,
+  the engine sleeps until just before it and spins on the clock for the rest,
+  1.2 ms of a core every frame. On Linux it now sleeps to an exact moment and
+  spins only the last 0.3 ms, widening that by itself when a sleep runs late
+  (`RECOMP_PACE_SPIN_US=1200`: as before). Windows, macOS, iOS and Android are
+  unchanged.
+- **Smaller logs.** A diagnostic probe that wrote about 200 lines every five
+  seconds -- nearly half of every log -- is off unless `RECOMP_GL_TIMELINE=1`.
+- Tested on a Mac against 0.5.10, back to back on the same machine: the
+  Fortified Residential Zone four times on Metal (0.6.0, 0.5.10, 0.5.10,
+  0.6.0 -- 60 frames a second throughout, not one slow frame once the level
+  was on) and on OpenGL, Dogenzaka Hill on OpenGL with SMAA and MSAA 4x and on
+  Metal (the pictures alike), and Shibuya Terminal from an empty save folder
+  (the camera 0.109 to 0.110 degree at every one of 197 frames, the sound
+  never running dry, as in 0.5.10). Then the pictures side by side with
+  0.5.10's at the same moments of play in the Fortified Residential Zone, on
+  Metal and on OpenGL, and once with the DXT textures handed to the driver
+  as they are (the Windows and Linux way, on the Mac's OpenGL): the same,
+  shadows and all, the DXT ones within a level or two of a colour here and
+  there. Linux (Mesa's llvmpipe) and Windows (under Wine): the attract demo
+  against 0.5.10 on the same machine, the same frame rate. The Android and
+  iPhone builds were built and checked, not run. And the engine's new tests:
+  every texture format decoded texel for texel as before; DXT through a
+  driver within 1 or 2 of the old decoder, transparent texels exact; runs of
+  indices leaving the renderer byte for byte as one index at a time; the new
+  hash against the same steps in plain C; the shaders the same through new
+  constants, every constant read where it should be, and accepted by
+  glslangValidator.
+
 ## 0.5.10 — 29 October 2026
 
 A hang where the picture stopped for good, now and then, while the game waited

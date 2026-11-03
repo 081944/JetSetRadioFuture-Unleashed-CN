@@ -251,22 +251,57 @@ Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeSetWidescreen(JNIEnv *env, jcla
     nv_window_request_widescreen(on ? 1 : 0);
 }
 
-/* The camera on the right stick (port/recomp_manual.c), as F7 switches it. */
+/* The camera on the right stick (port/recomp_manual.c), as F7 switches it:
+ * 0 off, 1 the camera, 2 tracking. */
 int  nv_window_pref_rstick_camera(void);
-void nv_window_request_rstick_camera(int on);
+void nv_window_request_rstick_camera(int mode);
 
-JNIEXPORT jboolean JNICALL
+JNIEXPORT jint JNICALL
 Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeRstickCamera(JNIEnv *env, jclass cls)
 {
     (void)env; (void)cls;
-    return nv_window_pref_rstick_camera() ? JNI_TRUE : JNI_FALSE;
+    return (jint)nv_window_pref_rstick_camera();
 }
 
 JNIEXPORT void JNICALL
-Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeSetRstickCamera(JNIEnv *env, jclass cls, jboolean on)
+Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeSetRstickCamera(JNIEnv *env, jclass cls, jint mode)
 {
     (void)env; (void)cls;
-    nv_window_request_rstick_camera(on ? 1 : 0);
+    nv_window_request_rstick_camera((int)mode);
+}
+
+/* Photo mode, from the settings (port/recomp_manual.c; the request is
+ * nv2a_gl.c's, with SDL). */
+void nv_window_request_photo(void);
+JNIEXPORT void JNICALL Java_com_jumatt_jsrfunleashed_JsrfActivity_nativePhotoMode(JNIEnv *env, jclass cls)
+{
+    (void)env; (void)cls;
+    nv_window_request_photo();
+}
+
+/* The map selector, from the settings (port/recomp_manual.c; the maps are
+ * jsrf_maps.h's, the request nv2a_gl.c's). */
+#include "../../src/nv2a_gl/jsrf_maps.h"
+void nv_window_request_map(int mission);
+JNIEXPORT jobjectArray JNICALL Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeMapNames(JNIEnv *env, jclass cls)
+{
+    jclass str = (*env)->FindClass(env, "java/lang/String");
+    jobjectArray a;
+    int k;
+    (void)cls;
+    if (!str) return NULL;
+    a = (*env)->NewObjectArray(env, JSRF_MAP_COUNT, str, NULL);
+    for (k = 0; a && k < JSRF_MAP_COUNT; k++) {
+        jstring n = (*env)->NewStringUTF(env, k_jsrf_maps[k].name);
+        (*env)->SetObjectArrayElement(env, a, k, n);
+        (*env)->DeleteLocalRef(env, n);
+    }
+    return a;
+}
+JNIEXPORT void JNICALL Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeGoToMap(JNIEnv *env, jclass cls, jint index)
+{
+    (void)env; (void)cls;
+    if (index >= 0 && index < JSRF_MAP_COUNT) nv_window_request_map(k_jsrf_maps[index].mission);
 }
 
 JNIEXPORT void JNICALL

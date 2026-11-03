@@ -60,8 +60,11 @@ Keyboard (by key position, so W A S D on QWERTY is Z Q S D on AZERTY):
   C / V        left / right stick click
 
   F11 or Alt+Return   full screen
-  F10                 widescreen 16:9 (a wider view, not a stretch; the HUD
-                      keeps its shape, the title screen stays 4:3); remembered
+  F10                 the picture, in turn: 4:3, 16:9 (widescreen) and 21:9
+                      (ultrawide) -- a wider view, not a stretch; the HUD keeps
+                      its shape and sits at the screen's edges, the title
+                      screen stays 4:3; remembered. On an ultrawide screen
+                      21:9 is the screen's own shape (up to 2.4:1).
   F9                  resolution: the game is drawn at 1x to 6x the Xbox's
                       640x480 (2x by default), up to 3840x2880 -- 6x is for a
                       4K screen; remembered. The game restarts to apply it,
@@ -69,11 +72,17 @@ Keyboard (by key position, so W A S D on QWERTY is Z Q S D on AZERTY):
   F8                  anti-aliasing: SMAA (a quick pass over each finished
                       frame) and MSAA 2x, 4x or 8x (every edge drawn with
                       that many samples a pixel), either or both; remembered
-  F7                  the camera on the right stick, on (the default) or off:
-                      the right stick (or the arrow keys) turns the camera
-                      around you and tilts it, and it eases back behind you
-                      when let go; L trigger puts it straight behind at once.
-                      Off, the camera is the original game's. Remembered
+  F7                  the camera on the right stick, in turn: on (the
+                      default), tracking, off. On, the right stick (or the
+                      arrow keys) turns the camera around you and tilts it,
+                      it eases back behind you when let go, L trigger puts it
+                      straight behind at once, and you go where it looks.
+                      Tracking, it only looks around: you keep going the way
+                      you were. Off, the camera is the original game's.
+                      Remembered
+  F6                  the map selector: a list of the 14 maps on screen;
+                      up/down to choose, A or Return to go there and skate it
+                      freely (as after the story), B or Esc to close
 
 
 Where things are kept

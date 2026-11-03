@@ -21,6 +21,42 @@ application.
 game files, no textures, no music, no video. It plays the files from a disc
 you own.
 
+## What it adds to the 2002 original
+
+The same game, made for today's screens and devices:
+
+- **On your phone.** Native apps for **iPhone, iPad and Android**, with
+  on-screen touch controls, or any Bluetooth controller — Xbox, DualSense,
+  Switch Pro. And natively on **Mac** (Apple Silicon, Metal), **Windows** and
+  **Linux**.
+- **Up to 4K.** The internal resolution goes from the Xbox's 640×480 up to
+  6× — 3840×2880, for a 4K screen — with **SMAA** and **MSAA** anti-aliasing.
+- **Widescreen 16:9 and ultrawide 21:9.** A wider view of Tokyo-to, not a
+  stretched one; the HUD moves out to the edges of the screen, and the boost's
+  heat haze covers the whole picture. On iPhone, the picture can fill the
+  screen.
+- **The camera on the right stick.** Turn and tilt the camera freely, as in a
+  modern game — the skater goes where you look, or, set to **tracking**, keeps
+  going while you look around. Or keep the original camera.
+- **Smooth 60 fps.** Shaders are built ahead and kept between sessions, so
+  new places don't stutter.
+- **Photo mode.** Hold Back (or Esc) while skating and the whole city stops —
+  skaters, people, cars, spray cans — while the camera is yours: fly it
+  around, hide the HUD, frame the shot. An on-screen panel shows the controls.
+- **A map selector.** Go straight to any of the 14 maps and skate it freely,
+  as after the story — nothing to race or chase. Explore Skyscraper District
+  on day one.
+- **Further draw distance in Skyscraper District**, where the towers used to
+  pop in on the way to 99th Street.
+- **The brake sparks and smoke, as on the console.** They come every time
+  and follow your skates, which they don't in emulation.
+- **Keyboard controls** on computers, by key position (WASD on QWERTY, ZQSD
+  on AZERTY), and **Game Mode** in full screen on the Mac.
+- **Your own copy, your way.** It plays from your game files or a disc image
+  of your disc; on iPhone, updates come through AltStore.
+
+What changed in each version is in the [changelog](CHANGELOG.md).
+
 ---
 
 ## Download
@@ -31,7 +67,7 @@ you own.
 | Linux, x86_64 (glibc 2.34 or later: Ubuntu 22.04, Debian 12, Fedora 36 and newer) | [JSRF-Unleashed-linux-x86_64.tar.gz](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-linux-x86_64.tar.gz) — less tested than the Mac build |
 | iPhone and iPad, iOS 15 or later (iPhone XS or newer recommended) | [JSRF-Unleashed-iOS.ipa](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-iOS.ipa) — less tested on iPads |
 | Windows 10 or 11, 64-bit | [JSRF-Unleashed-windows-x86_64.zip](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-windows-x86_64.zip) — tested under Wine |
-| Android 10 or later, 64-bit, OpenGL ES 3.0 | [JSRF-Unleashed-android-arm64.apk](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-android-arm64.apk) — tested in the Android emulator |
+| Android 10 or later, 64-bit, Snapdragon 8 Gen 1 or newer | [JSRF-Unleashed-android-arm64.apk](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-android-arm64.apk) — tested in the Android emulator |
 
 Every version is on the [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases) page; what changed is in the [changelog](CHANGELOG.md).
 
@@ -74,12 +110,15 @@ years has; on a laptop with two GPUs it asks for the dedicated one (NVIDIA or
 AMD). The **Video** menu at the top of the window sets the resolution, from
 1× to 6× the Xbox's 640×480 (2× by default; 6×, 3840×2880, is for a 4K
 screen; the game restarts to apply it), the anti-aliasing (SMAA, MSAA 2× to
-8×, or both), widescreen 16:9 and full screen, all of them remembered: the
-game starts the way it was left, in full screen or in a window
-(`--fullscreen` and `--windowed` choose for one start). The same are on
+8×, or both), the picture (4:3, 16:9, or 21:9 for an ultrawide screen) and
+full screen, all of them remembered: the game starts the way it was left, in
+full screen or in a window (`--fullscreen` and `--windowed` choose for one
+start). The same are on
 **F9**, **F8**, **F10** and **F11** (or Alt+Enter), which also work in full
-screen, where the menu is hidden. **Controls › Camera on the Right Stick**,
-or **F7**, turns the right-stick camera (below) off and on.
+screen, where the menu is hidden. **Controls › Camera on the Right Stick**
+and **Camera on the Right Stick (Tracking)**, or **F7** (on, tracking, off),
+choose how the right stick works (below). **Maps** goes straight to a map
+(below); **F6** shows the same list on screen.
 Controllers work through SDL: Xbox, PlayStation, Switch Pro and many more.
 Saves are kept in the game folder, in `UDATA`, as on the Mac. The
 `README.txt` inside lists the options and where the settings and logs
@@ -190,8 +229,9 @@ resolution (used from the next start). Saves are kept in the game folder (in
 somewhere first. Each run's log is
 `Android/data/com.jumatt.jsrfunleashed/files/Logs/last-run.log`.
 
-It needs Android 10 or later on a 64-bit phone or tablet with OpenGL ES 3.0
-(any from the last several years). So far it has been run in the Android
+It needs Android 10 or later on a 64-bit phone or tablet with a Snapdragon 8
+Gen 1 or newer: the game runs on the phone's processor, so a slower one lags
+whatever the resolution. So far it has been run in the Android
 emulator only — unpacking a disc image, boot, title, attract demo, the
 on-screen controls — not on a phone yet: reports are welcome.
 
@@ -207,9 +247,10 @@ OpenGL 3.3 drivers and an X11 or Wayland desktop; SDL2 is bundled. The
 and where settings, saves and logs are kept.
 
 On Linux the keyboard layout is the same as below; **F11** (or Alt+Return)
-toggles full screen, **F10** widescreen, **F9** sets the resolution (1× to
+toggles full screen, **F10** the picture (4:3, 16:9, 21:9), **F9** sets the resolution (1× to
 6×; the game restarts to apply it), **F8** the anti-aliasing (SMAA, MSAA,
-or both) and **F7** turns the right-stick camera (below) off and on.
+or both), **F7** turns the right-stick camera (below) off and on, and **F6**
+shows the map selector (below).
 
 ### Your game files
 
@@ -221,6 +262,24 @@ came with the Xbox), whose JSRF is a different, later build. Every app checks
 the files before starting and says what they are if they are not the right
 ones. Make an image of your own disc (`.iso`), or extract it: you want the
 folder with `default.xbe`, `Media/` and the rest.
+
+### A save from an Xbox, xemu or Cxbx-Reloaded
+
+Copy the save's folder into the game folder's `UDATA/5345000a/` (5345000a is
+JSRF's title ID), next to any save already there — from Cxbx-Reloaded it is
+in `EmuDisk/Partition1/UDATA/5345000a/`; from xemu or an Xbox, copy it out of
+the hard-disk image or the console with a FATX tool. A save is signed by the
+console or emulator that made it, and a save JSRF cannot check is taken for a damaged one,
+so sign it again for JSRF Unleashed with
+[`tools/jsrf_save_resign.py`](tools/jsrf_save_resign.py) (Python 3):
+
+```
+python3 jsrf_save_resign.py "<the game folder>/UDATA/5345000a"
+```
+
+It keeps a copy of each save as it was (`JSRFDATA.SAV.orig`) and leaves saves
+already signed for JSRF Unleashed alone. On iPhone and Android, sign it on a
+computer first, then copy the folder in.
 
 ## Playing
 
@@ -246,10 +305,33 @@ knows.
 **The camera on the right stick** (on by default, on every platform): the
 right stick — or the arrow keys — turns the camera around the skater and
 tilts it, and it eases back behind them when you let go; the L trigger still
-puts it straight behind at once, as in the original game. Turn it off for the
-original camera: **Controls › Camera on the Right Stick** on the Mac, **F7**
-(or the Controls menu) on Windows, **F7** on Linux, and the settings on the
-iPhone and on Android.
+puts it straight behind at once, as in the original game. The skater goes
+where the camera looks. **Tracking**, the other way to have it, only looks
+around: the skater keeps going the way they were, and up on the left stick
+is still straight ahead of them. Or turn it off for the original camera. On
+the Mac: **Controls › Camera on the Right Stick** or **Camera on the Right
+Stick (Tracking)** (choose the one that is on again to turn it off); **F7**
+on Windows (or the Controls menu) and Linux goes round on, tracking and off;
+and the settings on the iPhone and on Android.
+
+**Photo mode:** hold **Back** (Esc on a keyboard) for about a second while
+skating — or choose **Controls › Photo Mode** (⌘ P on the Mac, the Controls
+menu on Windows, the settings on iPhone and Android). The left stick moves the
+camera, the right stick turns it, the triggers lower and raise it; **Y** hides
+the HUD, **A** the help panel, and **B** or **Back** goes back to the game.
+The whole world holds still while you do — the skaters, the people, the cars,
+the spray cans — and goes on where it was when you go back. On a phone it
+needs a controller, for the right stick.
+
+**Map selector:** go straight to any map and skate it freely — the free
+skating that comes after the story, with nothing to race or chase. Choose it
+from the **Maps** menu on the Mac and on Windows, **Go to a map** in the
+settings on iPhone and Android, or press **F6** on Windows and Linux for a
+list on screen (up and down to choose, **A** or Return to go, **B** or Esc to
+close). Choose a map while you skate, or at the title screen — it goes there
+once you press Start. These are the
+game's last missions, so if the game offers to save while you explore, say
+no — or keep a copy of your save — so your story progress stays where it was.
 
 **Video menu:**
 - **Resolution** — the internal resolution, 1× to 6× (2× by default; 6×,
@@ -261,9 +343,12 @@ iPhone and on Android.
   apply it. Both are off by default.
 - **Renderer** — Metal (the default) or OpenGL. The game restarts to apply it.
 - **Full Screen** — Ctrl ⌘ F.
-- **Widescreen (16:9)** — ⇧ ⌘ W. The game is shown at 16:9 with a wider
-  field of view, not stretched; the HUD and text keep their shape. The title
-  screen stays 4:3.
+- **4:3**, **Widescreen (16:9)** — ⇧ ⌘ W, **Ultrawide (21:9)** — ⇧ ⌘ U. The
+  game is shown at that shape with a wider field of view, not stretched. On
+  an ultrawide screen 21:9 is the screen's own shape (2560×1080, 3440×1440,
+  up to 2.4:1), so the picture fills it; on any other screen it shows between
+  bars. The HUD keeps its shape and sits at the screen's edges; menus and
+  dialogue stay in the middle. The title screen stays 4:3.
 
 ## Status
 
@@ -275,7 +360,7 @@ Playable, early, and not yet played from start to finish.
 | New Game through the tutorial, the DJ K scene and Dogenzaka Hill | works — the part played and tested most |
 | Skating, grinding, tricks, graffiti, the pause map | works |
 | Music, sound effects, voices | works |
-| Widescreen 16:9 (and the whole screen, on iPhone) | works in game; the title screen stays 4:3 |
+| Widescreen 16:9 and 21:9 (and the whole screen, on iPhone) | works in game; the title screen stays 4:3 |
 | Linux build | boots, menus, starting a new game; far less played than the Mac build |
 | Windows build | tested under Wine |
 | iPhone / iPad build | plays on iPhone; less tested on iPads |

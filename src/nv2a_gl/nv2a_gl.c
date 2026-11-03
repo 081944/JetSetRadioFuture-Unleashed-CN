@@ -33,6 +33,9 @@
 #include "nv2a_backend.h"
 #include "nv2a_shader_cache.h"
 #include "jsrf_debug_env.h"
+#include "nv2a_hash.h"
+#include "nv2a_psh_consts.h"
+#include "jsrf_maps.h"
 
 /*
  * Two ways to get a 3.3 core context.
@@ -90,6 +93,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <math.h>
 #include <time.h>
 #include <stddef.h>
@@ -496,7 +500,7 @@ typedef struct {
     unsigned long vbo_bytes, unif_vec4;
     unsigned long geometry_packets, geometry_words;
     unsigned tex_held;                  /* textures the cache holds, now */
-    unsigned long long tex_held_bytes;  /* ... and their size, uploaded as RGBA8 */
+    unsigned long long tex_held_bytes;  /* ... and their size, as handed over */
     unsigned n_tex_rewritten;           /* dropped by tcache_verify: rewritten in place */
     unsigned long long tex_verified;    /* source bytes tcache_verify compared */
 } GlProfile;
@@ -839,7 +843,7 @@ static struct {
  * written, then one in fifty.
  */
 static struct {
-    unsigned compiles, tex_new;
+    unsigned compiles, tex_new, tex_dxt;        /* tex_dxt: DXT as they are (tex_dxt_direct) */
     double   compile_s, compile_worst, tex_s;
     double   idle_s;                            /* building ahead for the shader cache */
     double   pso_ms0;                           /* the backend's pipeline time at the frame's start */
@@ -1041,6 +1045,8 @@ static struct {
     float    vp_scale[4], vp_off[4];
     float    wide_shift;
     uint32_t fbo_w, fbo_h;      /* the surface size vpSurface and vpRect hold */
+    uint32_t psh_c[NV2A_PSH_NCONSTS];   /* the combiner constants, as words */
+    int      psh_ok;                    /* ... and whether the program has them */
 } g_last;
 static uint32_t g_frame_chars;       /* big skinned batches this frame */
 static uint32_t g_frame_chars_prev;  /* ... and in the frame just finished */
@@ -1067,6 +1073,7 @@ static struct {
     uint32_t sampling;      /* how it is sampled (sampler_key): part of what it is */
     int      bias;          /* uploaded as a bump source (g_upload_bias_bg) */
     int      used;
+    size_t   held;          /* bytes handed to the device: RGBA8, or DXT as stored */
 } g_tcache[TEX_CACHE];
 
 /* ---- helpers ------------------------------------------------------------ */
@@ -1281,6 +1288,11 @@ static void pres_start(void);        /* the presenter, below */
 static void sdl_menu_init(void);     /* the menu bar, below */
 static int  sdl_cfg_get(const char *key, int def);   /* the settings file, below */
 #endif
+static int   sdl_pref_picture(void);     /* the picture (4:3, 16:9, 21:9), below */
+static int   sdl_picture_now(void);
+static float sdl_screen_aspect(void);
+float nv2a_wide_aspect(void);
+void  nv2a_set_picture(int pic, float screen, int apply);
 
 static int gl_init(uint32_t w, uint32_t h)
 {
@@ -1315,15 +1327,18 @@ static int gl_init(uint32_t w, uint32_t h)
     /* The window is not the game's resolution: the game draws 640x480, the
      * renderer works at a multiple of that (RECOMP_GL_SCALE), and the window
      * is whatever size the player makes it -- each frame is fitted into it
-     * (sdl_present). It opens at 1280x960, or 16:9 at that height when
-     * widescreen is on, shrunk to fit the screen. */
+     * (sdl_present). It opens at 1280x960, or at the picture's shape at that
+     * height in widescreen (16:9, or 21:9), shrunk to fit the screen. */
     {
         int ww = 1280, wh = 960;
         Uint32 flags = SDL_WINDOW_OPENGL | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE;
         SDL_Rect usable;
         const char *e;
         (void)w; (void)h;
-        if (nv2a_widescreen()) ww = wh * 16 / 9;
+        /* The stored picture's shape, unless the environment says (tests). */
+        if (!getenv("RECOMP_WIDESCREEN") && !getenv("RECOMP_WIDE_ASPECT"))
+            nv2a_set_picture(sdl_pref_picture(), sdl_screen_aspect(), 0);
+        if (nv2a_widescreen()) ww = (int)((float)wh * nv2a_wide_aspect() + 0.5f);
         if (SDL_GetDisplayUsableBounds(0, &usable) == 0 && usable.h > 0 && usable.w > 0) {
             int maxh = usable.h * 9 / 10, maxw = usable.w * 9 / 10;
             if (wh > maxh) { ww = ww * maxh / wh; wh = maxh; }
@@ -1375,8 +1390,9 @@ static int gl_init(uint32_t w, uint32_t h)
 #if defined(_WIN32)
     sdl_menu_init();
 #endif
-    fprintf(stderr, "  [WIN] SDL window (%s video), %s\n", SDL_GetCurrentVideoDriver(),
-            nv2a_widescreen() ? "16:9" : "4:3");
+    fprintf(stderr, "  [WIN] SDL window (%s video), %s (%.3f:1; the screen %.3f:1)\n", SDL_GetCurrentVideoDriver(),
+            nv2a_widescreen() ? (sdl_picture_now() == 2 ? "21:9" : "16:9") : "4:3",
+            nv2a_widescreen() ? (double)nv2a_wide_aspect() : 4.0 / 3.0, (double)sdl_screen_aspect());
 
     fprintf(stderr, "  [GL] %s | %s | GLSL %s\n",
             (const char *)glGetString(GL_VERSION),
@@ -1397,6 +1413,7 @@ int  nv2a_widescreen(void);
 void nv2a_set_widescreen(int on);
 int  nv2a_wide_scene(void);
 float nv2a_wide_aspect(void);
+void nv2a_set_picture(int pic, float screen, int apply);
 
 /* $XDG_CONFIG_HOME/jsrf-unleashed/settings (or JSRF_SETTINGS_FILE): lines of
  * key=value, shared with the launcher script, which keeps game_dir and
@@ -1474,28 +1491,34 @@ static void sdl_cfg_set(const char *key, int val)
 /* nv2a_widescreen() asks this when RECOMP_WIDESCREEN is not set. */
 int nv_window_pref_widescreen(void) { return sdl_cfg_get("widescreen", 0) != 0; }
 
-/* The camera on the right stick (port/recomp_manual.c): on unless turned off --
- * Controls in the window's menu bar on Windows, F7 anywhere (and the Android
- * app's settings), kept as rstick_camera= (0 for off). Asked every frame, so
- * the file is read once. */
+/* The camera on the right stick (port/recomp_manual.c): 1 the camera (the
+ * default), 2 tracking -- the view turns and the skater keeps his heading --
+ * or 0 off. Controls in the window's menu bar on Windows, F7 anywhere (and
+ * the Android app's settings), kept as rstick_camera= (0 for off) and
+ * rstick_tracking=. Asked every frame, so the file is read once. */
 static volatile int g_rstick_cam = -1;
 int nv_window_pref_rstick_camera(void);
 int nv_window_pref_rstick_camera(void)
 {
-    if (g_rstick_cam < 0) g_rstick_cam = sdl_cfg_get("rstick_camera", 1) != 0;
+    if (g_rstick_cam < 0)
+        g_rstick_cam = sdl_cfg_get("rstick_camera", 1) ? (sdl_cfg_get("rstick_tracking", 0) ? 2 : 1) : 0;
     return g_rstick_cam;
 }
-static void nv_window_set_rstick_camera(int on)
+static void nv_window_set_rstick_camera(int mode)
 {
-    g_rstick_cam = on ? 1 : 0;
-    sdl_cfg_set("rstick_camera", g_rstick_cam);
-    fprintf(stderr, "[WIN] the camera on the right stick: %s\n", on ? "on" : "off");
+    g_rstick_cam = mode == 2 ? 2 : mode ? 1 : 0;
+    sdl_cfg_set("rstick_camera", g_rstick_cam != 0);
+    sdl_cfg_set("rstick_tracking", g_rstick_cam == 2);
+    fprintf(stderr, "[WIN] the right stick: %s\n", g_rstick_cam == 2 ? "the camera, tracking"
+                    : g_rstick_cam ? "the camera" : "the game's (camera off)");
 }
 /* Asked for from another thread (the Android app's settings): done at the
  * next sdl_pump, by the thread that owns the window and the settings file. */
 static volatile int g_sdl_want_rcam = -1;
-void nv_window_request_rstick_camera(int on);
-void nv_window_request_rstick_camera(int on) { g_sdl_want_rcam = on ? 1 : 0; }
+void nv_window_request_rstick_camera(int mode);
+void nv_window_request_rstick_camera(int mode) { g_sdl_want_rcam = mode == 2 ? 2 : mode ? 1 : 0; }
+void nv_window_request_photo(void);           /* photo mode's help panel, below */
+void nv_window_request_map(int mission);       /* the map selector, below (-1: its panel) */
 
 /* The keyboard as a gamepad -- the same layout as the Mac's, by key POSITION
  * (scancodes), so W A S D on QWERTY is Z Q S D on AZERTY:
@@ -1505,8 +1528,8 @@ void nv_window_request_rstick_camera(int on) { g_sdl_want_rcam = on ? 1 : 0; }
  *   R          Black                    F  White
  *   Return     Start                    Esc  Back (and Android's Back)
  *   C / V      left / right stick click
- * F11 or Alt+Return: full screen. F10: widescreen. F9: resolution. F8:
- * anti-aliasing. F7: the camera on the right stick. */
+ * F11 or Alt+Return: full screen. F10: the picture. F9: resolution. F8:
+ * anti-aliasing. F7: the camera on the right stick (on, tracking, off). */
 static volatile unsigned short g_sdl_kb_buttons;
 static volatile unsigned char  g_sdl_kb_analog[8];
 
@@ -1610,20 +1633,57 @@ static volatile int g_sdl_want_wide = -1;
 void nv_window_request_widescreen(int on);
 void nv_window_request_widescreen(int on) { g_sdl_want_wide = on ? 1 : 0; }
 
-static void sdl_toggle_widescreen(void)
+/* The picture -- 0 4:3, 1 16:9, 2 21:9 (nv2a_set_picture) -- kept as
+ * widescreen= and ultrawide= in the settings, the first as before, so the
+ * Android app's switch and an older version's choice still read right. */
+static int sdl_pref_picture(void)
 {
-    int on = !nv2a_widescreen();
-    nv2a_set_widescreen(on);
-    sdl_cfg_set("widescreen", on);
+    if (!sdl_cfg_get("widescreen", 0)) return 0;
+    return sdl_cfg_get("ultrawide", 0) ? 2 : 1;
+}
+/* The one shown now (RECOMP_WIDESCREEN and RECOMP_WIDE_ASPECT included). */
+static int sdl_picture_now(void)
+{
+    if (!nv2a_widescreen()) return 0;
+    return nv2a_wide_aspect() > 16.0f / 9.0f + 0.01f ? 2 : 1;
+}
+/* The shape of the screen the window is on (before there is a window, the
+ * first screen's); 0 if SDL cannot say. */
+static float sdl_screen_aspect(void)
+{
+    SDL_DisplayMode dm;
+    int d = g_window ? SDL_GetWindowDisplayIndex(g_window) : 0;
+    if (d < 0) d = 0;
+    if (SDL_GetDesktopDisplayMode(d, &dm) != 0 || dm.w <= 0 || dm.h <= 0) return 0.0f;
+    return (float)dm.w / (float)dm.h;
+}
+
+/* F10 (round 4:3, 16:9, 21:9), Video > Picture on Windows, and the Android
+ * app's widescreen switch (16:9 or 4:3). */
+static void sdl_set_picture(int pic)
+{
+    nv2a_set_picture(pic, sdl_screen_aspect(), 1);
+    sdl_cfg_set("widescreen", pic != 0);
+    sdl_cfg_set("ultrawide", pic == 2);
     /* A window (not full screen, not maximised) takes the new shape at the
-     * same height, as the Mac's does. */
+     * same height, as the Mac's does -- narrower if that would not fit. */
     if (!(SDL_GetWindowFlags(g_window) & (SDL_WINDOW_FULLSCREEN_DESKTOP | SDL_WINDOW_MAXIMIZED))) {
-        int ww, wh;
+        int ww, wh, nw;
+        SDL_Rect usable;
+        int d = SDL_GetWindowDisplayIndex(g_window);
         SDL_GetWindowSize(g_window, &ww, &wh);
-        SDL_SetWindowSize(g_window, on ? wh * 16 / 9 : wh * 4 / 3, wh);
+        nw = (int)((float)wh * (pic ? nv2a_wide_aspect() : 4.0f / 3.0f) + 0.5f);
+        if (SDL_GetDisplayUsableBounds(d < 0 ? 0 : d, &usable) == 0 && usable.w > 320
+            && nw > usable.w * 19 / 20) {
+            wh = wh * (usable.w * 19 / 20) / nw;
+            nw = usable.w * 19 / 20;
+        }
+        SDL_SetWindowSize(g_window, nw, wh);
     }
     sdl_menu_update();
-    fprintf(stderr, "[WIN] widescreen %s\n", on ? "on (16:9)" : "off (4:3)");
+    if (pic) fprintf(stderr, "[WIN] picture %s (%.3f:1)\n", pic == 2 ? "21:9" : "16:9",
+                     (double)nv2a_wide_aspect());
+    else     fprintf(stderr, "[WIN] picture 4:3\n");
 }
 
 /* F9: the internal resolution, 1x to 6x the Xbox's 640x480 (4x on Android,
@@ -1793,30 +1853,32 @@ static void sdl_choose_aa(void)
     sdl_keys_release();
 }
 
-/* F7 and Controls > Camera on the Right Stick: on or off, kept. */
-static void sdl_toggle_rstick_camera(void)
+/* F7 (round the camera, tracking and off) and Controls > Camera on the Right
+ * Stick, (Tracking): kept. */
+static void sdl_set_rstick_camera(int mode)
 {
-    nv_window_set_rstick_camera(!nv_window_pref_rstick_camera());
+    nv_window_set_rstick_camera(mode);
     sdl_menu_update();
 }
 
 #if defined(_WIN32)
 /*
  * The window's menu bar (Windows): Video -- the resolution, anti-aliasing,
- * widescreen and full screen, which is what the Mac's Video menu has and what
- * F9, F8, F10 and F11 do. Not in full screen, where it would sit across the
- * top of the picture; the keys work there, and leaving full screen brings it
- * back. SDL hands the menu's WM_COMMAND over as a system event (sdl_pump).
+ * the picture (4:3, 16:9, 21:9) and full screen, which is what the Mac's
+ * Video menu has and what F9, F8, F10 and F11 do. Not in full screen, where
+ * it would sit across the top of the picture; the keys work there, and
+ * leaving full screen brings it back. SDL hands the menu's WM_COMMAND over
+ * as a system event (sdl_pump).
  *
  * Holding a menu open holds the thread that owns the window, which is the
  * one that runs the GPU, so the game waits while it is open -- as a pause
  * menu would. Choosing a resolution asks before it restarts.
  */
 #include <SDL2/SDL_syswm.h>
-enum { MENU_RES1 = 101, MENU_WIDE = 110, MENU_FULL = 111, MENU_SMAA = 120, MENU_MSAA1 = 121,
-       MENU_RCAM = 130 };
+enum { MENU_RES1 = 101, MENU_FULL = 111, MENU_PIC1 = 112, MENU_SMAA = 120, MENU_MSAA1 = 121,
+       MENU_RCAM = 130, MENU_RCAMT = 131, MENU_PHOTO = 132, MENU_MAPS = 139, MENU_MAP0 = 140 };
 static HWND  g_menu_hwnd;
-static HMENU g_menu_bar, g_menu_video, g_menu_res, g_menu_aa, g_menu_controls;
+static HMENU g_menu_bar, g_menu_video, g_menu_res, g_menu_aa, g_menu_pic, g_menu_controls;
 
 static void sdl_menu_update(void)
 {
@@ -1825,8 +1887,8 @@ static void sdl_menu_update(void)
     for (i = 1; i <= NV2A_SCALE_MAX; i++)
         CheckMenuItem(g_menu_res, MENU_RES1 + i - 1,
                       MF_BYCOMMAND | (i == cur ? MF_CHECKED : MF_UNCHECKED));
-    CheckMenuItem(g_menu_video, MENU_WIDE,
-                  MF_BYCOMMAND | (nv2a_widescreen() ? MF_CHECKED : MF_UNCHECKED));
+    if (g_menu_pic)
+        CheckMenuRadioItem(g_menu_pic, MENU_PIC1, MENU_PIC1 + 2, MENU_PIC1 + sdl_picture_now(), MF_BYCOMMAND);
     /* Anti-aliasing: what is asked for, and only what the device can do. */
     CheckMenuItem(g_menu_aa, MENU_SMAA, MF_BYCOMMAND | (g_smaa_want ? MF_CHECKED : MF_UNCHECKED));
     EnableMenuItem(g_menu_aa, MENU_SMAA,
@@ -1838,9 +1900,12 @@ static void sdl_menu_update(void)
         EnableMenuItem(g_menu_aa, MENU_MSAA1 + i,
                        MF_BYCOMMAND | (!g_msaa_max || n <= g_msaa_max ? MF_ENABLED : MF_GRAYED));
     }
-    if (g_menu_controls)
+    if (g_menu_controls) {
         CheckMenuItem(g_menu_controls, MENU_RCAM,
-                      MF_BYCOMMAND | (nv_window_pref_rstick_camera() ? MF_CHECKED : MF_UNCHECKED));
+                      MF_BYCOMMAND | (nv_window_pref_rstick_camera() == 1 ? MF_CHECKED : MF_UNCHECKED));
+        CheckMenuItem(g_menu_controls, MENU_RCAMT,
+                      MF_BYCOMMAND | (nv_window_pref_rstick_camera() == 2 ? MF_CHECKED : MF_UNCHECKED));
+    }
 }
 
 /* The menu takes its height from the window, not from the picture: the
@@ -1865,7 +1930,8 @@ static void sdl_menu_init(void)
     g_menu_video = CreatePopupMenu();
     g_menu_res   = CreatePopupMenu();
     g_menu_aa    = CreatePopupMenu();
-    if (!g_menu_bar || !g_menu_video || !g_menu_res || !g_menu_aa) { g_menu_bar = NULL; return; }
+    g_menu_pic   = CreatePopupMenu();
+    if (!g_menu_bar || !g_menu_video || !g_menu_res || !g_menu_aa || !g_menu_pic) { g_menu_bar = NULL; return; }
     AppendMenuW(g_menu_res, MF_STRING, MENU_RES1 + 0, L"1x  (640 x 480)");
     AppendMenuW(g_menu_res, MF_STRING, MENU_RES1 + 1, L"2x  (1280 x 960)");
     AppendMenuW(g_menu_res, MF_STRING, MENU_RES1 + 2, L"3x  (1920 x 1440)");
@@ -1879,13 +1945,36 @@ static void sdl_menu_init(void)
     AppendMenuW(g_menu_aa, MF_STRING, MENU_MSAA1 + 2, L"MSAA &4x");
     AppendMenuW(g_menu_aa, MF_STRING, MENU_MSAA1 + 3, L"MSAA &8x");
     AppendMenuW(g_menu_video, MF_POPUP, (UINT_PTR)g_menu_res, L"&Resolution\tF9");
+    AppendMenuW(g_menu_pic, MF_STRING, MENU_PIC1 + 0, L"&4:3");
+    AppendMenuW(g_menu_pic, MF_STRING, MENU_PIC1 + 1, L"16:9  (&widescreen)");
+    AppendMenuW(g_menu_pic, MF_STRING, MENU_PIC1 + 2, L"21:9  (&ultrawide)");
     AppendMenuW(g_menu_video, MF_POPUP, (UINT_PTR)g_menu_aa, L"&Anti-aliasing\tF8");
-    AppendMenuW(g_menu_video, MF_STRING, MENU_WIDE, L"&Widescreen\tF10");
+    AppendMenuW(g_menu_video, MF_POPUP, (UINT_PTR)g_menu_pic, L"&Picture\tF10");
     AppendMenuW(g_menu_video, MF_STRING, MENU_FULL, L"&Full screen\tF11");
     AppendMenuW(g_menu_bar, MF_POPUP, (UINT_PTR)g_menu_video, L"&Video");
     if ((g_menu_controls = CreatePopupMenu()) != NULL) {
         AppendMenuW(g_menu_controls, MF_STRING, MENU_RCAM, L"Camera on the &Right Stick\tF7");
+        AppendMenuW(g_menu_controls, MF_STRING, MENU_RCAMT, L"Camera on the Right Stick (&Tracking)");
+        AppendMenuW(g_menu_controls, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(g_menu_controls, MF_STRING, MENU_PHOTO, L"&Photo Mode\t(hold Back / Esc)");
         AppendMenuW(g_menu_bar, MF_POPUP, (UINT_PTR)g_menu_controls, L"&Controls");
+    }
+    {   /* Maps: each map, by district (jsrf_maps.h); F6 the same list on screen. */
+        HMENU maps = CreatePopupMenu();
+        int k;
+        if (maps) {
+            AppendMenuW(maps, MF_STRING, MENU_MAPS, L"Map &Selector\tF6");
+            for (k = 0; k < JSRF_MAP_COUNT; k++) {
+                wchar_t w[64];
+                int i;
+                if (k == 0 || strcmp(k_jsrf_maps[k].district, k_jsrf_maps[k - 1].district) != 0)
+                    AppendMenuW(maps, MF_SEPARATOR, 0, NULL);
+                for (i = 0; k_jsrf_maps[k].name[i] && i < 63; i++) w[i] = (wchar_t)k_jsrf_maps[k].name[i];
+                w[i] = 0;
+                AppendMenuW(maps, MF_STRING, MENU_MAP0 + k, w);
+            }
+            AppendMenuW(g_menu_bar, MF_POPUP, (UINT_PTR)maps, L"&Maps");
+        }
     }
     SDL_EventState(SDL_SYSWMEVENT, SDL_ENABLE);
     sdl_menu_update();
@@ -1915,19 +2004,174 @@ static void sdl_menu_command(unsigned id)
         box.buttons = b;
         if (SDL_ShowMessageBox(&box, &ans) == 0 && ans == 1) sdl_restart_at(pick, 0);
         sdl_keys_release();
-    } else if (id == MENU_WIDE) {
-        sdl_toggle_widescreen();
+    } else if (id >= MENU_PIC1 && id < MENU_PIC1 + 3) {
+        sdl_set_picture((int)(id - MENU_PIC1));
     } else if (id == MENU_FULL) {
         sdl_fullscreen_by_player();
     } else if (id == MENU_SMAA) {
         sdl_pick_smaa(!g_smaa_want);
     } else if (id >= MENU_MSAA1 && id < MENU_MSAA1 + 4) {
         sdl_pick_msaa(1 << (id - MENU_MSAA1));
-    } else if (id == MENU_RCAM) {
-        sdl_toggle_rstick_camera();
+    } else if (id == MENU_PHOTO) {
+        nv_window_request_photo();
+    } else if (id == MENU_MAPS) {
+        nv_window_request_map(-1);
+    } else if (id >= MENU_MAP0 && id < MENU_MAP0 + (unsigned)JSRF_MAP_COUNT) {
+        nv_window_request_map(k_jsrf_maps[id - MENU_MAP0].mission);
+    } else if (id == MENU_RCAM || id == MENU_RCAMT) {
+        /* The one that is on, chosen again, turns it off. */
+        int want = id == MENU_RCAMT ? 2 : 1;
+        sdl_set_rstick_camera(nv_window_pref_rstick_camera() == want ? 0 : want);
     }
 }
 #endif
+
+/* ---- Photo mode's help panel ----------------------------------------------
+ * The text photo mode asks for (port/recomp_manual.c), drawn over the frame
+ * in the window's corner: lines of a small 5x7 font of this file's own,
+ * rasterised into a texture when the text changes and blitted -- scaled up a
+ * whole number of times, kept sharp -- just before the swap. No program, no
+ * blending: the panel is opaque, dark, with the title in the HUD's green. */
+static const struct { char c; unsigned char rows[7]; } k_help_font[] = {
+    { ' ', { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
+    { '(', { 0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02 } },
+    { ')', { 0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08 } },
+    { ',', { 0x00, 0x00, 0x00, 0x00, 0x0C, 0x04, 0x08 } },
+    { '-', { 0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00 } },
+    { '.', { 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C } },
+    { '/', { 0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10 } },
+    { '0', { 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E } },
+    { '1', { 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E } },
+    { '2', { 0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F } },
+    { '3', { 0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E } },
+    { '4', { 0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02 } },
+    { '5', { 0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E } },
+    { '6', { 0x0E, 0x10, 0x10, 0x1E, 0x11, 0x11, 0x0E } },
+    { '7', { 0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 } },
+    { '8', { 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E } },
+    { '9', { 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x0E } },
+    { ':', { 0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00 } },
+    { '>', { 0x08, 0x04, 0x02, 0x01, 0x02, 0x04, 0x08 } },
+    { 'A', { 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 } },
+    { 'B', { 0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E } },
+    { 'C', { 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E } },
+    { 'D', { 0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E } },
+    { 'E', { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F } },
+    { 'F', { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10 } },
+    { 'G', { 0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F } },
+    { 'H', { 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 } },
+    { 'I', { 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E } },
+    { 'J', { 0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C } },
+    { 'K', { 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11 } },
+    { 'L', { 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F } },
+    { 'M', { 0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11 } },
+    { 'N', { 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11 } },
+    { 'O', { 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E } },
+    { 'P', { 0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10 } },
+    { 'Q', { 0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D } },
+    { 'R', { 0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11 } },
+    { 'S', { 0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E } },
+    { 'T', { 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 } },
+    { 'U', { 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E } },
+    { 'V', { 0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04 } },
+    { 'W', { 0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A } },
+    { 'X', { 0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11 } },
+    { 'Y', { 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04 } },
+    { 'Z', { 0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F } },
+
+};
+static SDL_SpinLock g_help_lock;
+static char g_help_text[640];
+static volatile int g_help_serial;
+static volatile int g_photo_request;
+void nv_window_photo_help(const char *text);
+void nv_window_photo_help(const char *text)
+{
+    SDL_AtomicLock(&g_help_lock);
+    snprintf(g_help_text, sizeof g_help_text, "%s", text ? text : "");
+    g_help_serial++;
+    SDL_AtomicUnlock(&g_help_lock);
+}
+/* Photo Mode from a menu (Windows) or the Android app's settings. */
+void nv_window_request_photo(void);
+void nv_window_request_photo(void) { g_photo_request = 1; }
+int nv_window_take_photo_request(void);
+int nv_window_take_photo_request(void) { int r = g_photo_request; g_photo_request = 0; return r; }
+/* The map selector (port/recomp_manual.c): a map from a menu (Windows) or the
+ * Android app's settings, or -1, its panel (F6). */
+static volatile int g_map_request;
+void nv_window_request_map(int mission) { g_map_request = mission; }
+int nv_window_take_map_request(void);
+int nv_window_take_map_request(void) { int r = g_map_request; g_map_request = 0; return r; }
+
+typedef struct { GLuint tex, fbo; int serial, w, h, has; } HelpPanel;
+static const unsigned char *help_glyph(char c)
+{
+    size_t i;
+    for (i = 0; i < sizeof k_help_font / sizeof k_help_font[0]; i++)
+        if (k_help_font[i].c == c) return k_help_font[i].rows;
+    return k_help_font[0].rows;                       /* ' ' */
+}
+/* With the window's framebuffer bound for drawing (ww x wh). */
+static void help_panel_draw(HelpPanel *hp, int ww, int wh)
+{
+    int serial = g_help_serial, s, x0, y0;
+    if (serial != hp->serial) {
+        char text[sizeof g_help_text];
+        int lines = 0, cols = 0, len = 0, i, row, w, h;
+        const char *p;
+        uint8_t *px;
+        SDL_AtomicLock(&g_help_lock);
+        memcpy(text, g_help_text, sizeof text);
+        serial = g_help_serial;
+        SDL_AtomicUnlock(&g_help_lock);
+        hp->serial = serial;
+        hp->has = text[0] != 0;
+        if (!hp->has) return;
+        for (p = text; ; p++) {
+            if (*p == '\n' || !*p) { lines++; if (len > cols) cols = len; len = 0; if (!*p) break; }
+            else len++;
+        }
+        w = cols * 6 + 9; h = lines * 10 + 7;        /* 6x10 cells, a 4-pixel margin */
+        px = (uint8_t *)calloc((size_t)w * h, 4);
+        if (!px) { hp->has = 0; return; }
+        for (i = 0; i < w * h; i++) { px[4 * i] = 16; px[4 * i + 1] = 16; px[4 * i + 2] = 20; px[4 * i + 3] = 255; }
+        row = 0; len = 0;
+        for (p = text; *p; p++) {
+            const unsigned char *g;
+            int gx, gy;
+            if (*p == '\n') { row++; len = 0; continue; }
+            g = help_glyph((char)toupper((unsigned char)*p));
+            for (gy = 0; gy < 7; gy++)
+                for (gx = 0; gx < 5; gx++) {
+                    int X = 4 + len * 6 + gx, Y = 4 + row * 10 + gy, o;
+                    if (!(g[gy] & (0x10 >> gx))) continue;
+                    o = 4 * ((h - 1 - Y) * w + X);    /* the texture's first row is the bottom */
+                    px[o] = row ? 235 : 190; px[o + 1] = row ? 235 : 240; px[o + 2] = row ? 235 : 40;
+                }
+            len++;
+        }
+        if (!hp->tex) { glGenTextures(1, &hp->tex); glGenFramebuffers(1, &hp->fbo); }
+        glBindTexture(GL_TEXTURE_2D, hp->tex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, hp->fbo);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, hp->tex, 0);
+        free(px);
+        hp->w = w; hp->h = h;
+    }
+    if (!hp->has || ww <= 0 || wh <= 0) return;
+    s = wh / 300; if (s < 1) s = 1;
+    while (s > 1 && hp->w * s > ww - 16) s--;
+    x0 = 8 * s; y0 = 8 * s;                           /* the bottom-left corner */
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, hp->fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glBlitFramebuffer(0, 0, hp->w, hp->h, x0, y0, x0 + hp->w * s, y0 + hp->h * s,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+}
 
 /* The frame, fitted into the window between black bars: a widened scene at
  * 16:9 (the 640x480 surface holds a 16:9 view squeezed), anything else at its
@@ -1960,6 +2204,7 @@ static void sdl_present(GLuint src_fbo, int sw, int sh)
     glBlitFramebuffer(0, 0, sw, sh,
                       (ww - dw) / 2, (wh - dh) / 2, (ww - dw) / 2 + dw, (wh - dh) / 2 + dh,
                       GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    { static HelpPanel hp; help_panel_draw(&hp, ww, wh); }
     SDL_GL_SwapWindow(g_window);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)rfb);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)dfb);
@@ -2215,6 +2460,7 @@ static int SDLCALL pres_main(void *arg)
                         "presenter\n", told, w, h, ww, wh, dw, dh);
             }
         }
+        { static HelpPanel hp; help_panel_draw(&hp, ww, wh); }
         SDL_GL_SwapWindow(g_window);
         glFinish();                     /* the swap done: when the display took it */
         t = mono_now();
@@ -2357,12 +2603,12 @@ static void sdl_pump(void)
     if (g_sdl_want_wide >= 0) {
         int want = g_sdl_want_wide;
         g_sdl_want_wide = -1;
-        if (want != nv2a_widescreen()) sdl_toggle_widescreen();
+        if (want != nv2a_widescreen()) sdl_set_picture(want ? 1 : 0);
     }
     if (g_sdl_want_rcam >= 0) {
         int want = g_sdl_want_rcam;
         g_sdl_want_rcam = -1;
-        if (want != nv_window_pref_rstick_camera()) sdl_toggle_rstick_camera();
+        if (want != nv_window_pref_rstick_camera()) sdl_set_rstick_camera(want);
     }
     while (SDL_PollEvent(&ev)) {
         switch (ev.type) {
@@ -2379,10 +2625,15 @@ static void sdl_pump(void)
                     sdl_fullscreen_by_player();
                     break;
                 }
-                if (k == SDL_SCANCODE_F10) { sdl_toggle_widescreen(); break; }
+                if (k == SDL_SCANCODE_F10) { sdl_set_picture((sdl_picture_now() + 1) % 3); break; }
                 if (k == SDL_SCANCODE_F9)  { sdl_choose_scale(); break; }
                 if (k == SDL_SCANCODE_F8)  { sdl_choose_aa(); break; }
-                if (k == SDL_SCANCODE_F7)  { sdl_toggle_rstick_camera(); break; }
+                if (k == SDL_SCANCODE_F6)  { nv_window_request_map(-1); break; }   /* the map selector */
+                if (k == SDL_SCANCODE_F7)  {   /* the camera -> tracking -> off -> the camera */
+                    int m = nv_window_pref_rstick_camera();
+                    sdl_set_rstick_camera(m == 1 ? 2 : m == 2 ? 0 : 1);
+                    break;
+                }
             }
             sdl_key(ev.key.keysym.scancode, 1);
             break;
@@ -2396,6 +2647,15 @@ static void sdl_pump(void)
                 g_sdl_kb_buttons = 0;
                 for (i = 0; i < 8; i++) g_sdl_kb_analog[i] = 0;
             }
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+            /* 21:9 is the screen's own shape: moved to another screen, the
+             * window takes that one's. */
+            if (ev.window.event == SDL_WINDOWEVENT_DISPLAY_CHANGED && sdl_picture_now() == 2
+                && !getenv("RECOMP_WIDE_ASPECT")) {
+                nv2a_set_picture(2, sdl_screen_aspect(), 0);
+                fprintf(stderr, "[WIN] another screen: picture 21:9 at %.3f:1\n", (double)nv2a_wide_aspect());
+            }
+#endif
             break;
 #if defined(_WIN32)
         case SDL_SYSWMEVENT:
@@ -2751,18 +3011,47 @@ static int sticky_attrs(void)
 
 /* The combiner state's half of the program key, hashed again only when it
  * changed: comparing it costs a few nanoseconds, hashing it a byte at a time
- * a few hundred. */
+ * a few hundred. It leaves out what the shader reads as uniforms
+ * (nv2a_psh_key), so a fade through a constant keeps its program. */
 static uint32_t psh_hash(void)
 {
     static Nv2aPshState last;
     static uint32_t h;
     static int valid;
-    if (!valid || memcmp(&last, &S.psh, sizeof last)) {
-        memcpy(&last, &S.psh, sizeof last);
-        h = fnv(&S.psh, sizeof S.psh);
+    Nv2aPshState key;
+    nv2a_psh_key(&key, &S.psh);
+    if (!valid || memcmp(&last, &key, sizeof last)) {
+        memcpy(&last, &key, sizeof last);
+        h = fnv(&key, sizeof key);
         valid = 1;
     }
     return h;
+}
+
+/* What a program was made from, for the shader cache's states: the combiner
+ * state as the key has it (nv2a_psh_key), without the constants the shader
+ * reads as uniforms -- one state for every shade of a fade. */
+static void sc_state_note(uint32_t hash, int kind, const void *vdata, uint32_t vlen)
+{
+    Nv2aPshState key;
+    nv2a_psh_key(&key, &S.psh);
+    nv2a_sc_state_note(hash, kind, vdata, vlen, &key, (uint32_t)sizeof key);
+}
+
+/* The combiner constants (nv2a_psh_consts.h), sent to the program when they
+ * changed since it last had them: a fade changes one a frame, and most draws
+ * none. */
+static void psh_consts_send(int slot)
+{
+    uint32_t w[NV2A_PSH_NCONSTS];
+    float v[NV2A_PSH_NCONSTS * 4];
+    if (!uses(slot, NV2A_U_PSHC)) return;
+    nv2a_psh_const_words(w, &S.psh);
+    if (g_last.psh_ok && !memcmp(w, g_last.psh_c, sizeof w)) return;
+    nv2a_psh_const_values(v, w);
+    G->uniform_f(NV2A_U_PSHC, v, NV2A_PSH_NCONSTS);
+    memcpy(g_last.psh_c, w, sizeof w);
+    g_last.psh_ok = 1;
 }
 
 /* Which inputs a fixed-function batch actually has.
@@ -2942,7 +3231,7 @@ static int ff_program_for_current(void)
     free(fsrc);
     if (!prog) { S.shader_fails++; return -1; }
     /* What it was made from, for the next start, here or anywhere. */
-    nv2a_sc_state_note(hash, 2, &f, (uint32_t)sizeof f, &S.psh, (uint32_t)sizeof S.psh);
+    sc_state_note(hash, 2, &f, (uint32_t)sizeof f);
     if (g_pcache[slot].used && g_pcache[slot].prog) G->prog_free(g_pcache[slot].prog);
     free(g_pcache[slot].dis);
     memset(&g_pcache[slot], 0, sizeof g_pcache[slot]);
@@ -3133,7 +3422,7 @@ static int program_for_current(void)
                          "translated vertex program + combiners");
     g_seed_building = 0;
     if (prog && fsrc)   /* what it was made from (a diagnostic's solid colour: not) */
-        nv2a_sc_state_note(hash, 1, S.prog + start * 4, (uint32_t)len * 16u, &S.psh, (uint32_t)sizeof S.psh);
+        sc_state_note(hash, 1, S.prog + start * 4, (uint32_t)len * 16u);
     free(vsrc);
     free(fsrc);
     if (!prog) { S.shader_fails++; return -1; }
@@ -3219,7 +3508,14 @@ static uint32_t swz_to_linear(uint32_t f)
     }
 }
 
-static uint32_t decode_texel(uint32_t f, const uint8_t *p)
+/* Inlined wherever it is called, so that a loop over one format (decode_rows)
+ * gets that format's code alone. */
+#if defined(_MSC_VER)
+#define TEXEL_INLINE static __forceinline
+#else
+#define TEXEL_INLINE static inline __attribute__((always_inline))
+#endif
+TEXEL_INLINE uint32_t decode_texel(uint32_t f, const uint8_t *p)
 {
     uint32_t v;
     switch (f) {
@@ -3316,19 +3612,77 @@ static void tex_alpha_census(const uint8_t *rgba, uint32_t w, uint32_t h,
  * linear one -- decoded to RGBA8, row 0 first, into `rgba`. 0 for a format
  * this cannot decode. */
 static int g_upload_bias_bg;   /* see psh_sync_textures: bump sources */
+/* A texel, ARGB, as the bytes R, G, B, A, in one write: every host this runs
+ * on is little-endian. */
+TEXEL_INLINE void put_rgba(uint8_t *o, uint32_t argb)
+{
+    uint32_t v = (argb & 0xFF00FF00u) | ((argb >> 16) & 0xFFu) | ((argb & 0xFFu) << 16);
+    memcpy(o, &v, 4);
+}
+/* A swizzled or linear level's rows in one format, `lin` a constant: each
+ * format a loop of its own, where every texel used to ask decode_texel which
+ * format it was -- two to seven times as fast, texel for texel the same
+ * (spriteice's; tests/tex_decode). */
+TEXEL_INLINE void decode_rows(uint32_t lin, uint32_t bpp, int swz, const uint8_t *src,
+                              uint32_t w, uint32_t h, uint32_t pitch, const uint32_t *offx,
+                              const uint32_t *offy, uint32_t bias, uint8_t *rgba)
+{
+    uint32_t x, y;
+    for (y = 0; y < h; y++) {
+        const uint8_t *row = swz ? src + (size_t)offy[y] * bpp : src + (size_t)y * pitch;
+        uint8_t *o = rgba + (size_t)y * w * 4;
+        if (swz)
+            for (x = 0; x < w; x++)
+                put_rgba(o + (size_t)x * 4, decode_texel(lin, row + (size_t)offx[x] * bpp) ^ bias);
+        else
+            for (x = 0; x < w; x++)
+                put_rgba(o + (size_t)x * 4, decode_texel(lin, row + (size_t)x * bpp) ^ bias);
+    }
+}
+/* decode_level's for every format but DXT: apart, so that the DXT loop keeps
+ * its block decode inlined. */
+static int decode_texels(uint32_t color, const uint8_t *src, uint32_t w, uint32_t h,
+                         uint32_t pitch, uint8_t *rgba)
+{
+    /* Where each column and each row lands in a swizzled image, worked
+     * out once per level: swizzle_offset(x, y) is offx[x] | offy[y], and
+     * working it out per texel was most of the time a swizzled upload
+     * took. */
+    static uint32_t offx[4096], offy[4096];
+    uint32_t lin = fmt_is_swz(color) ? swz_to_linear(color) : color;
+    uint32_t bpp = linear_bpp(lin), bias = g_upload_bias_bg ? 0x00008080u : 0u;
+    uint32_t x, y;
+    int swz = fmt_is_swz(color);
+    if (!bpp) return 0;
+    if (swz) {
+        uint32_t mx, my;
+        xbox_swizzle_masks(w, h, &mx, &my);
+        for (x = 0; x < w; x++) offx[x] = swizzle_deposit(x, mx);
+        for (y = 0; y < h; y++) offy[y] = swizzle_deposit(y, my);
+    }
+    if (!pitch) pitch = w * bpp;
+#define ROWS(f, b) case f: decode_rows(f, b, swz, src, w, h, pitch, offx, offy, bias, rgba); break
+    switch (lin) {
+    ROWS(0x12, 4); ROWS(0x1E, 4); ROWS(0x3F, 4); ROWS(0x40, 4); ROWS(0x41, 4);
+    ROWS(0x10, 2); ROWS(0x1C, 2); ROWS(0x11, 2); ROWS(0x1D, 2); ROWS(0x20, 2);
+    ROWS(0x13, 1); ROWS(0x1F, 1);
+    default: return 0;
+    }
+#undef ROWS
+    return 1;
+}
 static int decode_level(uint32_t color, const uint8_t *src, uint32_t w, uint32_t h,
                         uint32_t pitch, uint8_t *rgba)
 {
     if (fmt_is_dxt(color)) {
-        /* Decoded here rather than handed to the driver compressed.
+        /* Decoded here only where the device doesn't take the blocks as
+         * they are, or the texels are read (tex_dxt_direct says when).
          *
-         * Passing the blocks straight through is faster and exact, but it
-         * makes every texture in the game depend on the host advertising
-         * S3TC -- and when it does not, glCompressedTexImage2D fails, the
-         * texture stays undefined, and every surface samples black. That is
-         * a whole-screen failure caused by a driver capability, which is not
-         * a trade worth making for an upload that happens once per texture
-         * and is cached afterwards.
+         * Handing every texture over compressed would make it depend on
+         * the host advertising S3TC -- and when it does not,
+         * glCompressedTexImage2D fails, the texture stays undefined, and
+         * every surface samples black. So the blocks go straight through
+         * only where the device says it takes them.
          *
          * A block at a time: decoded per texel, every block was decoded
          * sixteen times -- 4 ms a texture, and the 49 a new area brings at
@@ -3352,41 +3706,8 @@ static int decode_level(uint32_t color, const uint8_t *src, uint32_t w, uint32_t
                 }
             }
         return 1;
-    } else {
-        /* Where each column and each row lands in a swizzled image, worked
-         * out once per level: swizzle_offset(x, y) is offx[x] | offy[y], and
-         * working it out per texel was most of the time a swizzled upload
-         * took. */
-        static uint32_t offx[4096], offy[4096];
-        uint32_t lin = fmt_is_swz(color) ? swz_to_linear(color) : color;
-        uint32_t bpp = linear_bpp(lin);
-        uint32_t x, y;
-        int swz = fmt_is_swz(color);
-        if (!bpp) return 0;
-        if (swz) {
-            uint32_t mx, my;
-            xbox_swizzle_masks(w, h, &mx, &my);
-            for (x = 0; x < w; x++) offx[x] = swizzle_deposit(x, mx);
-            for (y = 0; y < h; y++) offy[y] = swizzle_deposit(y, my);
-        }
-        for (y = 0; y < h; y++) {
-            for (x = 0; x < w; x++) {
-                const uint8_t *p;
-                uint32_t argb;
-                if (swz)
-                    p = src + (size_t)(offx[x] | offy[y]) * bpp;
-                else
-                    p = src + (size_t)y * (pitch ? pitch : w * bpp) + (size_t)x * bpp;
-                argb = decode_texel(lin, p);
-                if (g_upload_bias_bg) argb ^= 0x00008080u;
-                rgba[((size_t)y * w + x) * 4 + 0] = (uint8_t)(argb >> 16);
-                rgba[((size_t)y * w + x) * 4 + 1] = (uint8_t)(argb >> 8);
-                rgba[((size_t)y * w + x) * 4 + 2] = (uint8_t)argb;
-                rgba[((size_t)y * w + x) * 4 + 3] = (uint8_t)(argb >> 24);
-            }
-        }
-        return 1;
     }
+    return decode_texels(color, src, w, h, pitch, rgba);
 }
 
 /*
@@ -3531,14 +3852,9 @@ static uint32_t tex_content(uint32_t color, uint32_t height, uint32_t pitch,
 static void tcache_drop(uint32_t k)
 {
     if (g_tcache[k].used && g_tcache[k].tex) {
-        uint32_t l, wl = g_tcache[k].w, hl = g_tcache[k].h;
         G->tex_free(g_tcache[k].tex);
         g_prof.tex_held--;
-        for (l = 0; l < (g_tcache[k].levels ? g_tcache[k].levels : 1); l++) {
-            g_prof.tex_held_bytes -= (unsigned long long)wl * hl * 4;
-            wl = wl > 1 ? wl / 2 : 1;
-            hl = hl > 1 ? hl / 2 : 1;
-        }
+        g_prof.tex_held_bytes -= (unsigned long long)g_tcache[k].held;
     }
     g_tcache[k].tex = 0;
     g_tcache[k].offset = 0xFFFFFFFFu;
@@ -3738,6 +4054,39 @@ static uint32_t sampler_key(const Nv2aSampler *s)
          | (uint32_t)s->levels << 16;
 }
 
+/*
+ * DXT textures handed to the device as the title stored them.
+ *
+ * They were all decoded to RGBA8 here (decode_level), so that no texture
+ * depended on the driver taking S3TC. Entering a level makes 50 to 110
+ * textures in one frame, and decoding them was most of the time those frames
+ * took: 61 to 75% of it in frames of 50 to 217 ms, as spriteice measured on a
+ * ROG Xbox Ally X. Where the device takes them (tex_new_dxt), DXT1, 3 and 5
+ * now go to it as they are: nothing to decode, and a quarter to an eighth of
+ * the bytes to hand over. Where it doesn't (Metal, an OpenGL without S3TC --
+ * most phones -- one drawing on the processor, and Apple's for now: see
+ * glx_s3tc), they are decoded as before, and so they are where the texels
+ * are read -- a bump source's bias (g_upload_bias_bg), the transparency
+ * census, the texture dump -- or for a chain the device makes itself
+ * (RECOMP_GL_MIPMAP). RECOMP_GL_DXT=0 decodes them all, to compare. The log
+ * says once which it is.
+ */
+static int g_dxt_direct = -1;   /* not asked yet; 0 decoded; 1 as they are */
+static unsigned g_dxt_made[2];  /* DXT textures made: decoded, as they are */
+static int tex_dxt_direct(const Nv2aSampler *smp)
+{
+    if (g_dxt_direct < 0) {
+        const char *v = getenv("RECOMP_GL_DXT"), *why = NULL;
+        if (v && atoi(v) == 0) why = "RECOMP_GL_DXT=0";
+        else if (!G->tex_new_dxt) why = "this device has no way to take them";
+        else if (getenv("RECOMP_GL_TEXALPHA") || getenv("RECOMP_GL_DUMP_TEX"))
+            why = "the census or the dump reads their texels";
+        g_dxt_direct = !why;
+        if (why) fprintf(stderr, "  [GL] DXT textures decoded (%s)\n", why);
+    }
+    return g_dxt_direct && !g_upload_bias_bg && !(smp->mip && smp->levels < 2);
+}
+
 static uint32_t upload_texture_inner(const TexStage *t)
 {
     uint32_t va = resolve(t->offset);
@@ -3746,9 +4095,9 @@ static uint32_t upload_texture_inner(const TexStage *t)
     int other_sampling = 0;
     uint32_t tex;
     uint8_t *rgba = NULL;
-    size_t rgba_bytes = 0;
+    size_t rgba_bytes = 0;      /* handed over: RGBA8, or DXT as it is */
     Nv2aSampler smp;
-    int slot = -1, stale = -1, tomb = -1;
+    int slot = -1, stale = -1, tomb = -1, dxt = 0;
 
     if (!w || !h || w > 4096 || h > 4096) return 0;
     nlev = tex_title_levels(t, w, h);
@@ -3846,6 +4195,25 @@ static uint32_t upload_texture_inner(const TexStage *t)
     /* Until the new texture exists the slot holds nothing. */
     tcache_drop((uint32_t)slot);
 
+    /* DXT as it is, where the device takes it (tex_dxt_direct). */
+    if (fmt_is_dxt(t->color) && tex_dxt_direct(&smp)) {
+        tex = G->tex_new_dxt(w, h, t->color == 0x0C ? 1 : t->color == 0x0E ? 3 : 5, src, &smp);
+        if (tex) {
+            uint32_t l, wl = w, hl = h;
+            for (l = 0; l < (smp.mip && nlev > 1 ? nlev : 1); l++) {
+                rgba_bytes += tex_bytes(t->color, wl, hl);
+                wl = wl > 1 ? wl / 2 : 1;
+                hl = hl > 1 ? hl / 2 : 1;
+            }
+            if (!g_dxt_made[1])
+                fprintf(stderr, "  [GL] DXT textures handed to the device as they are\n");
+            dxt = 1;
+            goto made;
+        }
+        g_dxt_direct = 0;
+        fprintf(stderr, "  [GL] DXT textures decoded (the device doesn't take them as they are)\n");
+    }
+
     /* Level 0, and the rest of the title's chain after it when it has one
      * (tex_title_levels): each level decoded as the base is, from where the
      * last one ended, into one buffer level after level. */
@@ -3883,16 +4251,6 @@ static uint32_t upload_texture_inner(const TexStage *t)
             hl = hl > 1 ? hl / 2 : 1;
         }
         tex_alpha_census(rgba, w, h, t->color, fmt_is_dxt(t->color));
-        /* How much of the city has a chain, once a while: uploads with one,
-         * and the levels they carried. */
-        { static unsigned long n, with, lv, twice;
-          n++;
-          if (nlev > 1) { with++; lv += nlev; }
-          if (other_sampling) twice++;
-          if (n == 200 || n % 2000 == 0)
-              fprintf(stderr, "  [GL] mipmaps: %lu of %lu textures uploaded with the title's own "
-                              "chain (%.1f levels each); %lu a second time, sampled another way\n",
-                      with, n, with ? (double)lv / with : 0.0, twice); }
     }
     /* RECOMP_GL_DUMP_TEX=<prefix>: every texture as uploaded. A frame that
      * shades to black is either sampling the wrong place or sampling a black
@@ -3973,10 +4331,24 @@ static uint32_t upload_texture_inner(const TexStage *t)
     free(rgba);
     if (!tex) return 0;
 
+made:
+    /* How much of the city has a chain, once a while: uploads with one,
+     * and the levels they carried. */
+    { static unsigned long n, with, lv, twice;
+      n++;
+      if (nlev > 1) { with++; lv += nlev; }
+      if (other_sampling) twice++;
+      if (n == 200 || n % 2000 == 0)
+          fprintf(stderr, "  [GL] mipmaps: %lu of %lu textures uploaded with the title's own "
+                          "chain (%.1f levels each); %lu a second time, sampled another way\n",
+                  with, n, with ? (double)lv / with : 0.0, twice); }
+    if (fmt_is_dxt(t->color)) g_dxt_made[dxt]++;
+    if (dxt) g_hf.tex_dxt++;
     g_prof.n_tex_upload++;
     g_hf.tex_new++;
     g_prof.tex_held++;
     g_prof.tex_held_bytes += (unsigned long long)rgba_bytes;
+    g_tcache[slot].held = rgba_bytes;
     g_tcache[slot].used = 1;
     g_tcache[slot].offset = t->offset; g_tcache[slot].format = t->color;
     g_tcache[slot].w = w; g_tcache[slot].h = h; g_tcache[slot].pitch = t->pitch;
@@ -4454,10 +4826,112 @@ void nv2a_set_wide_aspect(float a)
 }
 float nv2a_wide_aspect(void) { return g_wide_aspect; }
 float nv2a_wide_squeeze(void) { return g_wide_s; }
+/* The windows' Video menus (Mac, Windows, Linux) offer three pictures: 4:3,
+ * 16:9 and 21:9. "21:9" is an ultrawide screen's own shape when the window
+ * is on one -- 2560x1080 is 2.370:1, 3440x1440 2.389:1, 3840x1600 2.4:1 --
+ * so the picture fills it exactly; on any other screen it is 64:27, the
+ * 2.370:1 that "21:9" is sold as, between bars above and below. */
+float nv2a_ultrawide_aspect(float screen);
+float nv2a_ultrawide_aspect(float screen)
+{
+    if (screen >= 2.2f) return screen < 2.4f ? screen : 2.4f;
+    return 64.0f / 27.0f;
+}
+/* A window's picture: 0 4:3, 1 16:9, 2 21:9, on a screen of shape `screen`
+ * (width over height). `apply` switches widescreen too -- a choice made in
+ * the menu; at start-up, whether it is on is nv2a_widescreen's to read, from
+ * RECOMP_WIDESCREEN or the stored choice. RECOMP_WIDE_ASPECT, a test's, keeps
+ * its shape. */
+void nv2a_set_picture(int pic, float screen, int apply);
+void nv2a_set_picture(int pic, float screen, int apply)
+{
+    const char *v = getenv("RECOMP_WIDE_ASPECT");
+    if (apply) nv2a_set_widescreen(pic != 0);
+    if (!(v && atof(v) > 0.0))
+        nv2a_set_wide_aspect(pic == 2 ? nv2a_ultrawide_aspect(screen) : 16.0f / 9.0f);
+}
 static int g_wide_squeeze;   /* this draw's 2D squeeze, set in do_draw */
 static float g_wide_shift;   /* this draw's framed-3D move, title pixels, ditto */
+static float g_wide_anchor;  /* this draw's move to a screen edge, NDC (see wide_hud_sheet) */
+static int g_wide_fill;      /* this draw is a quad filling the 4:3 view, widened (do_draw) */
 static Nv2aRenderState g_draw_rs;   /* the state this draw was given */
 static float g_wide_ext[4];  /* its x and y extent, for the draw log */
+
+/* ---- the HUD at the screen's edges, in widescreen ---------------------------
+ *
+ * The squeeze above keeps every overlay its shape by drawing it into the
+ * middle 4:3 of the wide screen. For menus and dialogue that is right -- they
+ * are compositions centred on the screen -- but the in-game HUD is pinned to
+ * the 4:3 screen's corners: the health bar, the spray cans and a race's rival
+ * at the top right, the gauge at the bottom right (the timer is at the top
+ * centre). Kept in the middle 4:3 they ended 82% of the way across a 16:9
+ * screen and 74% across 21:9.
+ *
+ * The HUD draws its pieces from one texture, a 256x256 DXT3 sheet of them --
+ * the bars, the digits, the can, the icons -- while the dialogue box, the
+ * menus and their text have sheets of their own. So a flat piece of that
+ * sheet drawn wholly in the right part of the 4:3 screen (from 0.1 of the
+ * half-width right of centre) goes with the right edge, one wholly in the
+ * left part with the left edge, and the rest -- the timer -- stays centred.
+ * Moved by the width the squeeze took away, 1 - s of the half-width (a
+ * quarter at 16:9), a piece is as far from its edge as on the console, in
+ * the screen's height. The HUD's few pieces drawn in 3D (the can, the icon of
+ * the rival in a race) come right after the flat ones and go with them.
+ *
+ * The sheet is told by its content, not by where it is in memory.
+ * RECOMP_WIDE_HUD=0: the HUD in the middle 4:3, as before. */
+static int wide_hud_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *v = getenv("RECOMP_WIDE_HUD"); on = !(v && v[0] == '0'); }
+    return on;
+}
+/* The content hash (tex_content) of the texture a stage is bound to, from
+ * the texture cache: 0 if it has not been made yet. */
+static uint32_t tcache_content_of(const TexStage *t)
+{
+    uint32_t key = (t->offset ^ (t->width << 16) ^ (t->height << 4) ^ t->color) * 2246822519u, i;
+    for (i = 0; i < TEX_CACHE; i++) {
+        uint32_t k = (key + i) % TEX_CACHE;
+        if (!g_tcache[k].used) break;
+        if (g_tcache[k].tex && g_tcache[k].offset == t->offset && g_tcache[k].format == t->color
+            && g_tcache[k].w == t->width && g_tcache[k].h == t->height)
+            return g_tcache[k].content;
+    }
+    return 0;
+}
+/* The sheet's tex_content: the same in every mission measured (City Rush,
+ * Dogenzaka Hill, the Fortified Residential Zone), wherever it is loaded. */
+/* Photo mode's "HUD off" (port/recomp_manual.c). */
+static volatile int g_hide_hud;
+void nv2a_set_hide_hud(int hide);
+void nv2a_set_hide_hud(int hide) { g_hide_hud = hide; }
+#ifndef WIDE_HUD_SHEET
+#define WIDE_HUD_SHEET 0x35732389u
+#endif
+static int wide_hud_sheet(const TexStage *t)
+{
+    static uint32_t said[8]; static int nsaid;
+    static int mode = -1; static uint32_t want;
+    uint32_t c;
+    int i, hit;
+    if (!t->enabled || t->width != 256 || t->height != 256 || t->color != 0x0E) return 0;
+    if (mode < 0) {
+        /* RECOMP_WIDE_HUD_SHEET (test only): another hash, or @address. */
+        const char *v = getenv("RECOMP_WIDE_HUD_SHEET");
+        mode = (v && v[0] == '@') ? 1 : 0;
+        want = v ? (uint32_t)strtoul(v + mode, NULL, 16) : WIDE_HUD_SHEET;
+    }
+    c = tcache_content_of(t);
+    hit = mode ? t->offset == want : (c != 0 && c == want);
+    for (i = 0; i < nsaid; i++) if (said[i] == (t->offset ^ c)) break;
+    if (i == nsaid && nsaid < 8) {
+        said[nsaid++] = t->offset ^ c;
+        fprintf(stderr, "[WIDEHUD] 256x256 DXT3 at %08X, content %08X: %s\n", t->offset, c,
+                hit ? "the HUD's sheet" : "not the HUD's");
+    }
+    return hit;
+}
 
 /* One attribute array a draw reads, resolved once per draw: see do_draw. */
 typedef struct {
@@ -4582,7 +5056,8 @@ static struct {
 static uint64_t vc_rotl(uint64_t x, int r) { return (x << r) | (x >> (64 - r)); }
 
 /* A 64-bit hash of n bytes, four lanes wide (xxHash64's round): a few GB/s,
- * which is what makes checking the source of every kept draw affordable. */
+ * which is what makes checking the source of every kept draw affordable.
+ * From NV2A_HASH_MIN bytes on x86-64, the wider one in nv2a_hash.h. */
 static uint64_t vc_hash(const void *data, size_t n, uint64_t seed)
 {
     const uint64_t P1 = 0x9E3779B185EBCA87ull, P2 = 0xC2B2AE3D27D4EB4Full,
@@ -4590,6 +5065,9 @@ static uint64_t vc_hash(const void *data, size_t n, uint64_t seed)
     const uint8_t *p = (const uint8_t *)data;
     uint64_t a = seed + P1 + P2, b = seed + P2, c = seed, d = seed - P1, h, w;
     size_t len = n;
+#if defined(NV2A_HASH_WIDE)
+    if (n >= NV2A_HASH_MIN) return nv2a_hash_wide(data, n, seed);
+#endif
     while (n >= 32) {
         uint64_t w0, w1, w2, w3;
         memcpy(&w0, p, 8); memcpy(&w1, p + 8, 8);
@@ -4637,7 +5115,11 @@ static const char *vc_debug_switch(void)
         "TEXHASH_FULL", "CONTIG_ALL", "HEAP_FIRST", "STICKY_ATTRS",
         /* the frame dumps: taken at the flip, from the picture */
         "DUMP_FB", "DUMP_AFTER", "DUMP_EVERY", "DUMP_3D", "DUMP_TRIS",
-        "DUMP_CHARS", "DUMP_DEPTH", NULL
+        "DUMP_CHARS", "DUMP_DEPTH",
+        /* the timeline probe: a draw's number, surface and vertex count */
+        "TIMELINE",
+        /* DXT textures decoded rather than handed over as they are */
+        "DXT", NULL
     };
     static char name[64];
     char **e;
@@ -5354,6 +5836,9 @@ static void do_draw_body(void)
     if (fan_expand == 1) out_n = (n / 4) * 6;
     if (fan_expand == 2) out_n = (n >= 4) ? ((n - 2) / 2) * 6 : 0;
     if (!out_n) { g_drop[DROP_SHORT]++; return; }
+    /* Photo mode with the HUD hidden (nv2a_set_hide_hud): the HUD's pieces,
+     * all from its one sheet (wide_hud_sheet), are not drawn. */
+    if (g_hide_hud && S.clip_w == 640 && S.clip_h == 480 && wide_hud_sheet(&S.tex[0])) return;
 
     /*
      * The vertex layout, cut down to what this draw actually needs.
@@ -5704,6 +6189,80 @@ static void do_draw_body(void)
           if (nosq < 0) nosq = jsrf_getenv("RECOMP_WIDE_NOSQUEEZE") ? 1 : 0;
           if (nosq) g_wide_squeeze = 0; }
     }
+    /* The HUD's pieces to the screen's edges (see wide_hud_sheet): a flat one
+     * by where it is; a 3D one, drawn right after a flat one that moved (or
+     * after a 3D one that did), with it. The pause screen draws its banners
+     * from the same sheet in 3D, with no flat piece of it before them, and
+     * they stay where they are. */
+    g_wide_anchor = 0.0f;
+    { static uint32_t hud_next = 0xFFFFFFFFu; static int hud_side;
+      if (nv2a_wide_scene() && wide_hud_on() && S.clip_w == 640 && S.clip_h == 480
+          && g_wide_s < 0.999f && S.tex[0].enabled) {
+          int flat = S.xf_mode != NV2A_XF_MODE_FIXED && g_pcache[slot].inputs == 0x1F9B;
+          if (flat && g_wide_squeeze && wide_hud_sheet(&S.tex[0])) {
+              hud_side = g_wide_ext[0] >= 0.1f ? 1 : g_wide_ext[1] <= -0.1f ? -1 : 0;
+              g_wide_anchor = (float)hud_side * (1.0f - g_wide_s);
+              hud_next = hud_side ? S.draws + 1 : 0xFFFFFFFFu;
+          } else if (!flat && out_n <= 32 && hud_side && S.draws == hud_next
+                     && wide_hud_sheet(&S.tex[0])) {
+              g_wide_anchor = (float)hud_side * (1.0f - g_wide_s);
+              hud_next = S.draws + 1;
+          }
+          if (g_wide_anchor != 0.0f) {
+              static int said;
+              if (said < 24) {
+                  said++;
+                  fprintf(stderr, "[WIDEHUD] flip %u draw %u: %s, %u vertices, x %.2f..%.2f y %.2f..%.2f "
+                          "-> %s edge (%+.3f)\n", S.flips, S.since_present, flat ? "flat" : "3D", out_n,
+                          g_wide_ext[0], g_wide_ext[1], g_wide_ext[2], g_wide_ext[3],
+                          g_wide_anchor > 0.0f ? "the right" : "the left", (double)g_wide_anchor);
+              }
+          }
+      } }
+    /* A quad that fills the screen from in front of the camera -- the boost
+     * dash's heat haze, which bends the scene drawn again small (a bump-
+     * mapped quad over a 128x128 copy of it). The title sizes it to fill its
+     * 4:3 view; through the widened camera it covered the middle 4:3 of the
+     * wide screen, with the edges of the haze in plain view at 12.5% and
+     * 87.5% of the width. A fixed-function draw of eight vertices or fewer
+     * whose corners land on that middle 4:3 -- the squeezed 4:3 screen, to a
+     * few pixels -- is widened to fill the screen (see the matrix it is
+     * drawn with, NV2A_U_FFMAT), the copy it samples with it. RECOMP_WIDE_FILL=0:
+     * as before. */
+    g_wide_fill = 0;
+    { static int on = -1;
+      if (on < 0) { const char *v = getenv("RECOMP_WIDE_FILL"); on = !(v && v[0] == '0'); }
+      if (on && nv2a_wide_scene() && S.xf_mode == NV2A_XF_MODE_FIXED && !vc_vb && attr_at[0] >= 0
+          && out_n >= 3 && out_n <= 8 && S.clip_w == 640 && S.clip_h == 480 && g_wide_s < 0.999f) {
+          const float (*mm)[4] = S.u.ff_mat;
+          float xlo = 1e30f, xhi = -1e30f, ylo = 1e30f, yhi = -1e30f, c = 0.5f * (float)g_fbo_w;
+          float tol = 0.008f * (float)g_fbo_w;
+          uint32_t q;
+          int ok = 1;
+          for (q = 0; q < out_n && ok; q++) {
+              const float *v = &vbuf[(size_t)q * stride_floats + (size_t)attr_at[0]];
+              float X = v[0] * mm[0][0] + v[1] * mm[0][1] + v[2] * mm[0][2] + v[3] * mm[0][3];
+              float Y = v[0] * mm[1][0] + v[1] * mm[1][1] + v[2] * mm[1][2] + v[3] * mm[1][3];
+              float W = v[0] * mm[3][0] + v[1] * mm[3][1] + v[2] * mm[3][2] + v[3] * mm[3][3];
+              if (!(W > 1e-6f)) { ok = 0; break; }
+              X /= W; Y /= W;
+              if (X < xlo) xlo = X;
+              if (X > xhi) xhi = X;
+              if (Y < ylo) ylo = Y;
+              if (Y > yhi) yhi = Y;
+          }
+          if (ok && fabsf(xlo - (c - g_wide_s * c)) < tol && fabsf(xhi - (c + g_wide_s * c)) < tol
+              && fabsf(ylo) < tol && fabsf(yhi - (float)g_fbo_h) < tol) {
+              static int said;
+              g_wide_fill = 1;
+              if (said < 6) {
+                  said++;
+                  fprintf(stderr, "[WIDEFILL] flip %u draw %u: %u vertices on %.1f..%.1f x %.1f..%.1f "
+                          "(the squeezed 4:3 screen) -- widened to fill it\n",
+                          S.flips, S.since_present, out_n, xlo, xhi, ylo, yhi);
+              }
+          }
+      } }
     /*
      * A 3D view inside a 2D frame -- the character select's two windows onto
      * the stage, a split screen. The title points it at a part of the screen
@@ -5755,6 +6314,7 @@ static void do_draw_body(void)
         g_last.tex_enable = -1;
         g_last.alpha_func = -1;
         g_last.vp_scale[0] = 1e30f;
+        g_last.psh_ok = 0;
     }
     /* The viewport the shader's epilogue divides by. The title programs it
      * into the hardware registers and, separately, into the constants its own
@@ -6081,7 +6641,16 @@ static void do_draw_body(void)
         G->uniform_f(NV2A_U_ZREV, r, 1);
     }
     if (uses(slot, NV2A_U_FFMAT)) {
-        G->uniform_f(NV2A_U_FFMAT, &S.u.ff_mat[0][0], 4);
+        if (g_wide_fill) {
+            /* Widened about the screen's centre c: x' = c + (x - c) / s, in
+             * the pixels the matrix lands in -- X' = X/s + c(1 - 1/s) W. */
+            float wm[4][4], c = 0.5f * (float)g_fbo_w, k = 1.0f / g_wide_s;
+            int j;
+            memcpy(wm, S.u.ff_mat, sizeof wm);
+            for (j = 0; j < 4; j++) wm[0][j] = wm[0][j] * k + c * (1.0f - k) * wm[3][j];
+            G->uniform_f(NV2A_U_FFMAT, &wm[0][0], 4);
+        } else
+            G->uniform_f(NV2A_U_FFMAT, &S.u.ff_mat[0][0], 4);
         if (uses(slot, NV2A_U_FFVPOFF)) {
             /* The viewport offset register less the driver's 0.53125 nudge,
              * as the programmable path takes it off (vpRect): the nudge
@@ -6161,11 +6730,24 @@ static void do_draw_body(void)
      * (x - vpOff.x) / vpScale.x, so 1/s more scale is s the width (at 16:9,
      * 4/3 more scale and 3/4 the width). */
     float vp_scale_eff[4];
+    float wshift = g_wide_shift;
     memcpy(vp_scale_eff, S.u.vp_scale, sizeof vp_scale_eff);
     if (g_wide_squeeze) vp_scale_eff[0] *= 1.0f / g_wide_s;
+    /* A HUD piece's move to the edge (g_wide_anchor, NDC) in the shift's
+     * title pixels: the fixed-function epilogue divides by half the surface,
+     * a program's by its viewport scale -- squeezed or not -- and then maps
+     * the viewport onto the surface (vpRect). */
+    if (g_wide_anchor != 0.0f) {
+        float half = 0.5f * (float)g_fbo_w;
+        if (S.xf_mode == NV2A_XF_MODE_FIXED) wshift -= g_wide_anchor * half;
+        else {
+            float rz = fabsf(S.u.vp_scale[0]) > 1e-6f ? fabsf(S.u.vp_scale[0]) : half;
+            wshift -= g_wide_anchor * vp_scale_eff[0] * half / rz;
+        }
+    }
     if (memcmp(g_last.vp_scale, vp_scale_eff, sizeof vp_scale_eff)
      || memcmp(g_last.vp_off, S.u.vp_off, sizeof S.u.vp_off)
-     || g_last.wide_shift != g_wide_shift
+     || g_last.wide_shift != wshift
      || g_last.fbo_w != g_fbo_w || g_last.fbo_h != g_fbo_h) {
         /* The viewport, whenever it or the surface it is on changes: vpSurface
          * and vpRect hold the surface's size, and a title can draw to a
@@ -6206,10 +6788,10 @@ static void do_draw_body(void)
             }
             G->uniform_f(NV2A_U_VPRECT, r, 1);
         }
-        uni1f(NV2A_U_WIDESHIFT, g_wide_shift);
+        uni1f(NV2A_U_WIDESHIFT, wshift);
         memcpy(g_last.vp_scale, vp_scale_eff, sizeof vp_scale_eff);
         memcpy(g_last.vp_off, S.u.vp_off, sizeof S.u.vp_off);
-        g_last.wide_shift = g_wide_shift;
+        g_last.wide_shift = wshift;
         g_last.fbo_w = g_fbo_w; g_last.fbo_h = g_fbo_h;
     }
 
@@ -6318,6 +6900,7 @@ static void do_draw_body(void)
                     ((S.fog_color >> 8) & 0xFF) / 255.0f,
                     ((S.fog_color >> 16) & 0xFF) / 255.0f,  /* B */
                     ((S.fog_color >> 24) & 0xFF) / 255.0f);
+    psh_consts_send(slot);
     {
         /* RECOMP_GL_NOALPHATEST=1 passes every fragment.
          *
@@ -6514,6 +7097,10 @@ static void do_draw_body(void)
           if (g_wide_squeeze || g_wide_shift != 0.0f) {
               float c = 0.5f * (float)g_fbo_w;
               float a = c + g_wide_s * ((float)cx0 - c), b = c + g_wide_s * ((float)cx1 - c);
+              /* A HUD piece moved to an edge takes its 4:3 screen with it:
+               * what the title parks past that screen's edge stays out of
+               * sight, past the wide screen's. */
+              if (g_wide_squeeze) { a += g_wide_anchor * c; b += g_wide_anchor * c; }
               cx0 = a > 0.0f ? (uint32_t)floorf(a) : 0u;
               cx1 = b > 0.0f ? (uint32_t)ceilf(b) : 0u;
               clip = 1;
@@ -7621,15 +8208,20 @@ static void do_draw_body(void)
        *
        * One frame every five seconds, printed as it happens: every surface
        * the frame switches to, every skinned batch, and every small quad
-       * (six vertices or fewer), which is what a composite looks like. */
+       * (six vertices or fewer), which is what a composite looks like.
+       * Only with RECOMP_GL_TIMELINE=1: up to 200 lines every five seconds,
+       * flushed, from the GPU thread, they were nearly half of every log. */
       { static double last_tl; static uint32_t tl_frame = 0xFFFFFFFFu;
         static uint32_t tl_surf; static int tl_events;
         static uint32_t tl_seen = 0xFFFFFFFFu; static int tl_arm;
+        static int tl_on = -1;
         double now_tl = g_frame_clock;
+        if (tl_on < 0) { const char *v = getenv("RECOMP_GL_TIMELINE");
+                         tl_on = v ? atoi(v) : 0; }
         /* Arming in the middle of a frame shows only its tail, which is
          * exactly the part that cannot answer the question. Wait for the
          * frame to turn over, then record that whole frame. */
-        if (tl_frame == 0xFFFFFFFFu && !tl_arm && now_tl - last_tl > 5.0)
+        if (tl_on && tl_frame == 0xFFFFFFFFu && !tl_arm && now_tl - last_tl > 5.0)
             tl_arm = 1;
         if (tl_arm && S.frames != tl_seen) {
             tl_arm = 0; last_tl = now_tl; tl_frame = S.frames;
@@ -9254,7 +9846,7 @@ static void do_draw_body(void)
                 "blend %d %04X/%04X depth %d/%d ctl %08X final %08X/%08X "
                 "| xf%u a9 off=%08X t%u s%u st%u u[%.3f..%.3f] v[%.3f..%.3f] "
                 "in%04X | sten %u f%X r%X m%X w%X op%X/%X/%X dfunc %X cm %08X | cull %d %X %X zc %X"
-                " | a0 off=%08X st%u p0 %.3f %.3f %.3f box %.3f..%.3f %.3f..%.3f %.3f..%.3f%s%s\n",
+                " | a0 off=%08X st%u p0 %.3f %.3f %.3f box %.3f..%.3f %.3f..%.3f %.3f..%.3f%s%s%s%s\n",
                 (long)S.flips, S.since_present, out_n, S.prim, slot,
                 S.u.vp_off[0] > 100.0f ? "3D" : "2D",
                 S.tex[0].offset, S.tex[0].width, S.tex[0].height,
@@ -9273,7 +9865,9 @@ static void do_draw_body(void)
                 S.attr[0].offset, S.attr[0].stride, p0[0], p0[1], p0[2],
                 plo[0], phi[0], plo[1], phi[1], plo[2], phi[2],
                 g_imm_drawing ? " | IMMEDIATE" : "",
-                g_wide_squeeze ? " | WIDE-SQUEEZED" : "");
+                g_wide_squeeze ? " | WIDE-SQUEEZED" : "",
+                g_wide_anchor > 0.0f ? " | HUD-RIGHT" : g_wide_anchor < 0.0f ? " | HUD-LEFT" : "",
+                g_wide_fill ? " | WIDE-FILL" : "");
         if (nv2a_wide_scene() && g_pcache[slot].inputs == 0x1F9B)
             fprintf(stderr, "[DRAW] f%ld %4u   2D ndc x[%.2f..%.2f] y[%.2f..%.2f]%s\n",
                     (long)S.flips, S.since_present, g_wide_ext[0], g_wide_ext[1],
@@ -9705,8 +10299,8 @@ static void fliplog(const char *why)
 /* How the pacing went, for the report: frames that reached the flip after
  * their moment, and the time from one released frame to the next. */
 static struct {
-    uint64_t frames, late, restarts, iv[5], overslept;
-    double   late_max, last, overslept_max;
+    uint64_t frames, late, restarts, iv[5], overslept, widened;
+    double   late_max, last, overslept_max, ran_over_max, margin_max;
 } g_pace_st;
 
 /* Sleep for ts -- on Windows, for about as long as that.
@@ -9737,6 +10331,66 @@ static void pace_sleep(const struct timespec *ts)
 }
 #else
 #define pace_sleep(ts) nanosleep((ts), NULL)
+#endif
+
+/* How much of the wait before a frame is spun rather than slept: the part a
+ * sleep cannot be trusted to deliver.
+ *
+ * 1.2 ms everywhere, and on Linux that spin -- the clock read in a loop -- was
+ * measured at about 7% of a core on the GPU thread, every frame, where Linux's
+ * sleeps barely needed it: one frame in 130,000 let go late, by half a
+ * millisecond. So on desktop Linux each sleep goes to an absolute time, which
+ * the slices before it cannot push later, and the spin starts 0.3 ms before
+ * the frame's moment. A sleep that runs more than three quarters of the way
+ * into the spin widens it at once, to what that sleep overran by and 0.2 ms
+ * more (1.2 ms at most); frames on time narrow it back by 2 us each.
+ * RECOMP_PACE_SPIN_US fixes it instead (1200: as before). Windows, macOS, iOS
+ * and Android keep 1.2 ms. (From spriteice's measurements on a ROG Xbox Ally
+ * X.) */
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <errno.h>
+#define PACE_ABSOLUTE 1
+static double g_pace_margin = -1.0, g_pace_margin_min;
+static int    g_pace_margin_fixed;
+
+static double pace_margin(void)
+{
+    if (g_pace_margin < 0.0) {
+        const char *v = getenv("RECOMP_PACE_SPIN_US");
+        g_pace_margin_fixed = v != NULL;
+        g_pace_margin_min = v ? atof(v) * 1e-6 : 0.0003;
+        if (g_pace_margin_min < 0.0) g_pace_margin_min = 0.0;
+        if (g_pace_margin_min > 0.005) g_pace_margin_min = 0.005;
+        g_pace_margin = g_pace_margin_min;
+        g_pace_st.margin_max = g_pace_margin;
+    }
+    return g_pace_margin;
+}
+
+/* The last sleep before the spin ended `over` past the spin's start. */
+static void pace_margin_learn(double over)
+{
+    if (over > g_pace_st.ran_over_max) g_pace_st.ran_over_max = over;
+    if (g_pace_margin_fixed) return;
+    if (over > g_pace_margin * 0.75) {
+        g_pace_margin = over + 0.0002 < 0.0012 ? over + 0.0002 : 0.0012;
+        g_pace_st.widened++;
+        if (g_pace_margin > g_pace_st.margin_max) g_pace_st.margin_max = g_pace_margin;
+    } else if (g_pace_margin > g_pace_margin_min) {
+        g_pace_margin -= 0.000002;
+        if (g_pace_margin < g_pace_margin_min) g_pace_margin = g_pace_margin_min;
+    }
+}
+
+/* Asleep until `until` on mono_now()'s clock. */
+static void pace_sleep_until(double until)
+{
+    struct timespec ts;
+    ts.tv_sec = (time_t)until;
+    ts.tv_nsec = (long)((until - (double)ts.tv_sec) * 1e9);
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) { }
+}
 #endif
 
 static void frame_pace(void)
@@ -9804,6 +10458,7 @@ static void frame_pace(void)
              * The last millisecond is spun rather than slept, because that is
              * the part the sleep cannot deliver accurately, and a millisecond
              * of one core is a cheaper way to hold 60 fps than missing it.
+             * (On desktop Linux, less of it: see pace_margin.)
              */
             now = mono_now();
             if (deadline == 0.0 || deadline < now - 1.0) deadline = now;
@@ -9844,7 +10499,12 @@ static void frame_pace(void)
                 deadline = now + period;
             } else if (now < deadline) {
                 int held = xbox_guest_lock_drop ? xbox_guest_lock_drop() : 0;
+#if defined(PACE_ABSOLUTE)
+                double spin = deadline - pace_margin();
+                int slept = 0;
+#else
                 double spin = deadline - 0.0012;
+#endif
                 /* Answer the display interrupt while waiting: this thread is
                  * the one that completes its acknowledgement, and the title's
                  * handler holds the guest lock until it does -- see
@@ -9857,6 +10517,16 @@ static void frame_pace(void)
                     service = (v ? atoi(v) : 1) && xbox_nv2a_vblank_service;
                 }
                 while (now < spin) {
+#if defined(PACE_ABSOLUTE)
+                    /* To an absolute time, the guest lock given up as below. */
+                    double until = spin;
+                    if (service && until - now > 0.001) until = now + 0.001;
+                    pace_sleep_until(until);
+                    slept = 1;
+                    now = mono_now();
+                    if (!service) break;
+                    xbox_nv2a_vblank_service();
+#else
                     struct timespec ts;
                     double wait = spin - now;
                     if (service && wait > 0.001) wait = 0.001;
@@ -9870,7 +10540,11 @@ static void frame_pace(void)
                     if (!service) break;
                     xbox_nv2a_vblank_service();
                     now = mono_now();
+#endif
                 }
+#if defined(PACE_ABSOLUTE)
+                if (slept) pace_margin_learn(now - spin);
+#endif
                 while ((now = mono_now()) < deadline) { if (service) xbox_nv2a_vblank_service(); }
                 /* A sleep that overran the deadline lets the frame go late;
                  * counted from half a millisecond. */
@@ -9907,10 +10581,12 @@ static void frame_pace(void)
                           g_ht.logged++;
                           fprintf(stderr, "[HITCH] frame %u: %.1f ms flip to flip, %u draws | "
                                   "%u programs built in %.1f ms (worst %.1f)%s | %u textures new, "
-                                  "%.1f ms in textures | %.1f ms the rest%s\n",
+                                  "%.1f ms in textures | %.1f ms the rest%s | %u of the new "
+                                  "textures DXT as they are\n",
                                   S.frames, ms, S.draws - g_hf.draws0, g_hf.compiles,
                                   1000.0 * g_hf.compile_s, 1000.0 * g_hf.compile_worst, pl,
-                                  g_hf.tex_new, 1000.0 * g_hf.tex_s, other < 0.0 ? 0.0 : other, gp);
+                                  g_hf.tex_new, 1000.0 * g_hf.tex_s, other < 0.0 ? 0.0 : other, gp,
+                                  g_hf.tex_dxt);
                       }
                   }
               }
@@ -11027,17 +11703,22 @@ int nv2a_gl_transform_run(uint32_t method, const uint32_t *params, uint32_t coun
     return 1;
 }
 
-int nv2a_gl_method_run(uint32_t method, const uint32_t *params, uint32_t count)
+int nv2a_gl_packet_batch_allowed(void)
 {
     static int allowed = -1;
+    if (allowed < 0)
+        allowed = !jsrf_getenv("RECOMP_PB_SOFT") && !jsrf_getenv("RECOMP_GL_PACKET_SCALAR") &&
+                  vc_debug_switch() == NULL;
+    return allowed;
+}
+
+int nv2a_gl_method_run(uint32_t method, const uint32_t *params, uint32_t count)
+{
     uint32_t take, i;
     if (method != M_ARRAY_ELEMENT16 && method != M_ARRAY_ELEMENT32 &&
         method != M_INLINE_ARRAY) return 0;
     if (!count || !nv2a_gl_enabled() || g_failed || !S.const_attr_init) return 0;
-    if (allowed < 0)
-        allowed = !jsrf_getenv("RECOMP_PB_SOFT") && !jsrf_getenv("RECOMP_GL_PACKET_SCALAR") &&
-                  vc_debug_switch() == NULL;
-    if (!allowed) return 0;
+    if (!nv2a_gl_packet_batch_allowed()) return 0;
 
     g_prof.geometry_packets++;
     g_prof.geometry_words += count;
@@ -11064,6 +11745,45 @@ int nv2a_gl_method_run(uint32_t method, const uint32_t *params, uint32_t count)
         S.inline_count += take;
     }
     return 1;
+}
+
+/*
+ * A run of index words in one call.
+ *
+ * In 99th Street the walk reads about 13 million words a second, and 55% of
+ * them are indices: ARRAY_ELEMENT16 or 32, one method written
+ * non-incrementing with up to 2047 words (spriteice's count). Each word went
+ * through three calls and every check nv2a_gl_method makes ahead of its
+ * switch, to land in S.idx.
+ *
+ * The first word still goes through nv2a_gl_method, which starts the batch,
+ * or draws what it holds if a constant or an array moved since
+ * (split_batch_if_state_moved). The rest are appended here as nv2a_gl_method
+ * would append them, dropped the same way once S.idx is full. Nothing
+ * nv2a_gl_method checks can change between two words of one run: only another
+ * method moves a constant or an array, and the per-method logs (methval_note,
+ * methtrace_note) skip the index methods.
+ */
+void nv2a_gl_indices(uint32_t method, const uint32_t *p, uint32_t n)
+{
+    uint32_t room, i;
+    nv2a_gl_method(method, p[0]);
+    if (n < 2 || !nv2a_gl_enabled() || g_failed) return;
+    p++;
+    n--;
+    if (method == M_ARRAY_ELEMENT16) {
+        room = (MAX_INDICES - S.idx_count) / 2;     /* two indices a word */
+        if (n > room) n = room;
+        for (i = 0; i < n; i++) {
+            S.idx[S.idx_count++] = p[i] & 0xFFFF;
+            S.idx[S.idx_count++] = p[i] >> 16;
+        }
+    } else if (method == M_ARRAY_ELEMENT32) {
+        room = MAX_INDICES - S.idx_count;
+        if (n > room) n = room;
+        memcpy(&S.idx[S.idx_count], p, n * sizeof *p);
+        S.idx_count += n;
+    }
 }
 
 void nv2a_gl_method(uint32_t method, uint32_t param)
@@ -11938,13 +12658,21 @@ void nv2a_gl_report(void)
         fprintf(stderr, "  [PACE] %llu frames paced at the flip: %llu reached it late "
                 "(worst %.1f ms), %llu let go late by the wait (worst %.1f ms), %llu restarts; "
                 "flip to flip: under 14 ms %llu, "
-                "a 60th of a second %llu, 19-30 ms %llu, 30-45 ms %llu, longer %llu (%llu)\n",
+                "a 60th of a second %llu, 19-30 ms %llu, 30-45 ms %llu, longer %llu (%llu)",
                 (unsigned long long)g_pace_st.frames, (unsigned long long)g_pace_st.late,
                 g_pace_st.late_max, (unsigned long long)g_pace_st.overslept,
                 1000.0 * g_pace_st.overslept_max, (unsigned long long)g_pace_st.restarts,
                 (unsigned long long)g_pace_st.iv[0], (unsigned long long)g_pace_st.iv[1],
                 (unsigned long long)g_pace_st.iv[2], (unsigned long long)g_pace_st.iv[3],
                 (unsigned long long)g_pace_st.iv[4], (unsigned long long)n);
+#if defined(PACE_ABSOLUTE)
+        if (g_pace_margin >= 0.0)
+            fprintf(stderr, "; spinning the last %.2f ms (at most %.2f, widened %llu times; "
+                    "a sleep ran up to %.2f ms past the spin's start)",
+                    1000.0 * g_pace_margin, 1000.0 * g_pace_st.margin_max,
+                    (unsigned long long)g_pace_st.widened, 1000.0 * g_pace_st.ran_over_max);
+#endif
+        fputc('\n', stderr);
     }
     if (g_ht.compiles)
         fprintf(stderr, "  [HITCH] %llu frames half again the period or longer; %llu programs "
@@ -11979,6 +12707,9 @@ void nv2a_gl_report(void)
         surf_desc(4), surf_desc(5), surf_desc(6), surf_desc(7),
         g_tex_dead[0][0], g_tex_dead[0][1], g_tex_dead[0][2],
         g_tex_dead[1][0], g_tex_dead[1][1], g_tex_dead[1][2]);
+    if (g_dxt_made[0] || g_dxt_made[1])
+        fprintf(stderr, "  [GL] DXT textures: %u handed to the device as they are, %u decoded\n",
+                g_dxt_made[1], g_dxt_made[0]);
     if (G) G->report();
     fflush(stderr);
 }

@@ -297,6 +297,10 @@ void nv_window_use_gl(void)
     });
 }
 
+static int   nv_window_picture_now(void);       /* the picture: 4:3, 16:9, 21:9 (below) */
+static float nv_window_screen_aspect(void);
+static void  nv_window_shape_for_mode(void);
+
 @interface NvWindowDelegate : NSObject <NSWindowDelegate>
 @end
 /* Whether any of the window can be seen: the Metal renderer does not ask
@@ -338,6 +342,14 @@ static void nv_window_note_refresh(void)
 {
     (void)n;
     nv_window_note_refresh();
+    /* 21:9 is the screen's own shape: on another screen, that one's. */
+    if (nv_window_picture_now() == 2 && !getenv("RECOMP_WIDE_ASPECT")) {
+        extern void nv2a_set_picture(int pic, float screen, int apply);
+        extern float nv2a_wide_aspect(void);
+        nv2a_set_picture(2, nv_window_screen_aspect(), 0);
+        fprintf(stderr, "[WIN] another screen: picture 21:9 at %.3f:1\n", (double)nv2a_wide_aspect());
+        nv_window_shape_for_mode();
+    }
 }
 @end
 
@@ -477,15 +489,42 @@ int nv_window_pref_scale(void)
     }
 }
 
-/* Video > Widescreen (16:9), stored as the "widescreen" default; applied at
- * once (nv2a_set_widescreen). RECOMP_WIDESCREEN in the environment wins
- * (nv2a_widescreen in nv2a_gl.c reads it first). */
+/* Video > 4:3, Widescreen (16:9), Ultrawide (21:9): the "widescreen" default
+ * as before, and "ultrawide" for 21:9 (nv2a_set_picture in nv2a_gl.c);
+ * applied at once. RECOMP_WIDESCREEN in the environment wins (nv2a_widescreen
+ * in nv2a_gl.c reads it first), and RECOMP_WIDE_ASPECT keeps its shape. */
 int nv_window_pref_widescreen(void);
 int nv_window_pref_widescreen(void)
 {
     @autoreleasepool {
         return [[NSUserDefaults standardUserDefaults] boolForKey:@"widescreen"] ? 1 : 0;
     }
+}
+static int nv_window_pref_picture(void)
+{
+    @autoreleasepool {
+        NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+        if (![d boolForKey:@"widescreen"]) return 0;
+        return [d boolForKey:@"ultrawide"] ? 2 : 1;
+    }
+}
+/* The picture shown now: 0 4:3, 1 16:9, 2 wider. */
+static int nv_window_picture_now(void)
+{
+    extern int nv2a_widescreen(void);
+    extern float nv2a_wide_aspect(void);
+    if (!nv2a_widescreen()) return 0;
+    return nv2a_wide_aspect() > 16.0f / 9.0f + 0.01f ? 2 : 1;
+}
+/* The shape of the screen the window is on (before there is a window, the
+ * main screen's). Main thread. */
+static float nv_window_screen_aspect(void)
+{
+    NSScreen *scr = (g_window && [g_window screen]) ? [g_window screen] : [NSScreen mainScreen];
+    NSRect f;
+    if (!scr) return 0.0f;
+    f = [scr frame];
+    return f.size.height > 0.0 ? (float)(f.size.width / f.size.height) : 0.0f;
 }
 
 /* Video > Renderer: Metal or OpenGL, stored as the "renderer" default
@@ -531,13 +570,14 @@ extern void nv2a_set_msaa(int n);
 extern int  nv2a_msaa_max(void);
 extern int  nv2a_msaa_live(void);
 
-/* The window in the picture's shape: 16:9 or 4:3, keeping its height (and
- * fitting the screen). Not while full screen -- the frame is letterboxed
- * there anyway. */
+/* The window in the picture's shape: 4:3, 16:9 or 21:9, keeping its height
+ * (and fitting the screen). Not while full screen -- the frame is
+ * letterboxed there anyway. */
 static void nv_window_shape_for_mode(void)
 {
     extern int nv2a_widescreen(void);
-    double aw = nv2a_widescreen() ? 16.0 : 4.0, ah = nv2a_widescreen() ? 9.0 : 3.0;
+    extern float nv2a_wide_aspect(void);
+    double aw = nv2a_widescreen() ? (double)nv2a_wide_aspect() * 9.0 : 4.0, ah = nv2a_widescreen() ? 9.0 : 3.0;
     NSRect content;
     if (!g_window) return;
     [g_window setContentAspectRatio:NSMakeSize(aw, ah)];
@@ -558,30 +598,102 @@ static void nv_window_shape_for_mode(void)
     }
 }
 
-/* Controls > Camera on the Right Stick, stored as the "rstickCamera" default:
- * on unless turned off. The right stick turns the camera around the skater
- * (recomp_manual.c, rcam_apply), which asks this every frame, so a change
- * applies at once. RECOMP_RSTICK_CAMERA in the environment wins there. */
+/* Controls > Camera on the Right Stick, and Camera on the Right Stick
+ * (Tracking): 1 or 2, 0 with neither -- the "rstickCamera" default, on unless
+ * turned off, and "rstickTracking". The right stick turns the camera around
+ * the skater (recomp_manual.c, rcam_apply); tracking, it turns only the view
+ * and the skater keeps his heading. Asked every frame, so a change applies at
+ * once. RECOMP_RSTICK_CAMERA in the environment wins there. */
 static volatile int g_rstick_cam = -1;
 int nv_window_pref_rstick_camera(void);
 int nv_window_pref_rstick_camera(void)
 {
     if (g_rstick_cam < 0) {
         @autoreleasepool {
-            id v = [[NSUserDefaults standardUserDefaults] objectForKey:@"rstickCamera"];
-            g_rstick_cam = v ? ([v boolValue] ? 1 : 0) : 1;
+            NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+            id v = [d objectForKey:@"rstickCamera"];
+            int on = v ? ([v boolValue] ? 1 : 0) : 1;
+            g_rstick_cam = on ? ([d boolForKey:@"rstickTracking"] ? 2 : 1) : 0;
         }
     }
     return g_rstick_cam;
 }
 
+/* ---- Photo mode (port/recomp_manual.c): the request from the menu, and the
+ * help panel -- a small borderless window of its own over the game's, at its
+ * bottom-left corner, which moves with it and takes no clicks. */
+static volatile int g_photo_request;
+void nv_window_request_photo(void);
+void nv_window_request_photo(void) { g_photo_request = 1; }
+int nv_window_take_photo_request(void);
+int nv_window_take_photo_request(void) { int r = g_photo_request; g_photo_request = 0; return r; }
+/* ---- the map selector (jsrf_maps.h): Maps > a map asks the game flow
+ * (port/recomp_manual.c) to go there. */
+#include "jsrf_maps.h"
+static volatile int g_map_request;
+void nv_window_request_map(int mission);
+void nv_window_request_map(int mission) { g_map_request = mission; }
+int nv_window_take_map_request(void);
+int nv_window_take_map_request(void) { int r = g_map_request; g_map_request = 0; return r; }
+static NSWindow *g_help_win;
+static NSTextField *g_help_field;
+void nv_window_photo_help(const char *text);
+void nv_window_photo_help(const char *text)
+{
+    NSString *str = text ? [NSString stringWithUTF8String:text] : nil;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSMutableAttributedString *as;
+        NSFont *font;
+        NSRange first;
+        NSSize sz;
+        NSRect content;
+        if (!g_window) return;
+        if (!str) {
+            if (g_help_win) { [g_window removeChildWindow:g_help_win]; [g_help_win orderOut:nil]; }
+            return;
+        }
+        font = [NSFont monospacedSystemFontOfSize:13.0 weight:NSFontWeightMedium];
+        as = [[NSMutableAttributedString alloc] initWithString:str attributes:@{
+            NSFontAttributeName: font,
+            NSForegroundColorAttributeName: [NSColor colorWithWhite:0.93 alpha:1.0] }];
+        first = [str rangeOfString:@"\n"];
+        if (first.location != NSNotFound)
+            [as addAttribute:NSForegroundColorAttributeName
+                       value:[NSColor colorWithRed:0.75 green:0.95 blue:0.16 alpha:1.0]
+                       range:NSMakeRange(0, first.location)];
+        if (!g_help_win) {
+            g_help_win = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 100, 100)
+                                                    styleMask:NSWindowStyleMaskBorderless
+                                                      backing:NSBackingStoreBuffered defer:NO];
+            [g_help_win setOpaque:NO];
+            [g_help_win setBackgroundColor:[NSColor colorWithWhite:0.05 alpha:0.82]];
+            [g_help_win setIgnoresMouseEvents:YES];
+            [g_help_win setHasShadow:NO];
+            [g_help_win setReleasedWhenClosed:NO];
+            g_help_field = [NSTextField labelWithString:@""];
+            [g_help_field setDrawsBackground:NO];
+            [[g_help_win contentView] addSubview:g_help_field];
+        }
+        [g_help_field setAttributedStringValue:as];
+        sz = [g_help_field fittingSize];
+        [g_help_field setFrame:NSMakeRect(12, 10, sz.width, sz.height)];
+        content = [g_window contentRectForFrameRect:[g_window frame]];
+        [g_help_win setFrame:NSMakeRect(content.origin.x + 14, content.origin.y + 14,
+                                        sz.width + 24, sz.height + 20) display:YES];
+        if (![g_help_win parentWindow]) [g_window addChildWindow:g_help_win ordered:NSWindowAbove];
+        [g_help_win orderFront:nil];
+    });
+}
+
 @interface NvMenuTarget : NSObject
 - (void)pickScale:(id)sender;
 - (void)pickRenderer:(id)sender;
-- (void)toggleWidescreen:(id)sender;
+- (void)pickPicture:(id)sender;
 - (void)toggleSmaa:(id)sender;
 - (void)pickMsaa:(id)sender;
-- (void)toggleRstickCamera:(id)sender;
+- (void)pickRstickCamera:(id)sender;
+- (void)photoMode:(id)sender;
+- (void)pickMap:(id)sender;
 - (void)showKeys:(id)sender;
 - (void)showPad:(id)sender;
 @end
@@ -698,8 +810,8 @@ int nv_window_pref_rstick_camera(void)
  * it applies), and no more samples than the device offers. */
 - (BOOL)validateMenuItem:(NSMenuItem *)item
 {
-    if ([item action] == @selector(toggleRstickCamera:)) {
-        [item setState:nv_window_pref_rstick_camera() ? NSControlStateValueOn : NSControlStateValueOff];
+    if ([item action] == @selector(pickRstickCamera:)) {
+        [item setState:[item tag] == nv_window_pref_rstick_camera() ? NSControlStateValueOn : NSControlStateValueOff];
         return YES;
     }
     if ([item action] == @selector(toggleSmaa:)) {
@@ -715,26 +827,53 @@ int nv_window_pref_rstick_camera(void)
     }
     return YES;
 }
-- (void)toggleRstickCamera:(id)sender
+/* Maps > a map: the item's tag is the mission. */
+- (void)pickMap:(id)sender
 {
-    int on = !nv_window_pref_rstick_camera();
-    g_rstick_cam = on;
-    [[NSUserDefaults standardUserDefaults] setBool:(on ? YES : NO) forKey:@"rstickCamera"];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-    [(NSMenuItem *)sender setState:on ? NSControlStateValueOn : NSControlStateValueOff];
-    fprintf(stderr, "[WIN] camera on the right stick %s\n", on ? "on" : "off");
+    g_map_request = (int)[sender tag];
 }
-- (void)toggleWidescreen:(id)sender
+/* Controls > Photo Mode: starts at the next frame of play (port/recomp_manual.c). */
+- (void)photoMode:(id)sender
 {
-    extern int nv2a_widescreen(void);
-    extern void nv2a_set_widescreen(int on);
-    int on = !nv2a_widescreen();
-    nv2a_set_widescreen(on);
-    [[NSUserDefaults standardUserDefaults] setBool:(on ? YES : NO) forKey:@"widescreen"];
+    (void)sender;
+    nv_window_request_photo();
+}
+/* The two items' tags are their modes: the one that is on, chosen again,
+ * turns the camera on the right stick off. */
+- (void)pickRstickCamera:(id)sender
+{
+    int want = (int)[(NSMenuItem *)sender tag];
+    int mode = want == nv_window_pref_rstick_camera() ? 0 : want;
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    g_rstick_cam = mode;
+    [d setBool:(mode ? YES : NO) forKey:@"rstickCamera"];
+    [d setBool:(mode == 2 ? YES : NO) forKey:@"rstickTracking"];
+    [d synchronize];
+    fprintf(stderr, "[WIN] the right stick: %s\n",
+            mode == 2 ? "the camera, tracking" : mode ? "the camera" : "the game's (camera off)");
+}
+/* Video > 4:3, Widescreen (16:9), Ultrawide (21:9): the item's tag is the
+ * picture. */
+- (void)pickPicture:(id)sender
+{
+    extern void nv2a_set_picture(int pic, float screen, int apply);
+    extern float nv2a_wide_aspect(void);
+    int pic = (int)[(NSMenuItem *)sender tag];
+    NSMenu *menu = [(NSMenuItem *)sender menu];
+    NSInteger i;
+    if (pic < 0 || pic > 2) return;
+    nv2a_set_picture(pic, nv_window_screen_aspect(), 1);
+    [[NSUserDefaults standardUserDefaults] setBool:(pic != 0 ? YES : NO) forKey:@"widescreen"];
+    [[NSUserDefaults standardUserDefaults] setBool:(pic == 2 ? YES : NO) forKey:@"ultrawide"];
     [[NSUserDefaults standardUserDefaults] synchronize];
-    [(NSMenuItem *)sender setState:on ? NSControlStateValueOn : NSControlStateValueOff];
+    for (i = 0; i < [menu numberOfItems]; i++) {
+        NSMenuItem *it = [menu itemAtIndex:i];
+        if ([it action] == @selector(pickPicture:))
+            [it setState:([it tag] == pic) ? NSControlStateValueOn : NSControlStateValueOff];
+    }
     nv_window_shape_for_mode();
-    fprintf(stderr, "[WIN] widescreen %s\n", on ? "on (16:9)" : "off (4:3)");
+    if (pic) fprintf(stderr, "[WIN] picture %s (%.3f:1)\n", pic == 2 ? "21:9" : "16:9", (double)nv2a_wide_aspect());
+    else     fprintf(stderr, "[WIN] picture 4:3\n");
 }
 - (void)showPad:(id)sender
 {
@@ -760,7 +899,9 @@ int nv_window_pref_rstick_camera(void)
          "Sticks, stick clicks\tthe same\n\n"
          "The right stick turns the camera around your skater (not in the "
          "original game; Controls > Camera on the Right Stick turns it off). "
-         "Let go and it drifts back behind; the L trigger puts it back at once.\n\n"
+         "Let go and it drifts back behind; the L trigger puts it back at once. "
+         "With Camera on the Right Stick (Tracking) it only looks around: the "
+         "skater keeps going the way he was.\n\n"
          "The keyboard keeps working alongside it. No vibration yet.";
     [a runModal];
 }
@@ -931,16 +1072,23 @@ static void build_menu(void)
         [video addItem:fs];
     }
     {
-        /* Cmd+Shift+W: Cmd+W alone closes windows everywhere else. */
-        extern int nv2a_widescreen(void);
-        NSMenuItem *ws = [[NSMenuItem alloc] initWithTitle:@"Widescreen (16:9)"
-                                                   action:@selector(toggleWidescreen:)
-                                            keyEquivalent:@"W"];
-        [ws setKeyEquivalentModifierMask:(NSEventModifierFlagCommand |
-                                          NSEventModifierFlagShift)];
-        [ws setTarget:g_menu_target];
-        [ws setState:nv2a_widescreen() ? NSControlStateValueOn : NSControlStateValueOff];
-        [video addItem:ws];
+        /* The picture: 4:3, 16:9 (Cmd+Shift+W: Cmd+W alone closes windows
+         * everywhere else), 21:9 (Cmd+Shift+U). */
+        NSString *names[3] = { @"4:3", @"Widescreen (16:9)", @"Ultrawide (21:9)" };
+        NSString *keys[3] = { @"", @"W", @"U" };
+        int p, now = nv_window_picture_now();
+        [video addItem:[NSMenuItem separatorItem]];
+        for (p = 0; p < 3; p++) {
+            NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:names[p]
+                                                       action:@selector(pickPicture:)
+                                                keyEquivalent:keys[p]];
+            if (p) [it setKeyEquivalentModifierMask:(NSEventModifierFlagCommand |
+                                                     NSEventModifierFlagShift)];
+            [it setTag:p];
+            [it setTarget:g_menu_target];
+            [it setState:(p == now) ? NSControlStateValueOn : NSControlStateValueOff];
+            [video addItem:it];
+        }
     }
     [videoItem setSubmenu:video];
     [bar addItem:videoItem];
@@ -962,16 +1110,55 @@ static void build_menu(void)
         }
         {
             /* Not in the original game: see nv_window_pref_rstick_camera. */
-            NSMenuItem *rc = [[NSMenuItem alloc] initWithTitle:@"Camera on the Right Stick"
-                                                       action:@selector(toggleRstickCamera:)
-                                                keyEquivalent:@""];
-            [rc setTarget:g_menu_target];
-            [rc setState:nv_window_pref_rstick_camera() ? NSControlStateValueOn : NSControlStateValueOff];
+            NSString *names[2] = { @"Camera on the Right Stick", @"Camera on the Right Stick (Tracking)" };
+            int k;
             [ctl addItem:[NSMenuItem separatorItem]];
-            [ctl addItem:rc];
+            for (k = 0; k < 2; k++) {
+                NSMenuItem *rc = [[NSMenuItem alloc] initWithTitle:names[k]
+                                                           action:@selector(pickRstickCamera:)
+                                                    keyEquivalent:@""];
+                [rc setTag:k + 1];
+                [rc setTarget:g_menu_target];
+                [rc setState:nv_window_pref_rstick_camera() == k + 1 ? NSControlStateValueOn : NSControlStateValueOff];
+                [ctl addItem:rc];
+            }
+            [ctl addItem:[NSMenuItem separatorItem]];
+            {
+                NSMenuItem *ph = [[NSMenuItem alloc] initWithTitle:@"Photo Mode (hold Back / Esc)"
+                                                            action:@selector(photoMode:)
+                                                     keyEquivalent:@"p"];
+                [ph setTarget:g_menu_target];
+                [ctl addItem:ph];
+            }
         }
         [ctlItem setSubmenu:ctl];
         [bar addItem:ctlItem];
+    }
+    {
+        NSMenuItem *mapsItem = [[NSMenuItem alloc] init];
+        NSMenu *maps = [[NSMenu alloc] initWithTitle:@"Maps"];
+        int k;
+        {   /* the same list on screen, gone through with the pad */
+            NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:@"Map Selector (on screen)"
+                                                        action:@selector(pickMap:)
+                                                 keyEquivalent:@""];
+            [it setTag:-1];
+            [it setTarget:g_menu_target];
+            [maps addItem:it];
+        }
+        for (k = 0; k < JSRF_MAP_COUNT; k++) {
+            NSMenuItem *it;
+            if (k == 0 || strcmp(k_jsrf_maps[k].district, k_jsrf_maps[k - 1].district) != 0)
+                [maps addItem:[NSMenuItem separatorItem]];
+            it = [[NSMenuItem alloc] initWithTitle:[NSString stringWithUTF8String:k_jsrf_maps[k].name]
+                                            action:@selector(pickMap:)
+                                     keyEquivalent:@""];
+            [it setTag:k_jsrf_maps[k].mission];
+            [it setTarget:g_menu_target];
+            [maps addItem:it];
+        }
+        [mapsItem setSubmenu:maps];
+        [bar addItem:mapsItem];
     }
 
     [NSApp setMainMenu:bar];
@@ -1052,10 +1239,15 @@ int nv_window_prepare(int width, int height, const char *title)
          * on a Retina screen, about a pixel-for-pixel picture in a window
          * that fits). RECOMP_WINDOW_FIT=0: the size as asked.
          */
-        /* Widescreen: the same height, 16:9 wide. */
+        /* Widescreen: the same height, at the picture's shape (16:9, or
+         * 21:9 -- the stored choice's, unless the environment says). */
         { extern int nv2a_widescreen(void);
+          extern float nv2a_wide_aspect(void);
+          extern void nv2a_set_picture(int pic, float screen, int apply);
+          if (!getenv("RECOMP_WIDESCREEN") && !getenv("RECOMP_WIDE_ASPECT"))
+              nv2a_set_picture(nv_window_pref_picture(), nv_window_screen_aspect(), 0);
           if (nv2a_widescreen() && (long)height * 4 == (long)width * 3)
-              width = height * 16 / 9; }
+              width = (int)((float)height * nv2a_wide_aspect() + 0.5f); }
         { const char *e = getenv("RECOMP_WINDOW_FIT");
           NSScreen *scr = [NSScreen mainScreen];
           if (scr && !(e && e[0] == '0')) {
@@ -1071,8 +1263,8 @@ int nv_window_prepare(int width, int height, const char *title)
               }
               if (k < 1.0) {
                   int w2 = (int)(width * k), h2 = (int)(height * k);
-                  if ((long)height * 4 == (long)width * 3) h2 = w2 * 3 / 4;
-                  if ((long)height * 16 == (long)width * 9) h2 = w2 * 9 / 16;
+                  /* The shape kept exactly: from the width. */
+                  h2 = (int)((double)w2 * (double)height / (double)width + 0.5);
                   fprintf(stderr, "[WIN] %dx%d does not fit the screen (%.0fx%.0f "
                           "points free, %.0fx backing): %dx%d\n", width, height,
                           vis.size.width, vis.size.height,
@@ -1092,7 +1284,8 @@ int nv_window_prepare(int width, int height, const char *title)
         /* Resizable, in the picture's shape; and it can go full screen (the
          * green button, or Video > Enter Full Screen, Ctrl+Cmd+F). */
         { extern int nv2a_widescreen(void);
-          [g_window setContentAspectRatio:nv2a_widescreen() ? NSMakeSize(16.0, 9.0)
+          extern float nv2a_wide_aspect(void);
+          [g_window setContentAspectRatio:nv2a_widescreen() ? NSMakeSize((double)nv2a_wide_aspect() * 9.0, 9.0)
                                                             : NSMakeSize(4.0, 3.0)]; }
         [g_window setContentMinSize:NSMakeSize(320.0, 240.0)];
         [g_window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
@@ -1279,9 +1472,8 @@ static void win_script_step(void)
         else if (!strcmp(a, "min")) [g_window miniaturize:nil];
         else if (!strcmp(a, "restore")) [g_window deminiaturize:nil];
         else if (!strcmp(a, "wide")) {
-            extern int nv2a_widescreen(void);
-            extern void nv2a_set_widescreen(int on);
-            nv2a_set_widescreen(!nv2a_widescreen());
+            extern void nv2a_set_picture(int pic, float screen, int apply);
+            nv2a_set_picture((nv_window_picture_now() + 1) % 3, nv_window_screen_aspect(), 1);
             nv_window_shape_for_mode();
         } else if (sscanf(a, "size %dx%d", &w, &h) == 2)
             [g_window setContentSize:NSMakeSize(w, h)];

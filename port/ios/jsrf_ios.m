@@ -169,21 +169,25 @@ int nv_window_pref_widescreen(void) { return picture_pref() != 0; }
 int nv_window_pref_metal(void);
 int nv_window_pref_metal(void) { return 1; }
 
-/* The camera on the right stick (port/recomp_manual.c): on unless turned off
- * in the settings, as the "rstickCamera" default -- the Mac's key. Asked
- * every frame, so kept here once read. */
+/* The camera on the right stick (port/recomp_manual.c): 1 on (the default),
+ * 2 tracking -- it only looks around, the skater keeps his heading -- or 0
+ * off, in the settings, as the "rstickCamera" and "rstickTracking" defaults --
+ * the Mac's keys. Asked every frame, so kept here once read. */
 static volatile int g_rstick_cam = -1;
 int nv_window_pref_rstick_camera(void);
 int nv_window_pref_rstick_camera(void)
 {
     if (g_rstick_cam < 0) {
         @autoreleasepool {
-            id v = [[NSUserDefaults standardUserDefaults] objectForKey:@"rstickCamera"];
-            g_rstick_cam = v ? ([v boolValue] ? 1 : 0) : 1;
+            NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+            id v = [d objectForKey:@"rstickCamera"];
+            int on = v ? ([v boolValue] ? 1 : 0) : 1;
+            g_rstick_cam = on ? ([d boolForKey:@"rstickTracking"] ? 2 : 1) : 0;
         }
     }
     return g_rstick_cam;
 }
+static NSString *const k_rcam[3] = { @"off", @"on", @"tracking" };
 
 /* Anti-aliasing (aa_start in nv2a_gl.c asks): SMAA on or off ("smaa"),
  * applied at once, and multisampling's samples a pixel ("msaa", 0 none),
@@ -311,6 +315,22 @@ static unsigned long long free_bytes(NSString *path)
 
 @class NvGameController;
 static NvGameController *g_vc;
+/* ---- Photo mode (port/recomp_manual.c): the settings' request, and the help
+ * panel -- a label over the game, at its bottom-left corner. */
+static volatile int g_photo_request;
+void nv_window_request_photo(void);
+void nv_window_request_photo(void) { g_photo_request = 1; }
+int nv_window_take_photo_request(void);
+int nv_window_take_photo_request(void) { int r = g_photo_request; g_photo_request = 0; return r; }
+/* The map selector (port/recomp_manual.c, the maps in jsrf_maps.h): a map from
+ * the settings, or -1, its panel. */
+#include "../../src/nv2a_gl/jsrf_maps.h"
+static volatile int g_map_request;
+void nv_window_request_map(int mission);
+void nv_window_request_map(int mission) { g_map_request = mission; }
+int nv_window_take_map_request(void);
+int nv_window_take_map_request(void) { int r = g_map_request; g_map_request = 0; return r; }
+static UILabel *g_help_label;
 
 @interface NvGameController : UIViewController
 - (void)engineStopped:(int)rc;
@@ -330,6 +350,43 @@ static void *engine_main(void *arg)
     fflush(stderr);
     dispatch_async(dispatch_get_main_queue(), ^{ [g_vc engineStopped:rc]; });
     return NULL;
+}
+void nv_window_photo_help(const char *text);
+void nv_window_photo_help(const char *text)
+{
+    NSString *str = text ? [NSString stringWithUTF8String:text] : nil;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIView *root = g_vc ? g_vc.view : nil;
+        NSMutableAttributedString *as;
+        NSRange first;
+        CGSize sz;
+        if (!root) return;
+        if (!str) { [g_help_label removeFromSuperview]; return; }
+        if (!g_help_label) {
+            g_help_label = [[UILabel alloc] init];
+            g_help_label.numberOfLines = 0;
+            g_help_label.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.82];
+            g_help_label.userInteractionEnabled = NO;
+            g_help_label.layer.cornerRadius = 6.0;
+            g_help_label.clipsToBounds = YES;
+        }
+        as = [[NSMutableAttributedString alloc] initWithString:str attributes:@{
+            NSFontAttributeName: [UIFont monospacedSystemFontOfSize:11.0 weight:UIFontWeightMedium],
+            NSForegroundColorAttributeName: [UIColor colorWithWhite:0.93 alpha:1.0] }];
+        first = [str rangeOfString:@"\n"];
+        if (first.location != NSNotFound)
+            [as addAttribute:NSForegroundColorAttributeName
+                       value:[UIColor colorWithRed:0.75 green:0.95 blue:0.16 alpha:1.0]
+                       range:NSMakeRange(0, first.location)];
+        g_help_label.attributedText = as;
+        sz = [g_help_label sizeThatFits:CGSizeMake(root.bounds.size.width, CGFLOAT_MAX)];
+        g_help_label.frame = CGRectMake(root.safeAreaInsets.left + 12,
+                                        root.bounds.size.height - root.safeAreaInsets.bottom - sz.height - 28,
+                                        sz.width + 20, sz.height + 16);
+        g_help_label.textAlignment = NSTextAlignmentCenter;
+        if (g_help_label.superview != root) [root addSubview:g_help_label];
+        [root bringSubviewToFront:g_help_label];
+    });
 }
 
 static int start_engine(NSString *game)
@@ -1014,14 +1071,13 @@ static BOOL touch_pref(void)
     [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Anti-aliasing: %@",
                                                  [self aaName]]
         style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { (void)x; [self pickAA]; }]];
-    [a addAction:[UIAlertAction actionWithTitle:nv_window_pref_rstick_camera() ? @"Camera on the right stick: on"
-                                                                              : @"Camera on the right stick: off"
-        style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { (void)x;
-            int on = !nv_window_pref_rstick_camera();
-            g_rstick_cam = on;
-            [d setBool:(on ? YES : NO) forKey:@"rstickCamera"];
-            fprintf(stderr, "[IOS] the camera on the right stick: %s\n", on ? "on" : "off");
-            fflush(stderr); }]];
+    [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Camera on the right stick: %@",
+                                                 k_rcam[nv_window_pref_rstick_camera()]]
+        style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { (void)x; [self pickRstickCamera]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Photo mode" style:UIAlertActionStyleDefault
+        handler:^(UIAlertAction *x) { (void)x; nv_window_request_photo(); }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Go to a map" style:UIAlertActionStyleDefault
+        handler:^(UIAlertAction *x) { (void)x; [self pickMap]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Controls" style:UIAlertActionStyleDefault
         handler:^(UIAlertAction *x) { (void)x;
             [self alert:@"Controls" text:
@@ -1032,10 +1088,26 @@ static BOOL touch_pref(void)
               "at the top.\n\n"
               "With the camera on the right stick (the settings), a controller's right stick turns the "
               "camera around you and it eases back behind you when let go; L trigger puts it straight "
-              "behind at once.\n\n"
+              "behind at once. Set to tracking, it only looks around: you keep going the way you "
+              "were.\n\n"
+              "Photo mode (the settings, or hold Back with a controller): move the camera freely with the sticks, the triggers lower and raise it, Y hides the HUD, A the help, B goes back to the game. Take the picture with the side and volume-up buttons.\n\n"
               "A keyboard: WASD (by position) moves, arrows the camera, Space jump, E spray, "
               "Return Start, Esc Back."]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+/* The map selector: straight to a map, to skate it freely (jsrf_maps.h). */
+- (void)pickMap
+{
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Go to a map"
+        message:@"Free skating, as after the story: nothing to race or chase." preferredStyle:UIAlertControllerStyleAlert];
+    for (int k = 0; k < JSRF_MAP_COUNT; k++) {
+        int mission = k_jsrf_maps[k].mission;
+        [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithUTF8String:k_jsrf_maps[k].name]
+            style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { (void)x; nv_window_request_map(mission); }]];
+    }
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
 }
 
@@ -1055,6 +1127,34 @@ static BOOL touch_pref(void)
                 apply_wide_shape(self.view.bounds.size);
                 fprintf(stderr, "[IOS] picture: %s\n", m == 0 ? "4:3" : m == 1 ? "16:9" : "fill the screen");
                 fflush(stderr); }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+/* The camera on the right stick: on (the skater goes where it looks),
+ * tracking (it only looks around, the skater keeps his heading), or off (the
+ * game's own camera). */
+- (void)pickRstickCamera
+{
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Camera on the right stick"
+        message:@"On: the skater goes where the camera looks. Tracking: the camera only looks around, "
+                 "the skater keeps going the way he was."
+        preferredStyle:UIAlertControllerStyleAlert];
+    int cur = nv_window_pref_rstick_camera();
+    static const int order[3] = { 1, 2, 0 };
+    for (int i = 0; i < 3; i++) {
+        int m = order[i];
+        [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@%@",
+                                                     m == 0 ? @"Off (the game's camera)" : m == 1 ? @"On" : @"Tracking",
+                                                     m == cur ? @"  ✓" : @""]
+            style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { (void)x;
+                NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+                g_rstick_cam = m;
+                [d setBool:(m ? YES : NO) forKey:@"rstickCamera"];
+                [d setBool:(m == 2 ? YES : NO) forKey:@"rstickTracking"];
+                fprintf(stderr, "[IOS] the camera on the right stick: %s\n", m == 2 ? "tracking" : m ? "on" : "off");
+                fflush(stderr); }]];
+    }
     [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
 }

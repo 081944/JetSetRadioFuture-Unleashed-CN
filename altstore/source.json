@@ -27,6 +27,69 @@
       },
       "versions": [
         {
+          "version": "0.6.6",
+          "buildVersion": "0.6.6",
+          "date": "2026-11-02T15:38:42Z",
+          "localizedDescription": "A map selector: Go to a map in the settings takes you straight to any of the 14 maps, to skate it freely.",
+          "downloadURL": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/download/v0.6.6/JSRF-Unleashed-iOS.ipa",
+          "size": 13403479,
+          "minOSVersion": "15.0"
+        },
+        {
+          "version": "0.6.5",
+          "buildVersion": "0.6.5",
+          "date": "2026-11-02T12:58:47Z",
+          "localizedDescription": "Photo mode now freezes the whole world: skaters, people, cars and spray cans hold still while you frame the shot.",
+          "downloadURL": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/download/v0.6.5/JSRF-Unleashed-iOS.ipa",
+          "size": 13401987,
+          "minOSVersion": "15.0"
+        },
+        {
+          "version": "0.6.4",
+          "buildVersion": "0.6.4",
+          "date": "2026-11-02T11:16:16Z",
+          "localizedDescription": "Photo mode (the settings, or hold Back with a controller), and no more towers popping in in Skyscraper District.",
+          "downloadURL": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/download/v0.6.4/JSRF-Unleashed-iOS.ipa",
+          "size": 13404024,
+          "minOSVersion": "15.0"
+        },
+        {
+          "version": "0.6.3",
+          "buildVersion": "0.6.3",
+          "date": "2026-11-02T09:45:52Z",
+          "localizedDescription": "The brake sparks and smoke now come every time, as on the console (the fix found by Miggas).",
+          "downloadURL": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/download/v0.6.3/JSRF-Unleashed-iOS.ipa",
+          "size": 13394629,
+          "minOSVersion": "15.0"
+        },
+        {
+          "version": "0.6.2",
+          "buildVersion": "0.6.2",
+          "date": "2026-11-01T20:56:17Z",
+          "localizedDescription": "The camera on the right stick can now be set to tracking (in the settings): the right stick looks around while you keep going.",
+          "downloadURL": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/download/v0.6.2/JSRF-Unleashed-iOS.ipa",
+          "size": 13388699,
+          "minOSVersion": "15.0"
+        },
+        {
+          "version": "0.6.1",
+          "buildVersion": "0.6.1",
+          "date": "2026-10-31T23:02:36Z",
+          "localizedDescription": "Widescreen: the HUD at the edges of the screen (16:9 and Fill the screen), and the boost's heat haze over the whole picture.",
+          "downloadURL": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/download/v0.6.1/JSRF-Unleashed-iOS.ipa",
+          "size": 13387159,
+          "minOSVersion": "15.0"
+        },
+        {
+          "version": "0.6.0",
+          "buildVersion": "0.6.0",
+          "date": "2026-10-30T22:37:20Z",
+          "localizedDescription": "Faster where the game used to stall: entering an area, fades, and the work done for every drawing command -- six of the speed fixes spriteice found.",
+          "downloadURL": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/download/v0.6.0/JSRF-Unleashed-iOS.ipa",
+          "size": 13384491,
+          "minOSVersion": "15.0"
+        },
+        {
           "version": "0.5.10",
           "buildVersion": "0.5.10",
           "date": "2026-10-29T12:38:51Z",

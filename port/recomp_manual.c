@@ -774,6 +774,51 @@ void sub_0013D300(void)
     sub_0013D300_gen();
 }
 
+/* ---- photo mode's freeze: the world's update skipped ------------------------
+ * sub_000123E0 is the game's scene tick, once a frame from the main loop
+ * (sub_00013A80). In play (none of its pause states at +0x40..+0x4C set) it
+ * runs seven systems and then the update walk of the task tree (sub_00011070:
+ * each node's vtable slot 1 -- the skaters, the people, the cars, the
+ * camera...), then the publish walk (sub_00011D00, slot 2) and the draw.
+ * While photo mode is on those eight calls are left out -- found by the
+ * return address each pushed (they are called from there only, the walk also
+ * from itself). The publish walk moves things too (the skaters' poses, the
+ * cans turning are worked out there: a test with the updates left out still
+ * had them going), so it is left out as well, all but the camera's publish,
+ * which is made by itself (sub_00011D00, below): the scene as it stood, drawn
+ * as ever, seen from the photo camera. JSRF_PHOTO_FREEZE=0 (test only) leaves
+ * the world running, as in 0.6.4. */
+static volatile int s_world_frozen;
+static uint32_t s_frozen_cam;   /* the camera, whose publish is still made */
+static int photo_freeze_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("JSRF_PHOTO_FREEZE"); on = !(e && e[0] == '0'); }
+    return on;
+}
+static int frozen_skip(uint32_t ra)
+{
+    if (!s_world_frozen) return 0;
+    if (*(const uint32_t *)((const uint8_t *)g_xbox_mem_offset + g_esp) != ra) return 0;
+    g_esp += 4;                     /* the ret it would have made */
+    return 1;
+}
+/* Each written out (the build finds the wrapped functions by their extern line). */
+extern void sub_0006F8C0_gen(void);
+void sub_0006F8C0(void) { if (frozen_skip(0x0001247Cu)) return; sub_0006F8C0_gen(); }
+extern void sub_0001DF30_gen(void);
+void sub_0001DF30(void) { if (frozen_skip(0x00012486u)) return; sub_0001DF30_gen(); }
+extern void sub_00065800_gen(void);
+void sub_00065800(void) { if (frozen_skip(0x00012490u)) return; sub_00065800_gen(); }
+extern void sub_00066AD0_gen(void);
+void sub_00066AD0(void) { if (frozen_skip(0x0001249Au)) return; sub_00066AD0_gen(); }
+extern void sub_00024AE0_gen(void);
+void sub_00024AE0(void) { if (frozen_skip(0x000124A4u)) return; sub_00024AE0_gen(); }
+extern void sub_00066110_gen(void);
+void sub_00066110(void) { if (frozen_skip(0x000124AEu)) return; sub_00066110_gen(); }
+extern void sub_00015130_gen(void);
+void sub_00015130(void) { if (frozen_skip(0x000124B8u)) return; sub_00015130_gen(); }
+
 /* ---- sub_00011070: scene-graph walk -- validate node pointers first, so
  * the holder of a corrupted link is named before the walk dereferences it. */
 extern void sub_00011070_gen(void);
@@ -833,6 +878,7 @@ void sub_00011070(void)
             e = (*end == ',') ? end + 1 : end;
         }
     }
+    if (depth == 0 && frozen_skip(0x000124C3u)) return;   /* photo mode: the world held */
     if (check && g_ecx) jsrf_check_tree(g_ecx, 0, 0, "root");
     if (depth == 0 && idump < ndump && g_ecx && pad_now() >= dump_t[idump]) {
         idump++;
@@ -1933,6 +1979,119 @@ __attribute__((constructor)) static void jsrf_wide_boot(void)
     const char *v = getenv("JSRF_WIDE_BOOT");
     nv2a_set_wide_scene(v && v[0] == '0' ? 0 : 1);
 }
+/* ---- the map selector ------------------------------------------------------
+ * Every platform: straight to a map, to skate it freely (the maps, each with
+ * its chapter 9 mission, are src/nv2a_gl/jsrf_maps.h's). A map comes from the
+ * window's menu (Mac, Windows) or the app's settings (iPhone, Android) through
+ * nv_window_take_map_request(), or from the panel: -1 asks for it (F6 on
+ * Windows and Linux, the Maps menu's Map Selector), a list drawn as photo
+ * mode's help is, gone through with the pad (up/down or a stick, A or Start
+ * to go, B or Back to close) while the game sees an idle pad.
+ *
+ * The map asked for is gone to the way a mission ends -- +0x4C/+0x54 the next
+ * chapter and number, state 93 -- at the flow's next frame in play (state 15)
+ * or once Start has been pressed at the title (mission 0x10001, state 31),
+ * the state held for a second (0x10001 passes through 15 on its way to 31:
+ * gone from there, the hand-over never finished). Asked for while a map
+ * loads, or at the title itself (mission 0x5A: the opening and its demo,
+ * whose flow takes its state back and never hands over -- the game hung), it
+ * waits until then. Photo mode is left first.
+ * JSRF_MAP_TOUR="t:id,t:id,..." (test only) asks for each id at its time;
+ * JSRF_MAP_PANEL_TEST="t:downs" opens the panel at t and goes down that many. */
+#include "../src/nv2a_gl/jsrf_maps.h"
+static void photo_leave(const char *why);
+int  nv_window_take_map_request(void);
+void nv_window_photo_help(const char *text);
+static struct {
+    volatile int open, want_open;
+    volatile int pick;                 /* a mission chosen in it, for the flow */
+    int sel, fresh, dir_was;
+    uint8_t go_was, close_was;
+    double next_move;
+} s_picker;
+static void picker_show(void)
+{
+    char text[640];
+    int k, n;
+    n = snprintf(text, sizeof text, "GO TO A MAP\n");
+    for (k = 0; k < JSRF_MAP_COUNT && n < (int)sizeof text - 48; k++)
+        n += snprintf(text + n, sizeof text - n, "%s %s\n", k == s_picker.sel ? ">" : " ", k_jsrf_maps[k].name);
+    snprintf(text + n, sizeof text - n, "UP/DOWN CHOOSE   A GO   B CLOSE");
+    nv_window_photo_help(text);
+}
+static void picker_close(void)
+{
+    s_picker.open = 0;
+    nv_window_photo_help(NULL);
+}
+/* The pad, before the game sees it. Returns 1 when the panel took it. */
+static int picker_note_pad(XBOX_INPUT_STATE *s)
+{
+    double now = jsrf_now();
+    int up, down, dir;
+    uint8_t go, close;
+    if (s_picker.want_open) {
+        s_picker.want_open = 0;
+        photo_leave("the map selector");
+        s_picker.open = 1;
+        s_picker.fresh = 1;
+        picker_show();
+    }
+    if (!s_picker.open) return 0;
+    up = (s->Gamepad.wButtons & XBOX_GAMEPAD_DPAD_UP) || s->Gamepad.sThumbLY > 16000 || s->Gamepad.sThumbRY > 16000;
+    down = (s->Gamepad.wButtons & XBOX_GAMEPAD_DPAD_DOWN) || s->Gamepad.sThumbLY < -16000 || s->Gamepad.sThumbRY < -16000;
+    dir = up ? -1 : down ? 1 : 0;
+    go = s->Gamepad.bAnalogButtons[XBOX_BUTTON_A] > 64 || (s->Gamepad.wButtons & XBOX_GAMEPAD_START);
+    close = s->Gamepad.bAnalogButtons[XBOX_BUTTON_B] > 64 || (s->Gamepad.wButtons & XBOX_GAMEPAD_BACK);
+    if (s_picker.fresh) {              /* what was held as it opened does nothing */
+        s_picker.fresh = 0;
+        s_picker.go_was = go; s_picker.close_was = close; s_picker.dir_was = dir;
+        s_picker.next_move = now + 0.4;
+    }
+    if (dir && (dir != s_picker.dir_was || now >= s_picker.next_move)) {
+        s_picker.sel = (s_picker.sel + dir + JSRF_MAP_COUNT) % JSRF_MAP_COUNT;
+        s_picker.next_move = now + (dir != s_picker.dir_was ? 0.4 : 0.12);
+        picker_show();
+    }
+    s_picker.dir_was = dir;
+    if (go && !s_picker.go_was) {
+        s_picker.pick = k_jsrf_maps[s_picker.sel].mission;
+        fprintf(stderr, "[MAP] the panel: %s\n", k_jsrf_maps[s_picker.sel].name);
+        picker_close();
+    } else if (close && !s_picker.close_was) {
+        picker_close();
+    }
+    s_picker.go_was = go; s_picker.close_was = close;
+    memset(&s->Gamepad, 0, sizeof s->Gamepad);   /* the game sees an idle pad */
+    return 1;
+}
+static uint32_t map_request(void)
+{
+    static int n = -1, i, ptest = -1, pdowns; static double pt;
+    static double at[32]; static uint32_t id[32];
+    int r = nv_window_take_map_request();
+    if (n < 0) {
+        const char *e = getenv("JSRF_MAP_TOUR");
+        n = 0;
+        while (e && *e && n < 32) {
+            char *end; double t = strtod(e, &end);
+            if (end == e || *end != ':') break;
+            at[n] = t; id[n] = (uint32_t)strtoul(end + 1, &end, 0); n++;
+            e = (*end == ',') ? end + 1 : end;
+        }
+        e = getenv("JSRF_MAP_PANEL_TEST");
+        ptest = (e && sscanf(e, "%lf:%d", &pt, &pdowns) == 2) ? 1 : 0;
+    }
+    if (ptest == 1 && pad_now() >= pt) {
+        ptest = 0;
+        s_picker.sel = pdowns % JSRF_MAP_COUNT;
+        r = -1;
+    }
+    if (r == -1) { s_picker.want_open = 1; r = 0; }
+    if (!r && s_picker.pick) { r = s_picker.pick; s_picker.pick = 0; }
+    if (!r && i < n && pad_now() >= at[i]) r = (int)id[i++];
+    return (uint32_t)r;
+}
 extern void sub_00051FC0_gen(void);
 void sub_00051FC0(void)
 {
@@ -1968,6 +2127,22 @@ void sub_00051FC0(void)
                   }
                   p = (*end == ',') ? end + 1 : NULL;
               }
+          } }
+        { static uint32_t want, seen_flow, seen_st = 0xFFFFFFFFu; static double seen_t;
+          uint32_t r = map_request(), st = *(uint32_t *)(m + flow + 0x5C);
+          uint32_t mi = *(uint32_t *)(m + flow + 0x58);
+          if (r) want = r;
+          if (flow != seen_flow || st != seen_st) { seen_flow = flow; seen_st = st; seen_t = pad_now(); }
+          /* in play (15, or 31 just past the title), for a second at least
+           * (a flow can pass through 15 on its way), never the title's own */
+          if (want && (st == 15 || st == 31) && mi != 0x5Au && pad_now() - seen_t >= 1.0) {
+              photo_leave("a map was chosen");
+              fprintf(stderr, "[MAP] t=%.1f flow %08X: state %u mission %08X -> mission %08X\n",
+                      pad_now(), flow, st, *(uint32_t *)(m + flow + 0x58), want);
+              *(uint32_t *)(m + flow + 0x4C) = want >> 16;
+              *(uint32_t *)(m + flow + 0x54) = want & 0xFFFF;
+              *(uint32_t *)(m + flow + 0x5C) = 93;
+              want = 0;
           } }
         if (init == 1 && pad_now() >= t) {
             /* The way a mission ends: +0x4C/+0x54 the next chapter and
@@ -2358,11 +2533,11 @@ void sub_00030690(void) { mission_hook(".dat"); sub_00030690_gen(); }
  * run can photograph the title, the menus and the level. */
 static void trace_at_step(void)
 {
-    static int n = -1, cur; static double t[8]; static int frames[8], shots[8], every[8];
+    static int n = -1, cur; static double t[32]; static int frames[32], shots[32], every[32];
     if (n < 0) {
         const char *e = getenv("JSRF_TRACE_AT");
         n = 0;
-        while (e && *e && n < 8) {
+        while (e && *e && n < 32) {
             shots[n] = 0; every[n] = 1;
             if (sscanf(e, "%lf:%d:%d,%d", &t[n], &frames[n], &shots[n], &every[n]) >= 2) n++;
             e = strchr(e, ';');
@@ -4122,11 +4297,19 @@ void sub_00042EE0(void)
  * If something else moved the eye in between (an event placing the camera),
  * that is left as it is and the turn dropped.
  *
- * Not in a conversation (mode 12) or the first-person look (14). On unless
- * the player turns it off, nv_window_pref_rstick_camera: the Mac's Controls
- * menu, the iPhone's and the Android app's settings, and on Windows and Linux
- * F7 (and Controls in the Windows window's menu bar); RECOMP_RSTICK_CAMERA=1
- * or 0 overrides.
+ * Tracking, the second way to have it (issue #44, players' feedback): the
+ * view turns as above but the heading is left alone, so the skater keeps the
+ * way he was going -- "up" on the left stick is still straight ahead of him,
+ * as the game's own camera behind him has it -- and the right stick only
+ * looks around. With the turn on the heading, panning the camera to look at
+ * something steered the skater towards it.
+ *
+ * Not in a conversation (mode 12) or the first-person look (14).
+ * nv_window_pref_rstick_camera says which: 0 off (the game's camera), 1 the
+ * camera (the default), 2 tracking -- the Mac's Controls menu, the iPhone's
+ * and the Android app's settings, and on Windows and Linux F7 (and Controls
+ * in the Windows window's menu bar); RECOMP_RSTICK_CAMERA=0, 1 or 2
+ * overrides.
  * The turn goes by the game's frames, a sixtieth of a second each, as its own
  * camera and its first-person look do: by the clock, it came out in uneven
  * steps from one picture to the next whenever the frames were not evenly
@@ -4167,12 +4350,167 @@ static struct {
     float    our_eye[3];       /* and as this left it */
     int32_t  game_hd, our_hd;  /* the heading, likewise */
     int      applied;
+    int      photo;            /* photo mode moved the point looked at too */
+    float    game_tgt[3], our_tgt[3];
 } s_rcam;
 /* The camera's updates (sub_000A5070): one a game frame. */
 static uint32_t s_rcam_frames;
 
+/* ---- Photo mode -------------------------------------------------------------
+ *
+ * Hold Back (Esc on a keyboard) for most of a second while skating -- or pick
+ * Photo Mode in a menu or the settings -- and the camera leaves the skater:
+ * the left stick moves it, the right stick turns it, the triggers lower and
+ * raise it; Y hides the HUD, A this help, and B or Back goes back to the
+ * game. The game sees no buttons meanwhile, so the skater stands where he
+ * was (the city goes on around him). The camera is the game's own, moved:
+ * its eye (+0x44) and the point it looks at (+0x5C) are set where the photo
+ * camera is after the game publishes them and put back before its next
+ * update (rcam_restore), as the camera on the right stick does with the
+ * eye. A help panel says all that on screen while it is on
+ * (nv_window_photo_help: the window's own on the Mac and the iPhone, drawn
+ * into the picture's window with SDL). */
+void nv_window_photo_help(const char *text);      /* NULL: none */
+void nv2a_set_hide_hud(int hide);
+int  nv_window_take_photo_request(void);          /* a menu's Photo Mode, once */
+#define PHOTO_HOLD   0.8       /* seconds of Back to start it */
+#define PHOTO_SPEED  110.0f    /* units a second at full stick */
+#define PHOTO_RISE   70.0f
+#define PHOTO_YAW    1.8f      /* radians a second */
+#define PHOTO_PITCH  1.3f
+static const char k_photo_help[] =
+    "PHOTO MODE\n"
+    "LEFT STICK     MOVE          (W A S D)\n"
+    "RIGHT STICK    LOOK          (ARROWS)\n"
+    "LT / RT        DOWN / UP     (Q / E)\n"
+    "Y              HUD ON / OFF  (L)\n"
+    "A              HIDE HELP     (SPACE)\n"
+    "B OR BACK      BACK TO GAME  (K / ESC)";
+static struct {
+    volatile int want;          /* asked for: enter at the next gameplay frame */
+    int      on;
+    double   back_since;        /* Back held since (0: not held) */
+    int      back_was;          /* Back down at the last poll, while on */
+    uint16_t btn_was;
+    uint8_t  a_was, b_was, y_was;
+    float    lx, ly, rx, ry, lt, rt;
+    float    pos[3], yaw, pitch;
+    int      help, hud_hidden;
+} s_photo;
+static float photo_axis(int16_t v)
+{
+    float x = (float)v / 32767.0f;
+    if (x > -0.18f && x < 0.18f) return 0.0f;
+    return x > 0 ? (x - 0.18f) / 0.82f : (x + 0.18f) / 0.82f;
+}
+static void photo_show_help(void)
+{
+    nv_window_photo_help(s_photo.on && s_photo.help ? k_photo_help : NULL);
+}
+static void photo_leave(const char *why)
+{
+    if (!s_photo.on) return;
+    s_photo.on = 0;
+    s_world_frozen = 0;
+    if (s_photo.hud_hidden) nv2a_set_hide_hud(0);
+    s_photo.hud_hidden = 0;
+    photo_show_help();
+    fprintf(stderr, "[PHOTO] off (%s)\n", why);
+}
+/* The pad, before the game sees it. Returns 1 when photo mode took it. */
+static int photo_note_pad(XBOX_INPUT_STATE *s)
+{
+    double now = jsrf_now();
+    { static int test = -1;   /* JSRF_PHOTO_HELP_TEST=1 (test only): the panel shown from the start */
+      if (test < 0) { test = getenv("JSRF_PHOTO_HELP_TEST") ? 1 : 0; if (test) nv_window_photo_help(k_photo_help); } }
+    int back = (s->Gamepad.wButtons & XBOX_GAMEPAD_BACK) != 0;
+    if (!s_photo.on) {
+        if (back) {
+            if (!s_photo.back_since) s_photo.back_since = now;
+            else if (now - s_photo.back_since >= PHOTO_HOLD) { s_photo.want = 1; s_photo.back_since = 0; }
+        } else {
+            s_photo.back_since = 0;
+        }
+        if (nv_window_take_photo_request()) s_photo.want = 1;
+        return 0;
+    }
+    {
+        uint8_t a = s->Gamepad.bAnalogButtons[XBOX_BUTTON_A] > 64;
+        uint8_t b = s->Gamepad.bAnalogButtons[XBOX_BUTTON_B] > 64;
+        uint8_t y = s->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] > 64;
+        s_photo.lx = photo_axis(s->Gamepad.sThumbLX);
+        s_photo.ly = photo_axis(s->Gamepad.sThumbLY);
+        s_photo.rx = photo_axis(s->Gamepad.sThumbRX);
+        s_photo.ry = photo_axis(s->Gamepad.sThumbRY);
+        s_photo.lt = s->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] / 255.0f;
+        s_photo.rt = s->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] / 255.0f;
+        if (a && !s_photo.a_was) { s_photo.help = !s_photo.help; photo_show_help(); }
+        if (y && !s_photo.y_was) {
+            s_photo.hud_hidden = !s_photo.hud_hidden;
+            nv2a_set_hide_hud(s_photo.hud_hidden);
+        }
+        if ((b && !s_photo.b_was) || (back && !s_photo.back_was)) photo_leave("B or Back");
+        s_photo.a_was = a; s_photo.b_was = b; s_photo.y_was = y; s_photo.back_was = back;
+    }
+    /* The game sees an idle pad (the packet number still moves). */
+    memset(&s->Gamepad, 0, sizeof s->Gamepad);
+    return 1;
+}
+/* Each game frame, with the camera just published. 1 when photo mode set it. */
+static int photo_frame(uint8_t *m, uint32_t cam, uint32_t mode, float dt)
+{
+    float *e = (float *)(m + cam + 0x44), *t = (float *)(m + cam + 0x5C);
+    float f[3], r[3], cp, sp;
+    if (s_photo.on && (mode == 12 || mode == 14)) photo_leave("an event");
+    if (s_photo.want && !s_photo.on) {
+        float v[3] = { t[0] - e[0], t[1] - e[1], t[2] - e[2] };
+        s_photo.want = 0;
+        if (mode == 12 || mode == 14) return 0;
+        s_photo.on = 1;
+        s_frozen_cam = cam;
+        s_world_frozen = photo_freeze_on();
+        s_photo.help = 1;
+        s_photo.hud_hidden = 0;
+        s_photo.back_was = 1;          /* the Back that started it does not end it */
+        s_photo.a_was = s_photo.b_was = s_photo.y_was = 1;
+        memcpy(s_photo.pos, e, 12);
+        s_photo.yaw = atan2f(v[0], v[2]);
+        s_photo.pitch = atan2f(v[1], sqrtf(v[0] * v[0] + v[2] * v[2]));
+        photo_show_help();
+        fprintf(stderr, "[PHOTO] on, at %.1f %.1f %.1f\n", e[0], e[1], e[2]);
+    }
+    s_photo.want = 0;
+    if (!s_photo.on) return 0;
+    s_photo.yaw += s_photo.rx * PHOTO_YAW * dt;
+    s_photo.pitch += s_photo.ry * PHOTO_PITCH * dt;
+    if (s_photo.pitch > 1.45f) s_photo.pitch = 1.45f;
+    if (s_photo.pitch < -1.45f) s_photo.pitch = -1.45f;
+    cp = cosf(s_photo.pitch); sp = sinf(s_photo.pitch);
+    f[0] = sinf(s_photo.yaw) * cp; f[1] = sp; f[2] = cosf(s_photo.yaw) * cp;
+    r[0] = cosf(s_photo.yaw); r[1] = 0.0f; r[2] = -sinf(s_photo.yaw);   /* the right of (x, z) is (z, -x) */
+    {
+        int i;
+        for (i = 0; i < 3; i++)
+            s_photo.pos[i] += (f[i] * s_photo.ly + r[i] * s_photo.lx) * PHOTO_SPEED * dt;
+        s_photo.pos[1] += (s_photo.rt - s_photo.lt) * PHOTO_RISE * dt;
+        memcpy(s_rcam.game_eye, e, 12);
+        memcpy(s_rcam.game_tgt, t, 12);
+        memcpy(e, s_photo.pos, 12);
+        for (i = 0; i < 3; i++) t[i] = s_photo.pos[i] + f[i] * 40.0f;
+        memcpy(s_rcam.our_eye, e, 12);
+        memcpy(s_rcam.our_tgt, t, 12);
+    }
+    s_rcam.game_hd = s_rcam.our_hd = *(int32_t *)(m + cam + 0x228);
+    s_rcam.cam = cam;
+    s_rcam.applied = 1;
+    s_rcam.photo = 1;
+    s_rcam.yaw = s_rcam.pitch = 0.0f;
+    return 1;
+}
+
 static void rcam_note_pad(XBOX_INPUT_STATE *s)
 {
+    if (picker_note_pad(s) || photo_note_pad(s)) { s_rcam.rx = s_rcam.ry = 0.0f; s_rcam.lt = 0; return; }
     float x = (float)s->Gamepad.sThumbRX / 32767.0f, y = (float)s->Gamepad.sThumbRY / 32767.0f;
     float mag = sqrtf(x * x + y * y);
     if (mag < RCAM_DEAD) {
@@ -4193,15 +4531,18 @@ static void rcam_note_pad(XBOX_INPUT_STATE *s)
     }
 }
 
-static int rcam_enabled(void)
+/* 0 off, 1 the camera, 2 tracking (see above). */
+static int rcam_mode(void)
 {
     static int env = -2;
+    int v;
     if (env == -2) {
         const char *e = getenv("RECOMP_RSTICK_CAMERA");
-        env = (e && *e) ? (atoi(e) != 0) : -1;
+        env = (e && *e) ? (atoi(e) == 2 ? 2 : atoi(e) != 0) : -1;
     }
     if (env >= 0) return env;
-    return nv_window_pref_rstick_camera() > 0;
+    v = nv_window_pref_rstick_camera();
+    return v == 2 ? 2 : v > 0;
 }
 
 static int rcam_log_on(void)
@@ -4222,6 +4563,11 @@ static void rcam_restore(uint8_t *m, uint32_t cam)
     if (cam != s_rcam.cam || cam < 0x10000u || cam + 0x240u >= (64u << 20)) return;
     e = (float *)(m + cam + 0x44);
     hd = (int32_t *)(m + cam + 0x228);
+    if (s_rcam.photo) {
+        float *t = (float *)(m + cam + 0x5C);
+        if (!memcmp(t, s_rcam.our_tgt, sizeof s_rcam.our_tgt)) memcpy(t, s_rcam.game_tgt, sizeof s_rcam.game_tgt);
+        s_rcam.photo = 0;
+    }
     if (memcmp(e, s_rcam.our_eye, sizeof s_rcam.our_eye) != 0) {
         if (rcam_log_on())
             fprintf(stderr, "[RCAM] t=%.2f the eye was moved by something else: turn dropped\n", jsrf_now());
@@ -4244,7 +4590,7 @@ static void rcam_apply(uint8_t *m, uint32_t cam)
     static double next_log, dump_at = -2.0;
     static int by_clock = -1;
     uint32_t mode, frames;
-    int ok, i;
+    int ok, i, how;
     if (by_clock < 0) by_clock = getenv("JSRF_RCAM_CLOCK") ? 1 : 0;
     /* The game's frames since the last turn (one, as a rule), a sixtieth of a
      * second each; up to six, after a pause. */
@@ -4278,7 +4624,9 @@ static void rcam_apply(uint8_t *m, uint32_t cam)
         fixed = f ? atof(f) * 3.14159265358979 / 180.0 : -1.0e8;
     }
     mode = c[0x208 / 4];
-    ok = rcam_enabled() && mode != 12 && mode != 14;
+    if (photo_frame(m, cam, mode, dt)) { s_rcam.active_until = 0.0; return; }
+    how = rcam_mode();
+    ok = how > 0 && mode != 12 && mode != 14;
     s_rcam.active_until = ok ? now + 0.25 : 0.0;
     if (!ok) {
         s_rcam.yaw = s_rcam.pitch = 0.0f;
@@ -4339,9 +4687,10 @@ static void rcam_apply(uint8_t *m, uint32_t cam)
         e[0] = t[0] + v[0]; e[1] = t[1] + v[1]; e[2] = t[2] + v[2];
         memcpy(s_rcam.our_eye, e, sizeof s_rcam.our_eye);
         /* The heading turned with it, in the game's range (-0x8000..0x8000,
-         * as sub_0004A7A0 gives it). */
+         * as sub_0004A7A0 gives it) -- or, tracking, left as it is. */
         s_rcam.game_hd = *hd;
-        *hd = (int32_t)(int16_t)(uint16_t)(s_rcam.game_hd + (int32_t)lrintf(s_rcam.yaw * (65536.0f / 6.28318531f)));
+        if (how != 2)
+            *hd = (int32_t)(int16_t)(uint16_t)(s_rcam.game_hd + (int32_t)lrintf(s_rcam.yaw * (65536.0f / 6.28318531f)));
         s_rcam.our_hd = *hd;
         s_rcam.cam = cam;
         s_rcam.applied = 1;
@@ -4353,10 +4702,10 @@ static void rcam_apply(uint8_t *m, uint32_t cam)
                 s_rcam.yaw * 57.29578f, s_rcam.pitch * 57.29578f);
     } else if (rcam_log_on() && now >= next_log) {
         next_log = now + 0.1;
-        fprintf(stderr, "[RCAM] t=%.2f flip %u mode %u on %d | stick %.2f %.2f lt %d | yaw %.1f pitch %.1f | "
+        fprintf(stderr, "[RCAM] t=%.2f flip %u mode %u on %d how %d | stick %.2f %.2f lt %d | yaw %.1f pitch %.1f | "
                 "eye (%.2f %.2f %.2f) game (%.2f %.2f %.2f) tgt (%.2f %.2f %.2f) | hd %d game %d | "
                 "player (%.2f %.2f %.2f)\n",
-                now, nv2a_gl_flips(), mode, ok, s_rcam.rx, s_rcam.ry, s_rcam.lt,
+                now, nv2a_gl_flips(), mode, ok, how, s_rcam.rx, s_rcam.ry, s_rcam.lt,
                 s_rcam.yaw * 57.29578f, s_rcam.pitch * 57.29578f, e[0], e[1], e[2],
                 s_rcam.applied ? s_rcam.game_eye[0] : e[0], s_rcam.applied ? s_rcam.game_eye[1] : e[1],
                 s_rcam.applied ? s_rcam.game_eye[2] : e[2], t[0], t[1], t[2],
@@ -4364,6 +4713,7 @@ static void rcam_apply(uint8_t *m, uint32_t cam)
                 s_player_pos[0], s_player_pos[1], s_player_pos[2]);
     }
 }
+
 
 /* ---- the camera -------------------------------------------------------------
  * Object 0x4C (class 0x1CD518) is the camera; sub_000A5070 its per-frame
@@ -4459,9 +4809,28 @@ void sub_000A28B0(void)
     uint8_t *m = (uint8_t *)g_xbox_mem_offset;
     uint32_t cam = g_ecx;
     jsrf_camcnt[0]++;
+    if (s_world_frozen) s_rcam_frames++;   /* its update, which counts the frames, is held */
     rcam_restore(m, cam);
     sub_000A28B0_gen();
     rcam_apply(m, cam);
+}
+/* The publish walk (sub_00011D00, from the scene tick at 0x12547 and from
+ * itself): while the world is frozen it is left out, and only the camera's
+ * publish is made, as the walk makes it -- this pointer, a return address. */
+extern void sub_00011D00_gen(void);
+void sub_001BA8A0(void);
+void sub_00011D00(void)
+{
+    uint8_t *m = (uint8_t *)g_xbox_mem_offset;
+    uint32_t cam = s_frozen_cam;
+    if (!s_world_frozen || *(const uint32_t *)(m + g_esp) != 0x0001254Cu) { sub_00011D00_gen(); return; }
+    g_esp += 4;                                 /* the walk's own ret */
+    if (cam < 0x10000u || cam + 0x240u >= (64u << 20) || *(const uint32_t *)(m + cam) != 0x001CD518u) return;
+    g_esp -= 4; *(uint32_t *)(m + g_esp) = 0x00011D63u;
+    sub_001BA8A0();                             /* the walk's matrix to identity first */
+    g_ecx = cam;
+    g_esp -= 4; *(uint32_t *)(m + g_esp) = 0x00011D6Au;
+    sub_000A28B0();                             /* each pops its return address, as a ret */
 }
 extern void sub_000A2960_gen(void);
 void sub_000A2960(void) { jsrf_camcnt[1]++; sub_000A2960_gen(); }
@@ -4510,3 +4879,243 @@ static void jsrf_cam_counts(void)
             len += snprintf(line + len, sizeof line - len, " %05X:%lu", jsrf_camva[i], jsrf_camcnt[i]);
     fprintf(stderr, "%s\n", line); fflush(stderr);
 }
+
+/* ---- The brake sparks: sub_0014C410 with the console's rsqrtss -----------
+ *
+ * Braking (the stick forward, then back) throws red sparks and smoke from the
+ * skates. Here, as in xemu, they came out only now and then, and stayed at a
+ * fixed spot instead of following the skates; on the console and in
+ * Cxbx-Reloaded they come every time. Miggas found why, in JSRF-Recomp
+ * (https://github.com/Miggas/JSRF-Recomp, its v125-v127): the console's
+ * Pentium III answers rsqrtss with a 12-bit approximation, and the lifter --
+ * like xemu -- computes 1/sqrt(x) exactly. One site needs the console's value:
+ * the rsqrtss in sub_0014C410, which normalises the vector at edx into ecx
+ * (x, y, z each times 1/sqrt(x^2 + y^2 + z^2)). Approximating the other sites
+ * as well broke geometry and shading in his tests, so only this one is.
+ *
+ * The body below is the generated one, statement for statement, but for that
+ * instruction, which gives the Pentium III's result bit for bit on any host
+ * (sse_p3.h, his table). RECOMP_SSE_P3=0: the exact value, as before.
+ */
+#include "sse_p3.h"
+extern void sub_0014C410_gen(void);
+static int sse_p3_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_SSE_P3");
+        on = !(e && *e == '0');
+        fprintf(stderr, "[SSE] the brake sparks' vector normalise (sub_0014C410): %s\n",
+                on ? "the console's rsqrtss" : "exact 1/sqrt (RECOMP_SSE_P3=0)");
+    }
+    return on;
+}
+static float rsqrtss_p3(float x)
+{
+    uint32_t u;
+    memcpy(&u, &x, 4);
+    u = p3_rsq_bits(u);
+    memcpy(&x, &u, 4);
+    return x;
+}
+void sub_0014C410(void)
+{
+    if (!sse_p3_on()) { sub_0014C410_gen(); return; }
+    g_xmm0 = XMM_SCALAR(MEMF(g_edx));                                    /* movss */
+    g_xmm1 = XMM_SCALAR(MEMF(g_edx + 4));                                /* movss */
+    g_xmm2 = XMM_SCALAR(MEMF(g_edx + 8));                                /* movss */
+    g_xmm4.f[0] = g_xmm0.f[0];                                           /* movss */
+    g_xmm0.f[0] = g_xmm0.f[0] * g_xmm0.f[0];                             /* mulss */
+    g_xmm5.f[0] = g_xmm1.f[0];                                           /* movss */
+    g_xmm1.f[0] = g_xmm1.f[0] * g_xmm1.f[0];                             /* mulss */
+    g_xmm6.f[0] = g_xmm2.f[0];                                           /* movss */
+    g_xmm2.f[0] = g_xmm2.f[0] * g_xmm2.f[0];                             /* mulss */
+    g_xmm0.f[0] = g_xmm0.f[0] + g_xmm1.f[0];                             /* addss */
+    g_xmm0.f[0] = g_xmm0.f[0] + g_xmm2.f[0];                             /* addss */
+    g_xmm0.f[0] = rsqrtss_p3(g_xmm0.f[0]);                               /* rsqrtss */
+    g_xmm4.f[0] = g_xmm4.f[0] * g_xmm0.f[0];                             /* mulss */
+    g_xmm5.f[0] = g_xmm5.f[0] * g_xmm0.f[0];                             /* mulss */
+    g_xmm6.f[0] = g_xmm6.f[0] * g_xmm0.f[0];                             /* mulss */
+    MEMWF(g_ecx, g_xmm4.f[0]);                                           /* movss */
+    MEMWF(g_ecx + 4, g_xmm5.f[0]);                                       /* movss */
+    MEMWF(g_ecx + 8, g_xmm6.f[0]);                                       /* movss */
+    g_esp += 4;                                                          /* ret */
+}
+
+/* ---- Draw distance: more of the map's areas drawn ---------------------------
+ *
+ * Buildings appear as you get near them -- on the console too: it is the
+ * game's own draw distance. A map is split into areas (up to 256). Every
+ * frame sub_0006A970 sets, in the bitset at 0x20C6C8 (8 words of the object
+ * at 0x20C6C0), the areas whose volume holds the camera plus those each of
+ * them lists as visible; the map's draw passes skip every area whose bit is
+ * clear. Found by Miggas in JSRF-Recomp (its v198-v201, MIT): the map is at
+ * +4 of that object (its areas at +4, their count at +8), an area record is
+ * 0x154 bytes with its visible list at +0x98 and the count at +0x9C; and his
+ * "hops" -- the game's own set, widened twice through those lists -- reaches
+ * far ahead without crossing to the far end of a looping map, where drawing
+ * every area shows a copy of a street in the sky (Dogenzaka Hill).
+ *
+ * Here: for the length of three of the draw passes (sub_0006B6A0,
+ * sub_0006B8F0, sub_0006C360; sub_0006BA80, the backdrop's, is left to the
+ * game, as in his default) the bitset holds the widened set, and the game's
+ * own is put back after, so objects, collision and triggers keep the game's
+ * areas -- only the drawing changes. Areas no list names (the garage's
+ * invisible walls) are never added. Only on the maps listed, as the cost is
+ * a draw call per piece added: by default Skyscraper District, where the
+ * towers and satellite dishes on the way to 99th Street popped in worst.
+ *
+ * A map is known by an ID worked out from its area layout (his: FNV-1a over
+ * the area count and every area's first 18 words), logged when it loads:
+ * "[AREAS] map ID xxxx".
+ *   RECOMP_DRAW_AREAS=game (or 0)    the game's areas everywhere, as on the Xbox
+ *   RECOMP_DRAW_AREAS=hops<N>         N steps (default 2)
+ *   RECOMP_DRAW_AREAS_MAPS=ID,ID|all  the maps it applies to
+ *   JSRF_AREAS_LOG=1                  every 2 s: the game's count and the drawn count
+ */
+extern void sub_0006B6A0_gen(void);
+extern void sub_0006B8F0_gen(void);
+extern void sub_0006C360_gen(void);
+#define AREA_OBJ 0x20C6C0u
+#define AREA_REC 0x154u
+#define AREA_MAPS_DEFAULT "07FC"        /* Skyscraper District (Stg34): 30 areas */
+static int areas_guest_ok(uint32_t a, uint32_t len)
+{
+    return a >= 0x10000u && a + len >= a && a + len < (64u << 20);
+}
+static int areas_hops(void)
+{
+    static int hops = -1;
+    if (hops < 0) {
+        const char *e = getenv("RECOMP_DRAW_AREAS");
+        hops = 2;
+        if (e && *e) {
+            if (!strncmp(e, "hops", 4)) hops = e[4] ? atoi(e + 4) : 2;
+            else hops = 0;                         /* game, 0, off */
+        }
+        if (hops > 16) hops = 16;
+        if (hops < 0) hops = 0;
+        fprintf(stderr, "[AREAS] draw distance: %s\n", hops ? "more areas on the maps listed" :
+                "the game's own areas (RECOMP_DRAW_AREAS)");
+    }
+    return hops;
+}
+static int areas_log_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("JSRF_AREAS_LOG") ? 1 : 0;
+    return on;
+}
+static int areas_map_listed(uint32_t id)
+{
+    const char *e = getenv("RECOMP_DRAW_AREAS_MAPS");
+    if (!e) e = AREA_MAPS_DEFAULT;
+    if (!strcmp(e, "all")) return 1;
+    while (*e) {
+        char *end;
+        unsigned long v = strtoul(e, &end, 16);
+        if (end == e) { e++; continue; }
+        if (v == id) return 1;
+        e = end;
+    }
+    return 0;
+}
+/* The current map: its areas, their count, its ID, the areas some list names,
+ * and whether it is one of the maps listed. Worked out again when the map
+ * object, its area table, the count or the first area's first word change. */
+static struct {
+    uint32_t map, areas, n, a0, id;
+    uint32_t drawable[8];
+    int listed;
+} s_amap;
+static int areas_map(uint32_t *areas_out, uint32_t *n_out)
+{
+    uint32_t map = MEM32(AREA_OBJ + 4), areas, n, i, j, q;
+    if (!areas_guest_ok(map, 12)) return 0;
+    areas = MEM32(map + 4);
+    n = MEM32(map + 8);
+    if (!n || n > 256 || !areas_guest_ok(areas, n * AREA_REC)) return 0;
+    if (map != s_amap.map || areas != s_amap.areas || n != s_amap.n || MEM32(areas) != s_amap.a0) {
+        uint32_t h = 2166136261u, cnt = 0;
+        s_amap.map = map; s_amap.areas = areas; s_amap.n = n; s_amap.a0 = MEM32(areas);
+        memset(s_amap.drawable, 0, sizeof s_amap.drawable);
+        for (i = 0; i < n; i++) {
+            uint32_t a = areas + i * AREA_REC, list = MEM32(a + 0x98), c = MEM32(a + 0x9C);
+            if (!c || c > 256 || !areas_guest_ok(list, c * 4u)) continue;
+            for (j = 0; j < c; j++) {
+                uint32_t v = MEM32(list + 4 * j);
+                if (v < 256) s_amap.drawable[v >> 5] |= 1u << (v & 31);
+            }
+        }
+        h = (h ^ n) * 16777619u;
+        for (i = 0; i < n; i++)
+            for (q = 0; q < 18; q++)
+                h = (h ^ MEM32(areas + i * AREA_REC + 4 * q)) * 16777619u;
+        s_amap.id = ((h >> 16) ^ h) & 0xFFFFu;
+        s_amap.listed = areas_map_listed(s_amap.id);
+        for (i = 0; i < 8; i++) cnt += (uint32_t)__builtin_popcount(s_amap.drawable[i]);
+        fprintf(stderr, "[AREAS] map ID %04X: %u areas, %u drawn by some view; draw distance %s\n",
+                s_amap.id, n, cnt, s_amap.listed && areas_hops() ? "widened" : "the game's");
+    }
+    *areas_out = areas; *n_out = n;
+    return 1;
+}
+/* The widened set for this frame (worked out at the first pass of a frame). */
+static uint32_t s_area_wide[8];
+static uint32_t s_area_wide_flip = ~0u;
+static int areas_prepare(void)
+{
+    uint32_t areas, n, cur[8], nxt[8], i, j, k, flip;
+    int hops = areas_hops(), step;
+    if (!hops || !areas_map(&areas, &n) || !s_amap.listed) return 0;
+    flip = nv2a_gl_flips();
+    if (flip == s_area_wide_flip) return 1;
+    s_area_wide_flip = flip;
+    for (k = 0; k < 8; k++) cur[k] = MEM32(AREA_OBJ + 8 + 4 * k);
+    for (step = 0; step < hops; step++) {
+        memcpy(nxt, cur, sizeof nxt);
+        for (i = 0; i < n; i++) {
+            uint32_t a = areas + i * AREA_REC, list, c;
+            if (!(cur[i >> 5] & (1u << (i & 31)))) continue;
+            list = MEM32(a + 0x98); c = MEM32(a + 0x9C);
+            if (!c || c > 256 || !areas_guest_ok(list, c * 4u)) continue;
+            for (j = 0; j < c; j++) {
+                uint32_t v = MEM32(list + 4 * j);
+                if (v < 256) nxt[v >> 5] |= 1u << (v & 31);
+            }
+        }
+        if (!memcmp(nxt, cur, sizeof cur)) break;
+        memcpy(cur, nxt, sizeof cur);
+    }
+    for (k = 0; k < 8; k++)
+        s_area_wide[k] = (cur[k] & s_amap.drawable[k]) | MEM32(AREA_OBJ + 8 + 4 * k);
+    if (areas_log_on()) {
+        static double last;
+        double now = pad_now();
+        if (now - last >= 2.0) {
+            unsigned g = 0, w = 0;
+            last = now;
+            for (k = 0; k < 8; k++) {
+                g += (unsigned)__builtin_popcount(MEM32(AREA_OBJ + 8 + 4 * k));
+                w += (unsigned)__builtin_popcount(s_area_wide[k]);
+            }
+            fprintf(stderr, "[AREAS] t=%.1f map %04X: the game's %u areas, drawn %u (hops%d)\n",
+                    now, s_amap.id, g, w, hops);
+        }
+    }
+    return 1;
+}
+static void area_pass(void (*gen)(void))
+{
+    uint32_t keep[8], k;
+    if (!areas_prepare()) { gen(); return; }
+    for (k = 0; k < 8; k++) {
+        keep[k] = MEM32(AREA_OBJ + 8 + 4 * k);
+        MEM32(AREA_OBJ + 8 + 4 * k) = s_area_wide[k];
+    }
+    gen();
+    for (k = 0; k < 8; k++) MEM32(AREA_OBJ + 8 + 4 * k) = keep[k];
+}
+void sub_0006B6A0(void) { area_pass(sub_0006B6A0_gen); }
+void sub_0006B8F0(void) { area_pass(sub_0006B8F0_gen); }
+void sub_0006C360(void) { area_pass(sub_0006C360_gen); }

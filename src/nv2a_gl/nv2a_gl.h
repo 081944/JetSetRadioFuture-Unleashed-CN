@@ -41,6 +41,16 @@ int nv2a_gl_method_run(uint32_t method, const uint32_t *params, uint32_t count);
 int nv2a_gl_transform_run(uint32_t method, const uint32_t *params, uint32_t count,
                           int noninc);
 
+/* A run of n words (at least one) to an index method, ARRAY_ELEMENT16 or 32,
+ * written non-incrementing: the same as n calls of nv2a_gl_method. */
+void nv2a_gl_indices(uint32_t method, const uint32_t *p, uint32_t n);
+
+/* 0 when the switches that turn packet batching off are set (RECOMP_PB_SOFT,
+ * RECOMP_GL_PACKET_SCALAR, a VC debug switch). Every fast path in the walk
+ * asks this one question, so turning batching off for a measurement turns off
+ * all of it rather than leaving one of them still batching. */
+int nv2a_gl_packet_batch_allowed(void);
+
 /* End-of-run summary: what was drawn, what was refused, and why. */
 void nv2a_gl_report(void);
 
