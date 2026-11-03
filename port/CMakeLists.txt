@@ -158,6 +158,7 @@ if(ANDROID)
         vk_probe.c
         vk_driver_probe.c
         vk_demo.c
+        nv2a_vk_gfx.c
         ios/xiso.c
         ${JSRF_GEN_SOURCES}
     )
