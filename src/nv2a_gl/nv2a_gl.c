@@ -504,6 +504,8 @@ typedef struct {
     unsigned long long tex_held_bytes;  /* ... and their size, as handed over */
     unsigned n_tex_rewritten;           /* dropped by tcache_verify: rewritten in place */
     unsigned long long tex_verified;    /* source bytes tcache_verify compared */
+    unsigned long long mergeable;       /* draws a batch could have taken with the last */
+    unsigned long long previous_vb;     /* draws that kept the previous vertex buffer */
 } GlProfile;
 static void vc_report(const char *when);
 static GlProfile g_prof;
@@ -592,6 +594,13 @@ static void prof_report(void)
                 ? 1e6 * (d.whole_draw - d.tex - d.verts - d.vbo - d.unif - d.draw - d.state - d.hash)
                   / (g_prof.n_draws - prev.n_draws) : 0.0,
             100 * d.present / dt, 100 * d.pace / dt);
+        /* What a batching layer could have taken: the previous draw's vertex
+         * buffer and nothing else changed is the only case a neighbour can be
+         * merged into one submission. */
+        jsrf_dbg_log("[GLPROF]   batching: same vertex buffer as the draw before %llu, "
+                     "nothing changed since %llu (of %llu draws)\n",
+                     g_prof.previous_vb, g_prof.mergeable,
+                     (unsigned long long)g_prof.n_draws);
         /* The remainder from the line above, split into the three stretches
          * that run before any of the counted GL work does. Per draw, because
          * that is the number a fixed cost has to be judged in. */
@@ -8365,6 +8374,25 @@ static void do_draw_body(void)
         } }
     }
     if (!curtain_skip && !g_surf_lost) {
+        /* Is this draw one a batch could have taken with the one before it?
+         *
+         * Only with the same vertex buffer, the same primitive, and nothing
+         * GL-side changed in between: a program switch, a uniform upload, a
+         * texture bound, an attribute written. All four are already cached,
+         * so their counters only move when something really is sent -- which
+         * makes them the honest test. Every merge wanted a shared vertex
+         * buffer, and whether this title ever gives one is the question that
+         * decides if batching here is worth building. */
+        { static uint32_t last_vb; static int last_mode;
+          static unsigned long long last_sig;
+          unsigned long long sig = (unsigned long long)g_prof.n_prog_switch * 1000003ull
+                                 + g_prof.unif_vec4 * 1009ull
+                                 + g_prof.n_tex_lookup * 31ull
+                                 + g_prof.n_const_upload * 7ull;
+          if (vc_vb && vc_vb == last_vb && mode == last_mode && sig == last_sig)
+              g_prof.mergeable++;
+          g_prof.previous_vb = (vc_vb == last_vb && last_vb);
+          last_vb = vc_vb; last_mode = mode; last_sig = sig; }
         PROF_T0();
         if (vc_vb && !vc_seq) G->draw_indexed(mode, out_n, vc_i32);
         else                  G->draw(mode, out_n);
