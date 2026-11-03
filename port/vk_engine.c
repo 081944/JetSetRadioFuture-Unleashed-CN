@@ -112,6 +112,8 @@ static PFN_vkCmdDraw                      p_cmd_draw;
 static PFN_vkCmdSetViewport               p_viewport;
 static PFN_vkCmdSetScissor                p_scissor;
 static int vke_pipeline(void);
+static int SDLCALL vke_present_main(void *arg);
+static void vke_frame_body(void);
 
 /* What the first pipeline needs: a view per swapchain image, the two shader
  * modules glslang compiled, and the pipeline itself. Dynamic rendering takes
@@ -121,6 +123,14 @@ static VkShaderModule   w_vs, w_fs;
 static VkPipelineLayout w_pl;
 static VkPipeline       w_pipe;
 static int              w_draw_ready;
+
+/* The frame belongs to a thread of its own, as the GL backend's does: the
+ * pushbuffer thread asks for a frame and moves on. Anything else means the
+ * window's thread and the renderer's are both inside Vulkan. */
+static SDL_Thread      *w_thread;
+static SDL_mutex       *w_mu;
+static SDL_cond        *w_cv;
+static int              w_req, w_quit;
 
 static int vke_switch_on(const char *name)
 {
@@ -282,7 +292,10 @@ int nv2a_vk_engine_start(int want_w, int want_h)
             f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
             f13.dynamicRendering = VK_TRUE;
             f13.synchronization2 = VK_TRUE;
-            dci.pNext = &f13;
+            /* RECOMP_VK_NO_F13=1: create the device as the demo did, with no
+             * 1.3 features asked for. It is the last thing this path does
+             * that the demo, which presented 600 frames, did not. */
+            if (!vke_switch_on("RECOMP_VK_NO_F13")) dci.pNext = &f13;
             dci.enabledExtensionCount = 1;
             dci.ppEnabledExtensionNames = dev_ext;
             r = p_create_device(w_phys, &dci, NULL, &w_dev);
@@ -407,6 +420,13 @@ int nv2a_vk_engine_start(int want_w, int want_h)
     vke("fn acquire %p, begin %p, barrier %p, clear %p, submit %p, wait %p, present %p",
         (void *)p_acquire, (void *)p_begin, (void *)p_barrier, (void *)p_clear,
         (void *)p_submit, (void *)p_wait, (void *)p_present);
+    if (!w_thread) {
+        w_mu = SDL_CreateMutex();
+        w_cv = SDL_CreateCond();
+        if (w_mu && w_cv)
+            w_thread = SDL_CreateThread(vke_present_main, "nv2a-vulkan-present", NULL);
+        if (w_thread) vke("presenter thread started");
+    }
     /* The surface may not be attached to the window yet. Give Android a
      * moment before the first acquire: a swapchain whose surface the driver
      * has not been told about would explain a fault inside the driver. */
@@ -556,7 +576,34 @@ static int vke_pipeline(void)
 
 int nv2a_vk_engine_active(void) { return w_active; }
 
+/* The frame belongs to a thread of its own, as the GL backend's does: the
+ * pushbuffer thread asks for one and moves on, and nothing else ever touches
+ * the swapchain. */
+static int SDLCALL vke_present_main(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        SDL_LockMutex(w_mu);
+        while (!w_req && !w_quit) SDL_CondWait(w_cv, w_mu);
+        if (w_quit) { SDL_UnlockMutex(w_mu); break; }
+        w_req = 0;
+        SDL_UnlockMutex(w_mu);
+        vke_frame_body();
+    }
+    return 0;
+}
+
+/* Called from the pushbuffer thread: ask, do not do. */
 void nv2a_vk_engine_frame(void)
+{
+    if (!w_active || !w_mu) return;
+    SDL_LockMutex(w_mu);
+    w_req = 1;
+    SDL_CondSignal(w_cv);
+    SDL_UnlockMutex(w_mu);
+}
+
+static void vke_frame_body(void)
 {
     uint32_t idx = 0, i;
     VkCommandBufferBeginInfo bi;
