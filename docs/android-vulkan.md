@@ -162,6 +162,33 @@ XBE 加载、目标线程全部在跑；截屏中心与 71% 屏幕是 `(15, 26, 
 
 还没有的：一个 draw 都还没画。`Nv2aGfx` 表里的目标/纹理/程序都是空实现，所以画面是纯清屏色。
 下一步是 SPIR-V 与管线。
+
+## 暂停点（2026-11-03）
+
+按维护者决定暂停。已完成、且都有真机实测：
+
+- Turnip 经 libadrenotools 加载：`Vulkan 1.3.363`；
+- 1.3 核心特性可用（`dynamicRendering` / `synchronization2` / `timelineSemaphore`）；
+- 窗口接管（SDL 自己的窗口 + `vkCreateAndroidSurfaceKHR`）、swapchain、present；
+- demo 连续 600 帧上屏；
+- 运行时 GLSL→SPIR-V（glslang 静态链）；
+- 引擎以 `RECOMP_BACKEND=vulkan` 启动，管线建成，帧流约 70 fps；
+- 修掉 4 轮崩溃的根因：`vkCmdPipelineBarrier` 多传一个参数（`dstAccessMask` 落在
+  `memoryBarrierCount` 位置 → 驱动读 NULL 数组 → fault at NULL+8）。
+
+**未完成**：画面。截屏仍是全黑，标题的纹理/程序/uniform/状态/draw 在后端表里全是空实现。
+
+### 恢复时从这里开始
+
+1. present 的返回值没有在计数处检查，先确认它是否真的 `VK_SUCCESS`；
+2. 里程碑 2：一次真实绘制——把已渲染的 target 当纹理画到窗口（管线 + 纹理 + 描述符打通）；
+3. 里程碑 3：接 pushbuffer 的 draw（顶点缓冲/索引/状态），画到"能认出是游戏"；
+4. 里程碑 4：与 GL 逐场景对画面、对帧率，决定是否替换。
+
+调试开关（都在属性后面，`setprop debug.jsrf.*`）：
+`recomp_backend=vulkan`、`recomp_vk_no_draw`、`recomp_vk_no_f13`、
+`recomp_vk_mainframes`、`recomp_vk_spirv_test`、`recomp_vk_driver_probe`、`recomp_vk_demo`。
+默认 GL 不受任何影响。
 ## 下一步
 
 1. 窗口接管：`RECOMP_BACKEND=vulkan` → `SDL_WINDOW_VULKAN` + instance + surface + swapchain（默认仍走 GL）；
