@@ -21,14 +21,21 @@
 #include "../../src/nv2a_gl/nv2a_backend.h"
 
 static int      stub_init(void) { return 1; }
-static uint32_t stub_target_new(uint32_t pw, uint32_t ph) { (void)pw; (void)ph; return 1; }
+/* The render target is real: nv2a_gl.c's surface_bind asks for one when the
+ * title binds a surface, and its size and its pixels are what the frame
+ * boundary hands back to the title (port/vk_engine.c). */
+extern uint32_t nv2a_vk_target_new(uint32_t pw, uint32_t ph);
+extern int      nv2a_vk_target_read(uint32_t rt, uint32_t x, uint32_t y,
+                                    uint32_t w, uint32_t h, int bgra, void *out);
+static uint32_t stub_target_new(uint32_t pw, uint32_t ph)
+{ return nv2a_vk_target_new(pw, ph); }
 static void     stub_target_free(uint32_t rt) { (void)rt; }
 static void     stub_target_bind(uint32_t rt) { (void)rt; }
 static uint32_t stub_target_texture(uint32_t rt) { (void)rt; return 1; }
 static uint32_t stub_target_snapshot(uint32_t rt) { (void)rt; return 1; }
 static int      stub_target_read(uint32_t rt, uint32_t x, uint32_t y, uint32_t w,
                                  uint32_t h, int bgra, void *out)
-{ (void)rt; (void)x; (void)y; (void)w; (void)h; (void)bgra; (void)out; return 0; }
+{ return nv2a_vk_target_read(rt, x, y, w, h, bgra, out); }
 static int      stub_target_read_depth(uint32_t rt, uint32_t pw, uint32_t ph, float *out)
 { (void)rt; (void)pw; (void)ph; (void)out; return 0; }
 

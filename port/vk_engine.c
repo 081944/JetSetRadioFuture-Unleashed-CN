@@ -111,6 +111,20 @@ static PFN_vkCmdBindPipeline              p_bind_pipeline;
 static PFN_vkCmdDraw                      p_cmd_draw;
 static PFN_vkCmdSetViewport               p_viewport;
 static PFN_vkCmdSetScissor                p_scissor;
+static PFN_vkDestroyImage      p_image_free;
+static PFN_vkCreateBuffer      p_buf_new;
+static PFN_vkDestroyBuffer     p_buf_free;
+static PFN_vkGetBufferMemoryRequirements p_buf_req;
+static PFN_vkGetImageMemoryRequirements  p_img_req;
+static PFN_vkBindBufferMemory  p_buf_bind;
+static PFN_vkBindImageMemory   p_img_bind;
+static PFN_vkAllocateMemory    p_mem_new;
+static PFN_vkFreeMemory        p_mem_free;
+static PFN_vkGetPhysicalDeviceMemoryProperties p_mem_props;
+static PFN_vkCreateImage       p_image_new;
+static PFN_vkMapMemory         p_map;
+static PFN_vkUnmapMemory       p_unmap;
+static PFN_vkCmdCopyImageToBuffer p_copy_to_buf;
 static int vke_pipeline(void);
 static int SDLCALL vke_present_main(void *arg);
 static void vke_frame_body(void);
@@ -131,6 +145,12 @@ static SDL_Thread      *w_thread;
 static SDL_mutex       *w_mu;
 static SDL_cond        *w_cv;
 static int              w_req, w_quit;
+/* The queue is shared: the presenter submits a frame, the pushbuffer thread
+ * submits a read-back. Vulkan allows that only with external synchronisation
+ * -- without it the driver loses the second submission and the presenter
+ * never gets another fence (measured: present called 10,000 times, one frame
+ * on screen). */
+static SDL_mutex       *w_q_mu;
 
 static int vke_switch_on(const char *name)
 {
@@ -322,6 +342,20 @@ int nv2a_vk_engine_start(int want_w, int want_h)
     p_barrier = (PFN_vkCmdPipelineBarrier)p_gipa(w_inst, "vkCmdPipelineBarrier");
     p_clear = (PFN_vkCmdClearColorImage)p_gipa(w_inst, "vkCmdClearColorImage");
     p_submit = (PFN_vkQueueSubmit)p_gipa(w_inst, "vkQueueSubmit");
+    p_image_new = (PFN_vkCreateImage)p_gipa(w_inst, "vkCreateImage");
+    p_image_free = (PFN_vkDestroyImage)p_gipa(w_inst, "vkDestroyImage");
+    p_img_req = (PFN_vkGetImageMemoryRequirements)p_gipa(w_inst, "vkGetImageMemoryRequirements");
+    p_img_bind = (PFN_vkBindImageMemory)p_gipa(w_inst, "vkBindImageMemory");
+    p_buf_new = (PFN_vkCreateBuffer)p_gipa(w_inst, "vkCreateBuffer");
+    p_buf_free = (PFN_vkDestroyBuffer)p_gipa(w_inst, "vkDestroyBuffer");
+    p_buf_req = (PFN_vkGetBufferMemoryRequirements)p_gipa(w_inst, "vkGetBufferMemoryRequirements");
+    p_buf_bind = (PFN_vkBindBufferMemory)p_gipa(w_inst, "vkBindBufferMemory");
+    p_mem_new = (PFN_vkAllocateMemory)p_gipa(w_inst, "vkAllocateMemory");
+    p_mem_free = (PFN_vkFreeMemory)p_gipa(w_inst, "vkFreeMemory");
+    p_mem_props = (PFN_vkGetPhysicalDeviceMemoryProperties)p_gipa(w_inst, "vkGetPhysicalDeviceMemoryProperties");
+    p_map = (PFN_vkMapMemory)p_gipa(w_inst, "vkMapMemory");
+    p_unmap = (PFN_vkUnmapMemory)p_gipa(w_inst, "vkUnmapMemory");
+    p_copy_to_buf = (PFN_vkCmdCopyImageToBuffer)p_gipa(w_inst, "vkCmdCopyImageToBuffer");
     p_view_new = (PFN_vkCreateImageView)p_gipa(w_inst, "vkCreateImageView");
     p_view_free = (PFN_vkDestroyImageView)p_gipa(w_inst, "vkDestroyImageView");
     p_shader_new = (PFN_vkCreateShaderModule)p_gipa(w_inst, "vkCreateShaderModule");
@@ -420,6 +454,7 @@ int nv2a_vk_engine_start(int want_w, int want_h)
     vke("fn acquire %p, begin %p, barrier %p, clear %p, submit %p, wait %p, present %p",
         (void *)p_acquire, (void *)p_begin, (void *)p_barrier, (void *)p_clear,
         (void *)p_submit, (void *)p_wait, (void *)p_present);
+        w_q_mu = SDL_CreateMutex();
     if (!w_thread) {
         w_mu = SDL_CreateMutex();
         w_cv = SDL_CreateCond();
@@ -588,6 +623,7 @@ static int SDLCALL vke_present_main(void *arg)
         if (w_quit) { SDL_UnlockMutex(w_mu); break; }
         w_req = 0;
         SDL_UnlockMutex(w_mu);
+        { static unsigned it; if (++it % 20 == 0) vke("presenter loop %u", it); }
         vke_frame_body();
     }
     return 0;
@@ -605,6 +641,7 @@ void nv2a_vk_engine_frame(void)
 
 static void vke_frame_body(void)
 {
+    { static unsigned b; if (++b % 20 == 0) vke("body %u", b); }
     uint32_t idx = 0, i;
     VkCommandBufferBeginInfo bi;
     VkClearColorValue clr;
@@ -705,6 +742,7 @@ static void vke_frame_body(void)
     p_barrier(w_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
               VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &b);
 
+    if (w_q_mu) SDL_LockMutex(w_q_mu);
     memset(&si, 0, sizeof si);
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.waitSemaphoreCount = 1;
@@ -719,7 +757,9 @@ static void vke_frame_body(void)
     { static int st5; if (!st5) { st5 = 1; vke("f1: submit"); } }
     if (p_submit(w_queue, 1, &si, w_fence) != VK_SUCCESS) return;
     { static int st6; if (!st6) { st6 = 1; vke("f1: wait"); } }
-    if (p_wait(w_dev, 1, &w_fence, VK_TRUE, 1000000000ull) != VK_SUCCESS) return;
+    { VkResult wr = p_wait(w_dev, 1, &w_fence, VK_TRUE, 1000000000ull);
+      if (w_q_mu) SDL_UnlockMutex(w_q_mu);
+      if (wr != VK_SUCCESS) return; }
 
     memset(&pi, 0, sizeof pi);
     pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -760,6 +800,215 @@ int nv2a_vk_engine_requested(void)
     return vke_switch_on("RECOMP_BACKEND_VULKAN") || vke_switch_on("RECOMP_VK_ENGINE");
 }
 
+
+/* ---- render target and read-back ---------------------------------------
+ *
+ * The front half asks the backend for a render target when the title binds a
+ * surface, then reads it back to copy the frame into the title's own memory
+ * (nv2a_gl.c: surface_bind, present). A stub that answers "yes" with no
+ * target leaves the frame boundary without anything to hand over, and the
+ * title stops making progress after its first flip -- measured.
+ *
+ * One target is enough for the moment: this title alternates two display
+ * buffers, and both bind and read the same size. The image is cleared to the
+ * same colour as the window so the read-back has something to describe.
+ */
+static VkImage          w_rt;
+static VkDeviceMemory   w_rt_mem;
+static VkImageView      w_rt_view;
+static uint32_t         w_rt_pw, w_rt_ph;
+static VkBuffer         w_rb;
+static VkDeviceMemory   w_rb_mem;
+static VkDeviceSize     w_rb_size;
+static void            *w_rb_map;
+static VkCommandPool    w_rb_pool;
+static VkCommandBuffer  w_rb_cmd;
+static VkFence          w_rb_fence;
+
+
+static uint32_t vke_mem_type(uint32_t need, VkMemoryPropertyFlags want)
+{
+    VkPhysicalDeviceMemoryProperties mp;
+    uint32_t i, fallback = UINT32_MAX;
+
+    if (!p_mem_props) return UINT32_MAX;
+    p_mem_props(w_phys, &mp);
+    for (i = 0; i < mp.memoryTypeCount; i++) {
+        if ((mp.memoryTypes[i].propertyFlags & need) != need) continue;
+        if ((mp.memoryTypes[i].propertyFlags & want) == want) return i;
+        if (fallback == UINT32_MAX) fallback = i;
+    }
+    return fallback;
+}
+
+void nv2a_vk_engine_target_free(void);
+uint32_t nv2a_vk_target_new(uint32_t pw, uint32_t ph);
+uint32_t nv2a_vk_target_new(uint32_t pw, uint32_t ph)
+{
+    VkImageCreateInfo ici;
+    VkImageViewCreateInfo vci;
+    VkMemoryRequirements req;
+    VkMemoryAllocateInfo mai;
+    VkBufferCreateInfo bci;
+    uint32_t type;
+
+    if (!pw || !ph) return 0;
+    if (w_rt && w_rt_pw == pw && w_rt_ph == ph && w_rb) return 1;
+    nv2a_vk_engine_target_free();
+    memset(&ici, 0, sizeof ici);
+    ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ici.extent.width = pw;
+    ici.extent.height = ph;
+    ici.extent.depth = 1;
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (p_image_new(w_dev, &ici, NULL, &w_rt) != VK_SUCCESS) return 0;
+    p_img_req(w_dev, w_rt, &req);
+    type = vke_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    memset(&mai, 0, sizeof mai);
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = type;
+    if (type == UINT32_MAX || p_mem_new(w_dev, &mai, NULL, &w_rt_mem) != VK_SUCCESS) return 0;
+    if (p_img_bind(w_dev, w_rt, w_rt_mem, 0) != VK_SUCCESS) return 0;
+    memset(&vci, 0, sizeof vci);
+    vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vci.image = w_rt;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    vci.subresourceRange.levelCount = 1;
+    vci.subresourceRange.layerCount = 1;
+    if (p_view_new(w_dev, &vci, NULL, &w_rt_view) != VK_SUCCESS) return 0;
+
+    memset(&bci, 0, sizeof bci);
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = (VkDeviceSize)pw * ph * 4;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (p_buf_new(w_dev, &bci, NULL, &w_rb) != VK_SUCCESS) return 0;
+    p_buf_req(w_dev, w_rb, &req);
+    type = vke_mem_type(req.memoryTypeBits,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    memset(&mai, 0, sizeof mai);
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = type;
+    if (type == UINT32_MAX || p_mem_new(w_dev, &mai, NULL, &w_rb_mem) != VK_SUCCESS) return 0;
+    if (p_buf_bind(w_dev, w_rb, w_rb_mem, 0) != VK_SUCCESS) return 0;
+    if (p_map(w_dev, w_rb_mem, 0, VK_WHOLE_SIZE, 0, &w_rb_map) != VK_SUCCESS) return 0;
+    w_rb_size = bci.size;
+    w_rt_pw = pw; w_rt_ph = ph;
+    vke("render target %ux%u", pw, ph);
+    return 1;
+}
+
+void nv2a_vk_engine_target_free(void);
+void nv2a_vk_engine_target_free(void)
+{
+    if (w_rb_map) { p_unmap(w_dev, w_rb_mem); w_rb_map = NULL; }
+    if (w_rb) { p_buf_free(w_dev, w_rb, NULL); w_rb = VK_NULL_HANDLE; }
+    if (w_rb_mem) { p_mem_free(w_dev, w_rb_mem, NULL); w_rb_mem = VK_NULL_HANDLE; }
+    if (w_rt_view) { p_view_free(w_dev, w_rt_view, NULL); w_rt_view = VK_NULL_HANDLE; }
+    if (w_rt) { p_image_free(w_dev, w_rt, NULL); w_rt = VK_NULL_HANDLE; }
+    if (w_rt_mem) { p_mem_free(w_dev, w_rt_mem, NULL); w_rt_mem = VK_NULL_HANDLE; }
+    w_rt_pw = w_rt_ph = 0;
+}
+
+uint32_t nv2a_vk_target_texture(uint32_t rt) { (void)rt; return 1; }
+uint32_t nv2a_vk_target_snapshot(uint32_t rt) { (void)rt; return 1; }
+void     nv2a_vk_target_bind(uint32_t rt) { (void)rt; }
+void     nv2a_vk_target_free(uint32_t rt) { (void)rt; }
+
+/* The picture the front half copies into the title's memory: `out` is BGRA
+ * or RGBA rows, bottom row first, as glReadPixels would have given it. */
+int nv2a_vk_target_read(uint32_t rt, uint32_t x, uint32_t y, uint32_t w,
+                        uint32_t h, int bgra, void *out);
+int nv2a_vk_target_read(uint32_t rt, uint32_t x, uint32_t y, uint32_t w,
+                        uint32_t h, int bgra, void *out)
+{
+    VkCommandBufferBeginInfo bi;
+    VkImageMemoryBarrier b;
+    VkBufferImageCopy cp;
+    VkSubmitInfo si;
+    const uint8_t *src;
+    uint8_t *dst = (uint8_t *)out;
+    uint32_t row;
+
+    (void)rt;
+    if (!w_rt || !w_rb_map || !w_rb_pool) return 0;
+    if (x + w > w_rt_pw || y + h > w_rt_ph) return 0;
+    memset(&bi, 0, sizeof bi);
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (p_begin(w_rb_cmd, &bi) != VK_SUCCESS) return 0;
+    memset(&b, 0, sizeof b);
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = w_rt;
+    b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    b.subresourceRange.levelCount = 1;
+    b.subresourceRange.layerCount = 1;
+    p_barrier(w_rb_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    memset(&cp, 0, sizeof cp);
+    cp.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    cp.imageSubresource.layerCount = 1;
+    cp.imageOffset.x = (int32_t)x;
+    cp.imageOffset.y = (int32_t)y;
+    cp.imageExtent.width = w;
+    cp.imageExtent.height = h;
+    cp.imageExtent.depth = 1;
+    p_copy_to_buf(w_rb_cmd, w_rt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, w_rb, 1, &cp);
+    b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    p_barrier(w_rb_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    if (p_end(w_rb_cmd) != VK_SUCCESS) return 0;
+    memset(&si, 0, sizeof si);
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &w_rb_cmd;
+    if (w_q_mu) SDL_LockMutex(w_q_mu);
+    p_reset(w_dev, 1, &w_rb_fence);
+    if (p_submit(w_queue, 1, &si, w_rb_fence) != VK_SUCCESS) {
+        if (w_q_mu) SDL_UnlockMutex(w_q_mu);
+        return 0;
+    }
+    { VkResult wr = p_wait(w_dev, 1, &w_rb_fence, VK_TRUE, 1000000000ull);
+      if (w_q_mu) SDL_UnlockMutex(w_q_mu);
+      if (wr != VK_SUCCESS) return 0; }
+
+    src = (const uint8_t *)w_rb_map;
+    for (row = 0; row < h; row++) {
+        const uint8_t *s = src + (size_t)(h - 1 - row) * w * 4;
+        uint8_t *d = dst + (size_t)row * w * 4;
+        uint32_t i;
+        if (bgra) {
+            for (i = 0; i < w; i++) {
+                d[i * 4 + 0] = s[i * 4 + 2];
+                d[i * 4 + 1] = s[i * 4 + 1];
+                d[i * 4 + 2] = s[i * 4 + 0];
+                d[i * 4 + 3] = s[i * 4 + 3];
+            }
+        } else {
+            memcpy(d, s, (size_t)w * 4);
+        }
+    }
+    return 1;
+}
 #else
 
 int nv2a_vk_engine_start(int w, int h) { (void)w; (void)h; return 0; }

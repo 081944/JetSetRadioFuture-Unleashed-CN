@@ -10903,6 +10903,7 @@ static void present(int is_frame)
     { extern int  nv2a_vk_engine_active(void);
       extern void nv2a_vk_engine_frame(void);
       if (nv2a_vk_engine_active()) {
+          { static unsigned pn; if (++pn % 30 == 0) fprintf(stderr, "  [GL] vulkan present #%u flips %u surf %08X fbo %ux%u\n", pn, S.flips, S.color_offset, g_fbo_w, g_fbo_h); }
           if (is_frame) { S.frames++; g_frame_clock = mono_now(); }
           nv2a_vk_engine_frame();
           return;
