@@ -157,6 +157,7 @@ if(ANDROID)
         android/jsrf_android.c
         vk_probe.c
         vk_driver_probe.c
+        vk_demo.c
         ios/xiso.c
         ${JSRF_GEN_SOURCES}
     )

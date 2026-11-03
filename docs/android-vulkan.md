@@ -113,6 +113,31 @@ NGPort（`E:\HH\NGPort\zh-work`）已经把这套跑通了，可以照搬：
 
 第 1 条与现有"运行时生成 + shader cache"的结构最贴合，代价是二进制增大和首次编译开销。
 
+
+## 窗口接管已跑通（2026-11-03）
+
+`RECOMP_VK_DEMO=1`（`setprop debug.jsrf.recomp_vk_demo 1`）把整个 App 跑在 Vulkan 上：
+拿 App 自己的原生窗口（SDL 的 `SDL_GetWindowWMInfo` → `ANativeWindow`），经 Turnip 建
+surface + swapchain，连续 present 清屏帧：
+
+```
+[VKM] native window 0xb400007a7dbeb6d0 (2297x998)
+[VKM] device Turnip Adreno (TM) 650 (1.3.363)
+[VKM] swapchain 2400x1080, format 37, 2 present modes
+[VKM] 600 frames presented -- window takeover, surface, swapchain and present all work
+```
+
+两个教训：
+
+- **不要用 `SDL_Vulkan_LoadLibrary`**：它会去开系统的 `libvulkan.so`，而我们要的是
+  Turnip 的 loader。改用 `SDL_GetWindowWMInfo`（`SDL_SYSWM_ANDROID` 给出
+  `ANativeWindow*`）+ 自己的 `vkCreateAndroidSurfaceKHR`（从 `gipa(instance, …)` 取），
+  这样 surface 属于 Turnip 的实例。
+- `VK_USE_PLATFORM_ANDROID_KHR` 必须在 `#include <vulkan/vulkan.h>` 之前定义，否则
+  `VkAndroidSurfaceCreateInfoKHR` 不存在。
+
+剩下的就是后端本体：把 stub 的 `Nv2aGfx` 接进引擎，让游戏跑在这套 instance/swapchain 上，
+然后 SPIR-V → 管线 → pushbuffer draw。
 ## 下一步
 
 1. 窗口接管：`RECOMP_BACKEND=vulkan` → `SDL_WINDOW_VULKAN` + instance + surface + swapchain（默认仍走 GL）；

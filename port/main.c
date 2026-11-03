@@ -1108,6 +1108,16 @@ int SDL_main(int argc, char **argv);
 #endif
 int main(int argc, char **argv)
 {
+#if defined(__ANDROID__)
+    /* RECOMP_VK_DEMO=1: the app on Vulkan alone -- its own window taken with
+     * SDL_WINDOW_VULKAN, an instance on Turnip's loader, a surface, a
+     * swapchain and cleared frames presented -- instead of the game. The
+     * window takeover the backend will need, answered before it is written
+     * (port/vk_demo.c). */
+    { extern int nv2a_vk_demo_requested(void);
+      extern int nv2a_vk_demo(void);
+      if (nv2a_vk_demo_requested()) return nv2a_vk_demo(); }
+#endif
     /* --version: the version this engine was built as (port/CMakeLists.txt:
      * the release tag), for the launchers and for anyone asking. */
     if (argc > 1 && !strcmp(argv[1], "--version")) {
