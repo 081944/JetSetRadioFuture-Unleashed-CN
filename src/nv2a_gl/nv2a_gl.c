@@ -13107,6 +13107,12 @@ static int gfx_init(uint32_t w, uint32_t h)
      * frees them; nothing here touches the renderer. */
     { extern int nv2a_vk_probe(void);
       if (jsrf_getenv("RECOMP_VK_PROBE")) nv2a_vk_probe(); }
+    /* There is no second window to open: on Android SDL has one, and making a
+     * Vulkan one before the GL one (then destroying it) leaves the GL context
+     * without a surface -- measured, it dies in the guest at the first frame.
+     * So the Vulkan backend, when it comes, has to take the same window this
+     * code is about to make: SDL_WINDOW_VULKAN instead of SDL_WINDOW_OPENGL,
+     * chosen here from RECOMP_BACKEND. */
 #endif
 #if defined(NV2A_GL_USE_CGL)
     /* With a window, the window has already decided (it was made for one or
