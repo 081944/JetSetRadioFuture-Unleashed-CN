@@ -13100,6 +13100,14 @@ static int gfx_init(uint32_t w, uint32_t h)
 {
     const char *v = jsrf_getenv("RECOMP_BACKEND");
     int want_metal = 0, metal_window = 0;
+#if defined(NV2A_GLES)
+    /* RECOMP_VK_PROBE=1: prove the phone's Vulkan driver, loader and this
+     * build can make a device and get a cleared image back, before a backend
+     * is written on top of them (port/vk_probe.c). Makes its own objects and
+     * frees them; nothing here touches the renderer. */
+    { extern int nv2a_vk_probe(void);
+      if (jsrf_getenv("RECOMP_VK_PROBE")) nv2a_vk_probe(); }
+#endif
 #if defined(NV2A_GL_USE_CGL)
     /* With a window, the window has already decided (it was made for one or
      * the other, from the same preference); without one, only the

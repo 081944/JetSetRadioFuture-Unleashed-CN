@@ -155,10 +155,15 @@ if(ANDROID)
         xbe_check.c
         cn_compat.c
         android/jsrf_android.c
+        vk_probe.c
         ios/xiso.c
         ${JSRF_GEN_SOURCES}
     )
     set_target_properties(jsrf_recomp PROPERTIES OUTPUT_NAME main)
+    # The Vulkan smoke test (port/vk_probe.c). The NDK ships the headers and
+    # the loader stub, so whether a Vulkan backend can exist here is a question
+    # a device can answer before one is written.
+    target_link_libraries(jsrf_recomp PRIVATE vulkan)
 else()
     add_executable(jsrf_recomp
         main.c
