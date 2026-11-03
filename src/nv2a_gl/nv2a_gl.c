@@ -11901,6 +11901,22 @@ void nv2a_gl_indices(uint32_t method, const uint32_t *p, uint32_t n)
     }
 }
 
+/* Where each method goes in nv2a_gl_method: see the route table there. */
+enum { R_UNKNOWN = 0, R_CHAIN, R_ARRAY_OFF, R_ARRAY_FMT, R_TEXTURE, R_LIGHT };
+static uint8_t s_route[0x800];      /* one per (method >> 2) slot */
+
+static uint8_t route_of(uint32_t method)
+{
+    if (method >= M_SET_VERTEX_ARRAY_OFFSET
+        && method < M_SET_VERTEX_ARRAY_OFFSET + 0x40) return R_ARRAY_OFF;
+    if (method >= M_SET_VERTEX_ARRAY_FORMAT
+        && method < M_SET_VERTEX_ARRAY_FORMAT + 0x40) return R_ARRAY_FMT;
+    if (method >= M_SET_TEXTURE_OFFSET
+        && method < M_SET_TEXTURE_OFFSET + NUM_STAGES * 0x40) return R_TEXTURE;
+    if (method >= 0x1000 && method < 0x1000 + 8 * 0x80) return R_LIGHT;
+    return R_CHAIN;
+}
+
 void nv2a_gl_method(uint32_t method, uint32_t param)
 {
     if (!nv2a_gl_enabled() || g_failed) return;
@@ -11943,6 +11959,29 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
         split_batch_if_state_moved();
         if (S.inline_count < MAX_INLINE) S.inline_buf[S.inline_count++] = param;
         return;
+    }
+
+    /* Ships the few blocks the title hits around every draw before the tests
+     * that cannot match them.
+     *
+     * A word of the stream reaches its handler by walking the ranges below in
+     * order, and the four blocks further down -- the vertex array's offsets
+     * and formats, the texture stage's registers, the lights -- sit behind
+     * eighteen tests each for a method that is in none of them. Which block a
+     * method belongs to does not change, so it is worked out once per method
+     * and kept; a method in none of the four takes the chain as it was.
+     *
+     * The ranges do not overlap and none is reachable from an earlier test
+     * (the geometry methods above, 0x1800/0x1808/0x1818, and 0x1B00 upward
+     * for the per-vertex ranges, which stop there), so jumping past those
+     * tests cannot change what a word does -- only what it costs. */
+    { uint32_t sl = (method >> 2) & 0x7FF;
+      uint8_t r = s_route[sl];
+      if (r == R_UNKNOWN) { r = route_of(method); s_route[sl] = r; }
+      if (r == R_ARRAY_OFF) goto blk_array_off;
+      if (r == R_ARRAY_FMT) goto blk_array_fmt;
+      if (r == R_TEXTURE)   goto blk_texture;
+      if (r == R_LIGHT)     goto blk_light;
     }
 
     /* Ranged methods first among the remaining register writes. */
@@ -12151,12 +12190,14 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
     /* Every per-vertex attribute method: the attribute's current value, and
      * inside Begin/End the position's last component sends a vertex. */
     if (imm_method(method, param)) return;
+    blk_array_off:
     if (method >= M_SET_VERTEX_ARRAY_OFFSET && method < M_SET_VERTEX_ARRAY_OFFSET + 0x40) {
         uint32_t ai = (method - M_SET_VERTEX_ARRAY_OFFSET) / 4;
         if (S.attr[ai].offset != param) S.arrays_since_geom = 1;
         S.attr[ai].offset = param;
         return;
     }
+    blk_array_fmt:
     if (method >= M_SET_VERTEX_ARRAY_FORMAT && method < M_SET_VERTEX_ARRAY_FORMAT + 0x40) {
         Attr *a = &S.attr[(method - M_SET_VERTEX_ARRAY_FORMAT) / 4];
         if (a->raw != param) S.arrays_since_geom = 1;
@@ -12171,6 +12212,7 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
         a->stride = (param >> 8) & 0xFFFFFF;
         return;
     }
+    blk_texture:
     if (method >= M_SET_TEXTURE_OFFSET && method < M_SET_TEXTURE_OFFSET + NUM_STAGES * 0x40) {
         uint32_t stage = (method - M_SET_TEXTURE_OFFSET) / 0x40;
         uint32_t reg   = (method - M_SET_TEXTURE_OFFSET) % 0x40;
@@ -12216,6 +12258,7 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
      * Colours and vectors are three floats, the spot direction four. Light 0's
      * values are logged the first few times they change, to see what the
      * title's sun looks like. */
+blk_light:
     if (method >= 0x1000 && method < 0x1000 + 8 * 0x80) {
         /* The fields are three floats apiece (the spot direction four), so
          * they do not sit on 16-byte boundaries: ambient 0x00, diffuse 0x0C,
