@@ -128,6 +128,46 @@ endforeach()
 set(JSRF_GEN_SOURCES ${_jsrf_gen_sources})
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/recomp_manual.c")
 
+# Android's dlopen-loaded engine uses dynamic ELF TLS. Keep its integer
+# registers in one TLS object, while retaining the original symbols for the
+# native bridges. This does not require initial-exec TLS or loader changes.
+if(ANDROID AND ANDROID_ABI STREQUAL "arm64-v8a")
+    option(JSRF_GROUPED_GPR_TLS "Share one dynamic TLS address for guest GPRs" ON)
+    if(JSRF_GROUPED_GPR_TLS)
+        file(READ "${JSRF_GEN_DIR}/recomp_types.h" _gpr_types)
+        string(REGEX MATCHALL "extern RECOMP_TLS uint32_t g_ebp" _gpr_anchors "${_gpr_types}")
+        list(LENGTH _gpr_anchors _gpr_anchor_count)
+        if(NOT _gpr_anchor_count EQUAL 1)
+            message(FATAL_ERROR "Grouped GPR TLS: cannot find unique register declaration hook")
+        endif()
+        string(REPLACE "extern RECOMP_TLS uint32_t g_ebp;"
+            "extern RECOMP_TLS uint32_t g_ebp;\n#include \"${CMAKE_CURRENT_SOURCE_DIR}/recomp_gpr_aliases.h\""
+            _gpr_types "${_gpr_types}")
+        set(_gpr_headers "${CMAKE_CURRENT_BINARY_DIR}/gpr_headers")
+        file(MAKE_DIRECTORY "${_gpr_headers}")
+        file(WRITE "${_gpr_headers}/recomp_gpr_types.h.new" "${_gpr_types}")
+        configure_file("${_gpr_headers}/recomp_gpr_types.h.new"
+            "${_gpr_headers}/recomp_gpr_types.h" COPYONLY)
+        file(REMOVE "${_gpr_headers}/recomp_gpr_types.h.new")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${JSRF_GEN_DIR}/recomp_types.h")
+        target_sources(xbox_kernel PRIVATE "${JSRF_REPO}/src/kernel/recomp_gpr.c")
+        target_compile_definitions(xbox_kernel PRIVATE XBOXRECOMP_GROUPED_GPR_TLS=1)
+        set_property(SOURCE ${JSRF_GEN_SOURCES} "${CMAKE_CURRENT_SOURCE_DIR}/recomp_manual.c"
+            APPEND PROPERTY COMPILE_OPTIONS "-I${_gpr_headers}" "-include" "${CMAKE_CURRENT_SOURCE_DIR}/recomp_gpr_fast.h")
+        set_property(SOURCE ${JSRF_GEN_SOURCES} "${CMAKE_CURRENT_SOURCE_DIR}/recomp_manual.c"
+            APPEND PROPERTY COMPILE_DEFINITIONS JSRF_GROUPED_GPR_TLS=1)
+        foreach(_gpr_source IN LISTS JSRF_GEN_SOURCES)
+            file(STRINGS "${_gpr_source}" _gpr_generated
+                REGEX "^#define RECOMP_GENERATED_CODE" LIMIT_COUNT 1)
+            if(_gpr_generated)
+                set_property(SOURCE "${_gpr_source}" APPEND PROPERTY
+                    COMPILE_DEFINITIONS JSRF_GPR_GENERATED=1)
+            endif()
+        endforeach()
+        message(STATUS "Guest GPRs: grouped dynamic TLS, legacy symbol aliases")
+    endif()
+endif()
+
 # The release builds' generated code carries two tables of functions an
 # earlier discovery pass missed (recomp_seeded.c, recomp_holes.c; see
 # recomp_manual.c). Code generated with today's tools/recomp has neither:

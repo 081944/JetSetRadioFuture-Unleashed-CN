@@ -2649,7 +2649,7 @@ static void auto_step(const float *camf, const float *chf)
                 dist, s_auto_lx, s_auto_ly);
     }
 }
-/* Host pad state for a port: real pad if attached, else the script. */
+/* Host pad state, with scheduled input merged over the real controller. */
 static int pad_read(uint32_t port, XBOX_INPUT_STATE *st)
 {
     static int inited; static uint32_t packet;
@@ -2659,6 +2659,7 @@ static int pad_read(uint32_t port, XBOX_INPUT_STATE *st)
                 polls, pad_now()); }
     memset(st, 0, sizeof *st);
     trace_at_step();
+    int have_pad = xbox_InputGetState(port, st) == 0;
     if (port == 0 && (s_pad_script_n > 0 || s_auto_n > 0)) {
         double now = pad_now();
         for (int i = 0; i < s_pad_script_n; i++)
@@ -2710,7 +2711,7 @@ static int pad_read(uint32_t port, XBOX_INPUT_STATE *st)
         st->dwPacketNumber = ++packet;
         return 1;
     }
-    if (xbox_InputGetState(port, st) == 0) return 1;
+    if (have_pad) return 1;
     return port == 0;   /* port 0 always "present", idle, so the title never waits for a pad */
 }
 static uint32_t pad_mask(uint32_t type) { return type == XPP_TYPE_GAMEPAD ? 1u : 0u; }

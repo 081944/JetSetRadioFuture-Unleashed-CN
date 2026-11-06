@@ -1003,6 +1003,14 @@ static int      g_cur_slot = -1;
  * (program_for_current). */
 static uint32_t g_vsh_gen = 1;
 
+/* Re-uploading identical microcode must not invalidate its decoded/hash
+ * memo. The load cursor and instruction-completion flags still advance in
+ * the callers, including partial and non-incrementing uploads. */
+static inline void vsh_word_store(uint32_t at, uint32_t word)
+{
+    if (S.prog[at] != word) { S.prog[at] = word; g_vsh_gen++; }
+}
+
 /*
  * When each constant last changed, by a clock that ticks once per upload
  * that follows a change (see the upload in do_draw). A program is sent the
@@ -1114,11 +1122,13 @@ static struct {
 
 /* ---- helpers ------------------------------------------------------------ */
 
-int nv2a_gl_enabled(void)
+static inline int gl_enabled(void)
 {
     if (g_on < 0) g_on = jsrf_getenv("RECOMP_GL") ? 1 : 0;
     return g_on;
 }
+
+int nv2a_gl_enabled(void) { return gl_enabled(); }
 
 static int verbose(void)
 {
@@ -3864,8 +3874,17 @@ static uint32_t tex_sample(uint32_t color, const uint8_t *src, uint32_t bytes, i
       if (full < 0) full = jsrf_getenv("RECOMP_GL_TEXHASH_FULL") ? 1 : 0;
       if (full) step = 1; }
     hash = color * 2654435761u;
-    for (i = 0; i < bytes && step; i += step)
-        hash = hash * 31u + src[i];
+    /* The same polynomial and the same sampled bytes. Fold four terms at
+     * once so the CPU can issue their loads independently, without relaxing
+     * the per-lookup content check (or the diagnostic full-content mode). */
+    i = 0;
+    uint32_t count = bytes ? (bytes - 1) / step + 1 : 0;
+    while (count >= 4) {
+        hash = hash * 923521u + src[i] * 29791u + src[i + step] * 961u +
+               src[i + 2*step] * 31u + src[i + 3*step];
+        i += 4*step; count -= 4;
+    }
+    while (count--) { hash = hash * 31u + src[i]; i += step; }
     hash = hash * 31u + bytes;
     if (bias) hash ^= 0x9E3779B9u;   /* a different upload */
     return hash;
@@ -10925,6 +10944,9 @@ static void present(int is_frame)
     { extern int  nv2a_vk_engine_active(void);
       extern void nv2a_vk_engine_frame(void);
       if (nv2a_vk_engine_active()) {
+          /* Input and queued settings belong to every SDL backend. Do not
+           * call the GL presenter here: this window has no GL context. */
+          if (is_frame && g_window) sdl_pump();
           if (is_frame && g_ready && g_cur_rt) {
               perf_frame_tick();
               uint32_t prt = g_cur_rt;
@@ -11866,13 +11888,12 @@ int nv2a_gl_transform_run(uint32_t method, const uint32_t *params, uint32_t coun
     if (plain < 0)
         plain = !jsrf_getenv("RECOMP_GL_WATCH_CONST") && !jsrf_getenv("RECOMP_GL_CONST_OWNER");
     if (!plain || !count) return 0;
-    if (!nv2a_gl_enabled() || g_failed || !S.const_attr_init) return 0;
+    if (!gl_enabled() || g_failed || !S.const_attr_init) return 0;
 
     if (is_prog) {
         for (i = 0; i < count; i++) {
             if (S.prog_load >= NV2A_VSH_MAX_INSNS) break;
-            S.prog[S.prog_load * 4 + S.prog_sub] = params[i];
-            g_vsh_gen++;
+            vsh_word_store(S.prog_load * 4 + S.prog_sub, params[i]);
             if (++S.prog_sub == 4) { S.prog_sub = 0; S.prog_load++; S.prog_dirty = 1; }
         }
         return 1;
@@ -11906,7 +11927,7 @@ int nv2a_gl_method_run(uint32_t method, const uint32_t *params, uint32_t count)
     uint32_t take, i;
     if (method != M_ARRAY_ELEMENT16 && method != M_ARRAY_ELEMENT32 &&
         method != M_INLINE_ARRAY) return 0;
-    if (!count || !nv2a_gl_enabled() || g_failed || !S.const_attr_init) return 0;
+    if (!count || !gl_enabled() || g_failed || !S.const_attr_init) return 0;
     if (!nv2a_gl_packet_batch_allowed()) return 0;
 
     g_prof.geometry_packets++;
@@ -11918,10 +11939,13 @@ int nv2a_gl_method_run(uint32_t method, const uint32_t *params, uint32_t count)
     if (method == M_ARRAY_ELEMENT16) {
         take = (MAX_INDICES - S.idx_count) / 2;
         if (take > count) take = count;
+        uint32_t *dst = S.idx + S.idx_count;
         for (i = 0; i < take; i++) {
-            S.idx[S.idx_count++] = params[i] & 0xFFFF;
-            S.idx[S.idx_count++] = params[i] >> 16;
+            uint32_t word = params[i];
+            dst[2*i] = word & 0xFFFF;
+            dst[2*i + 1] = word >> 16;
         }
+        S.idx_count += 2*take;
     } else if (method == M_ARRAY_ELEMENT32) {
         take = MAX_INDICES - S.idx_count;
         if (take > count) take = count;
@@ -11957,16 +11981,19 @@ void nv2a_gl_indices(uint32_t method, const uint32_t *p, uint32_t n)
 {
     uint32_t room, i;
     nv2a_gl_method(method, p[0]);
-    if (n < 2 || !nv2a_gl_enabled() || g_failed) return;
+    if (n < 2 || !gl_enabled() || g_failed) return;
     p++;
     n--;
     if (method == M_ARRAY_ELEMENT16) {
         room = (MAX_INDICES - S.idx_count) / 2;     /* two indices a word */
         if (n > room) n = room;
+        uint32_t *dst = S.idx + S.idx_count;
         for (i = 0; i < n; i++) {
-            S.idx[S.idx_count++] = p[i] & 0xFFFF;
-            S.idx[S.idx_count++] = p[i] >> 16;
+            uint32_t word = p[i];
+            dst[2*i] = word & 0xFFFF;
+            dst[2*i + 1] = word >> 16;
         }
+        S.idx_count += 2*n;
     } else if (method == M_ARRAY_ELEMENT32) {
         room = MAX_INDICES - S.idx_count;
         if (n > room) n = room;
@@ -11993,7 +12020,7 @@ static uint8_t route_of(uint32_t method)
 
 void nv2a_gl_method(uint32_t method, uint32_t param)
 {
-    if (!nv2a_gl_enabled() || g_failed) return;
+    if (!gl_enabled() || g_failed) return;
     if (PROF_ON()) g_meth_count[(method >> 2) & 0x7FF]++;
     methval_note(method, param);
     methtrace_note(method, param);
@@ -12073,8 +12100,7 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
      * like the whole renderer being broken. */
     if (method >= M_SET_TRANSFORM_PROGRAM && method <= M_SET_TRANSFORM_PROGRAM + 0x7C) {
         if (S.prog_load < NV2A_VSH_MAX_INSNS) {
-            S.prog[S.prog_load * 4 + S.prog_sub] = param;
-            g_vsh_gen++;
+            vsh_word_store(S.prog_load * 4 + S.prog_sub, param);
         }
         if (++S.prog_sub == 4) { S.prog_sub = 0; S.prog_load++; S.prog_dirty = 1; }
         return;
@@ -13218,11 +13244,15 @@ static int gfx_init(uint32_t w, uint32_t h)
     if (v && !strcmp(v, "vulkan")) {
         extern int nv2a_vk_engine_start(int, int);
         extern int nv2a_vk_engine_active(void);
+        extern SDL_Window *nv2a_vk_engine_window(void);
         extern const Nv2aGfx *nv2a_vk_stub_gfx(void);
         /* Started already, on the thread SDL wants for its window (main.c),
          * when it could be: this call is on the pushbuffer thread, where
          * Android will not make a second window. */
         if (nv2a_vk_engine_active() || nv2a_vk_engine_start((int)w, (int)h)) {
+            g_window = nv2a_vk_engine_window();
+            if (!jsrf_getenv("RECOMP_WIDESCREEN") && !jsrf_getenv("RECOMP_WIDE_ASPECT"))
+                nv2a_set_picture(sdl_pref_picture(), sdl_screen_aspect(), 0);
             G = nv2a_vk_stub_gfx();
             if (!G->init()) {
                 fprintf(stderr, "  [GL] Vulkan renderer initialization failed\n");

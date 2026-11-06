@@ -13,6 +13,7 @@ extern int nv2a_vk_glsl_to_spirv(const char *, int, uint32_t **, size_t *);
 #define VG_RT 64
 #define VG_PROG 4096
 #define VG_PIPES 8192
+#define VG_PIPE_BUCKETS 4096
 #define VG_SETS 4096
 #define VG_UNIFORM_CAP 16384
 #define VG_STATIC (128u << 20)
@@ -43,7 +44,13 @@ typedef struct {
     uint32_t w, h, levels;
     int owner;
 } VgTexture;
-typedef struct { VgTexture texture; int state; uint32_t flip; VkDescriptorSet set; } VgDisplay;
+typedef struct {
+    VgTexture texture;
+    int state;
+    uint32_t flip;
+    VkDescriptorSet set;
+    float aspect; /* Scene shape captured with this frame, before hand-off. */
+} VgDisplay;
 typedef struct {
     uint32_t color, snapshot, w, h;
     VgTexture depth;
@@ -88,6 +95,9 @@ static VgTexture vg_tex[VG_TEX];
 static VgTarget vg_rt[VG_RT];
 static VgProgram vg_prog[VG_PROG];
 static VgPipeline vg_pipes[VG_PIPES];
+/* Index + 1, so zero terminates a chain. Dead pipelines remain in their
+ * chain until shutdown and are skipped; program IDs can safely be reused. */
+static uint32_t vg_pipe_head[VG_PIPE_BUCKETS], vg_pipe_next[VG_PIPES];
 static VgSlot vg_slots[VG_SLOTS];
 static VgVertexBuffer vg_vbufs[VG_VBUFS];
 static VgRange vg_free_ranges[VG_RANGES];
@@ -905,11 +915,50 @@ static VkPrimitiveTopology vg_topology(int p)
     }
 }
 
+static uint32_t vg_pipeline_bucket(const VgPipeline *key)
+{
+    /* Four independent lanes shorten the dependency chain. Hash the exact
+     * bytes compared below, including normalized unused state. */
+    const uint8_t *p = (const uint8_t *)key;
+    size_t n = offsetof(VgPipeline, pipeline);
+    uint32_t h[4] = {0x9e3779b1u, 0x85ebca77u, 0xc2b2ae3du, 0x27d4eb2fu};
+    while (n >= 16) {
+        for (int i = 0; i < 4; i++) {
+            uint32_t word; memcpy(&word, p + 4*i, 4);
+            h[i] = (h[i] ^ word) * 0x9e3779b1u;
+        }
+        p += 16; n -= 16;
+    }
+    uint32_t hash = h[0] ^ (h[1] << 7 | h[1] >> 25) ^
+                    (h[2] << 13 | h[2] >> 19) ^ (h[3] << 19 | h[3] >> 13);
+    while (n--) hash = (hash ^ *p++) * 16777619u;
+    hash ^= hash >> 16; hash *= 0x85ebca6bu; hash ^= hash >> 13;
+    return hash & (VG_PIPE_BUCKETS - 1);
+}
+
+static VkPipeline vg_pipeline_find(const VgPipeline *key, uint32_t bucket)
+{
+    for (uint32_t entry = vg_pipe_head[bucket]; entry; entry = vg_pipe_next[entry - 1]) {
+        const VgPipeline *p = &vg_pipes[entry - 1];
+        if (p->pipeline && !memcmp(p, key, offsetof(VgPipeline, pipeline))) return p->pipeline;
+    }
+    return VK_NULL_HANDLE;
+}
+
+static void vg_pipeline_remember(const VgPipeline *key, uint32_t bucket)
+{
+    vg_pipes[vg_npipe] = *key;
+    vg_pipe_next[vg_npipe] = vg_pipe_head[bucket];
+    vg_pipe_head[bucket] = ++vg_npipe;
+}
+
 static VkPipeline vg_pipeline(int prim)
 {
     /* Scissor is dynamic. Zero structure padding and irrelevant fields so
      * semantically equal states have the same cache key. */
-    VgPipeline key = { .prog = vg_current_prog, .prim = (uint32_t)prim };
+    VgPipeline key;
+    memset(&key, 0, sizeof key);
+    key.prog = vg_current_prog; key.prim = (uint32_t)prim;
     key.stride=vg_attr_stride*4;
     for(int i=0;i<16;i++) if(vg_prog[vg_current_prog].inputs&(1u<<i))
         key.attr[i]=(vg_attr_mask&(1u<<i))?vg_attr_at[i]:UINT32_MAX;
@@ -924,8 +973,9 @@ static VkPipeline vg_pipeline(int prim)
     r->poly_offset = vg_state.poly_offset; r->poly_offset_factor = vg_state.poly_offset_factor; r->poly_offset_units = vg_state.poly_offset_units;
     if (vg_force_nocull) r->cull_enable=0;
     if (vg_force_nodepth) r->depth_test=r->depth_write=0;
-    for (uint32_t i = 0; i < vg_npipe; i++)
-        if (vg_pipes[i].pipeline && !memcmp(&vg_pipes[i], &key, offsetof(VgPipeline, pipeline))) return vg_pipes[i].pipeline;
+    uint32_t bucket = vg_pipeline_bucket(&key);
+    VkPipeline found = vg_pipeline_find(&key, bucket);
+    if (found) return found;
     if (vg_npipe == VG_PIPES) { vke("game pipeline cache exhausted"); return VK_NULL_HANDLE; }
     VgProgram *p = &vg_prog[vg_current_prog];
     VkPipelineShaderStageCreateInfo stages[2] = {
@@ -979,7 +1029,7 @@ static VkPipeline vg_pipeline(int prim)
         .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms,
         .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy, .layout = vg_pipeline_layout };
     if (!vg_ok(p_pipe_new(w_dev, vg_pipeline_cache, 1, &ci, NULL, &key.pipeline), "game pipeline")) return VK_NULL_HANDLE;
-    vg_pipes[vg_npipe++] = key;
+    vg_pipeline_remember(&key, bucket);
     return key.pipeline;
 }
 
@@ -1297,7 +1347,7 @@ static void vg_window_frame(int index)
     if(r!=VK_SUCCESS && r!=VK_SUBOPTIMAL_KHR){vg_ok(r,"window acquire");return;}
     if(image>=w_nimg || !vg_ok(p_pool_reset(w_dev,w_pool,0),"window command reset"))return;
     float aspect=(float)w_window_extent.width/w_window_extent.height;
-    float picture=(float)d->texture.w/d->texture.h;
+    float picture=d->aspect;
     float scale[4]={1,1,0,0};if(picture<aspect)scale[0]=picture/aspect;else scale[1]=aspect/picture;
     float rotation[4]={1,0,0,1};
     if(w_transform==VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR){rotation[0]=0;rotation[1]=-1;rotation[2]=1;rotation[3]=0;}
@@ -1368,6 +1418,7 @@ static void vg_present(uint32_t rt,uint32_t pw,uint32_t ph)
     if(index>=0) {
         VgTexture *src=&vg_tex[vg_rt[rt].color];
         if(!vg_display_target(index,src->w,src->h) || !vg_begin())return;
+        vg_display[index].aspect=nv2a_wide_scene() ? nv2a_wide_aspect() : (float)src->w/src->h;
         VgTexture *dst=&vg_display[index].texture;
         vg_transition(src,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_ASPECT_COLOR_BIT);
         vg_transition(dst,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_ASPECT_COLOR_BIT);
@@ -1554,6 +1605,7 @@ static void vg_stop(void)
     vg_pipeline_cache=VK_NULL_HANDLE;vg_pipeline_layout=VK_NULL_HANDLE;vg_set_layout=VK_NULL_HANDLE;
     memset(vg_slots,0,sizeof vg_slots);memset(vg_tex,0,sizeof vg_tex);memset(vg_rt,0,sizeof vg_rt);
     memset(vg_prog,0,sizeof vg_prog);memset(vg_pipes,0,sizeof vg_pipes);
+    memset(vg_pipe_head,0,sizeof vg_pipe_head);memset(vg_pipe_next,0,sizeof vg_pipe_next);
     memset(vg_vbufs,0,sizeof vg_vbufs);vg_nfree_ranges=vg_cached_vb=0;
     vg_ready=vg_recording=vg_rendering=0;vg_slot_index=vg_current_rt=vg_current_prog=vg_npipe=0;
 }

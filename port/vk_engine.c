@@ -53,6 +53,7 @@ static void vke(const char *fmt, ...)
 }
 
 int nv2a_vk_engine_active(void);
+SDL_Window *nv2a_vk_engine_window(void);
 void nv2a_vk_engine_frame(void);
 void nv2a_vk_engine_stop(void);
 
@@ -657,6 +658,7 @@ static int vke_pipeline(void)
 }
 
 int nv2a_vk_engine_active(void) { return w_active; }
+SDL_Window *nv2a_vk_engine_window(void) { return w_win; }
 
 /* The frame belongs to a thread of its own, as the GL backend's does: the
  * pushbuffer thread asks for one and moves on, and nothing else ever touches

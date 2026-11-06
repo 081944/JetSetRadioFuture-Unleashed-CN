@@ -1134,8 +1134,13 @@ RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
  * at is. Zero total means the image had no TLS directory. */
 static uint32_t g_tls_template_va, g_tls_total, g_tls_thread_size = 64;
 
+#if defined(XBOXRECOMP_GROUPED_GPR_TLS)
+/* Definitions and ABI-compatible TLS aliases live in recomp_gpr.c. */
+extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
+#else
 RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
 RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
+#endif
 
 #ifdef RECOMP_ABI_CHECK
 /* Report a lifted function that returned without restoring ebx/esi/edi.
@@ -1482,7 +1487,9 @@ RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
 /* Last frame established by `mov ebp, esp`. Read by frameless functions
  * that address their caller's frame through ebp. */
+#if !defined(XBOXRECOMP_GROUPED_GPR_TLS)
 RECOMP_TLS uint32_t g_ebp = 0;
+#endif
 
 /* EFLAGS.DF. Zero means the string instructions walk forwards, which is the
  * ABI's resting state and what almost every one of them does -- so this is

@@ -54,6 +54,10 @@ int nv2a_gl_packet_batch_allowed(void);
 /* End-of-run summary: what was drawn, what was refused, and why. */
 void nv2a_gl_report(void);
 
+/* Presentation follows the scene's display shape, not the 4:3 render target. */
+int nv2a_wide_scene(void);
+float nv2a_wide_aspect(void);
+
 #if defined(NV2A_GLES)
 /* Android's optional in-game performance overlay. */
 void nv2a_gl_performance_enable(int on);
