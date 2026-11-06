@@ -102,8 +102,8 @@ int nv2a_vk_glsl_to_spirv(const char *glsl, int stage, uint32_t **words,
         return 0;
     }
     *nwords = n;
-    *words = (uint32_t *)malloc(n * sizeof *words);
-    if (*words) memcpy(*words, spv, n * sizeof *words);
+    *words = (uint32_t *)malloc(n * sizeof **words);
+    if (*words) memcpy(*words, spv, n * sizeof **words);
     glslang_program_delete(program);
     glslang_shader_delete(shader);
     return *words != NULL;

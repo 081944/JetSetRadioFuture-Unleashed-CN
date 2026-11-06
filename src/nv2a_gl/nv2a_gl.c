@@ -10802,6 +10802,28 @@ static void perf_frame_tick(void)
     if (g_perf_last_frame > 0.0) {
         double dt = now - g_perf_last_frame;
         if (dt > 0.0 && dt < 2.0) {
+            /* Optional frame-level A/B log. Reuse existing measurements;
+             * no extra clock reads or per-draw timers. */
+            static int log_on = -1;
+            static unsigned frames;
+            static double elapsed, cpu_total, gpu_total;
+            static unsigned gpu_frames;
+            if (log_on < 0) {
+                const char *v = jsrf_getenv("RECOMP_FRAME_STATS");
+                log_on = v && atoi(v) != 0;
+            }
+            if (log_on) {
+                frames++; elapsed += dt;
+                cpu_total += atomic_load_explicit(&g_perf_cpu_us, memory_order_relaxed);
+                int gpu = atomic_load_explicit(&g_perf_gpu_us, memory_order_relaxed);
+                if (gpu >= 0) { gpu_total += gpu; gpu_frames++; }
+                if (elapsed >= 2.0) {
+                    jsrf_dbg_log("[FRAMESTATS] %u frames %.3f s: %.2f fps, frame %.3f ms, render CPU %.3f ms, GPU %.3f ms\n",
+                        frames, elapsed, frames/elapsed, elapsed*1000/frames,
+                        cpu_total/frames/1000, gpu_frames?gpu_total/gpu_frames/1000:-1.0);
+                    frames=gpu_frames=0; elapsed=cpu_total=gpu_total=0;
+                }
+            }
             g_perf_frame_ema = g_perf_frame_ema > 0.0
                 ? g_perf_frame_ema * 0.85 + dt * 0.15 : dt;
             atomic_store_explicit(&g_perf_frame_us, (unsigned)(g_perf_frame_ema * 1000000.0 + 0.5), memory_order_relaxed);
@@ -10903,9 +10925,25 @@ static void present(int is_frame)
     { extern int  nv2a_vk_engine_active(void);
       extern void nv2a_vk_engine_frame(void);
       if (nv2a_vk_engine_active()) {
-          { static unsigned pn; if (++pn % 30 == 0) fprintf(stderr, "  [GL] vulkan present #%u flips %u surf %08X fbo %ux%u\n", pn, S.flips, S.color_offset, g_fbo_w, g_fbo_h); }
-          if (is_frame) { S.frames++; g_frame_clock = mono_now(); }
-          nv2a_vk_engine_frame();
+          if (is_frame && g_ready && g_cur_rt) {
+              perf_frame_tick();
+              uint32_t prt = g_cur_rt;
+              uint32_t pw = g_fbo_pw, ph = g_fbo_ph;
+              if (g_present_slot >= 0 && g_present_slot < SURF_CACHE && g_surf[g_present_slot].used) {
+                  prt = g_surf[g_present_slot].rt;
+                  pw = g_surf[g_present_slot].w * gl_scale();
+                  ph = g_surf[g_present_slot].h * gl_scale();
+              }
+              S.frames++; g_frame_clock = mono_now();
+              prof_report(); tcache_sweep(); tcache_verify();
+              memcpy(g_slot_prev, g_slot_draws, sizeof g_slot_prev);
+              memset(g_slot_draws, 0, sizeof g_slot_draws);
+              g_frame_chars_prev = g_frame_chars; g_frame_chars = 0;
+              { PROF_T0(); cache_idle_frame(); frame_pace(); PROF_ADD(pace); }
+              g_shown_rt = prt;
+              { PROF_T0(); G->present(prt, pw, ph); PROF_ADD(present); }
+              S.flips++; S.since_present = 0;
+          }
           return;
       } }
 #endif
@@ -13186,6 +13224,10 @@ static int gfx_init(uint32_t w, uint32_t h)
          * Android will not make a second window. */
         if (nv2a_vk_engine_active() || nv2a_vk_engine_start((int)w, (int)h)) {
             G = nv2a_vk_stub_gfx();
+            if (!G->init()) {
+                fprintf(stderr, "  [GL] Vulkan renderer initialization failed\n");
+                return 0;
+            }
             g_is_gl = 0;
             fprintf(stderr, "  [GL] backend: %s\n", G->name);
             zrev_start();
@@ -13253,6 +13295,11 @@ void nv2a_gl_performance_stats(unsigned *fps_milli, unsigned *frame_us,
     if (cpu_us) *cpu_us = atomic_load_explicit(&g_perf_cpu_us, memory_order_relaxed);
     if (gpu_us) *gpu_us = atomic_load_explicit(&g_perf_gpu_us, memory_order_relaxed);
     if (gpu_supported) *gpu_supported = atomic_load_explicit(&g_perf_gpu_supported, memory_order_relaxed);
+}
+void nv2a_gl_performance_backend_gpu(int us)
+{
+    atomic_store_explicit(&g_perf_gpu_supported, us >= 0, memory_order_relaxed);
+    atomic_store_explicit(&g_perf_gpu_us, us, memory_order_relaxed);
 }
 #endif
 

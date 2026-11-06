@@ -193,6 +193,7 @@ uint32_t xbox_ContiguousBlockSize(uint32_t xbox_va);
 uint32_t xbox_ContiguousBlockSerial(uint32_t xbox_va);
 /* Wake the NV2A acknowledgement thread now (D3D KickOff). */
 void xbox_nv2a_kick(void);
+void xbox_nv2a_flush_wait(uint32_t register_base);
 void xbox_nv2a_hurry(int on);
 /* Completes a pending vblank acknowledgement now; for the renderer's frame
  * pacing, which sleeps on the thread that normally does it. */

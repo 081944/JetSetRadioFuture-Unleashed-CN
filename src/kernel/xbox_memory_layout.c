@@ -164,6 +164,37 @@ static volatile LONG g_nv2a_ack_stop = 0;
 #include <sched.h>
 static int s_kick_on = -1;
 static volatile int s_hurry;
+static pthread_mutex_t s_flush_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_flush_cv = PTHREAD_COND_INITIALIZER;
+
+/* Keep the existing acknowledgement ordering, but do not burn a guest core
+ * polling it. In particular, do not acknowledge this on the producer: the
+ * legacy pushbuffer walker also relies on the handshake as backpressure. */
+void xbox_nv2a_flush_wait(uint32_t register_base)
+{
+    extern int xbox_guest_lock_drop(void);
+    extern void xbox_guest_lock_retake(int held);
+    uint32_t *r = (uint32_t *)((uintptr_t)(register_base + 0x100410u) + g_memory_offset);
+    pthread_mutex_lock(&s_flush_mu);
+    __atomic_fetch_or(r, 0x10000u, __ATOMIC_SEQ_CST);
+    pthread_mutex_unlock(&s_flush_mu);
+    int held = xbox_guest_lock_drop();
+    xbox_nv2a_kick();
+    pthread_mutex_lock(&s_flush_mu);
+    while (__atomic_load_n(r, __ATOMIC_ACQUIRE) & 0x10000u)
+        pthread_cond_wait(&s_flush_cv, &s_flush_mu);
+    pthread_mutex_unlock(&s_flush_mu);
+    xbox_guest_lock_retake(held);
+}
+
+static void nv2a_flush_ack(uint32_t *r)
+{
+    if (!(__atomic_load_n(r, __ATOMIC_ACQUIRE) & 0x10000u)) return;
+    pthread_mutex_lock(&s_flush_mu);
+    __atomic_fetch_and(r, ~0x10000u, __ATOMIC_RELEASE);
+    pthread_cond_broadcast(&s_flush_cv);
+    pthread_mutex_unlock(&s_flush_mu);
+}
 #if defined(_WIN32)
 /* On Windows the wait is Windows' own: an auto-reset event for the kick and a
  * high-resolution waitable timer (Windows 10 1803 on; a plain one before) for
@@ -246,6 +277,12 @@ void xbox_nv2a_hurry(int on)
 #else
 void xbox_nv2a_kick(void) { }
 void xbox_nv2a_hurry(int on) { (void)on; }
+void xbox_nv2a_flush_wait(uint32_t register_base)
+{
+    volatile uint32_t *r = (volatile uint32_t *)((uintptr_t)(register_base + 0x100410u) + g_memory_offset);
+    *r |= 0x10000u;
+    while (*r & 0x10000u) Sleep(0);
+}
 #endif
 
 /*
@@ -834,6 +871,12 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
             extern int xbox_nv2a_swm_in_flight(void);
+#if !defined(_WIN32) || defined(XBOXRECOMP_WIN_GL)
+            if (NV2A_ACK[i].offset == 0x100410u) {
+                nv2a_flush_ack((uint32_t *)r);
+                continue;
+            }
+#endif
             /* A software method the title has not acknowledged yet keeps its
              * PGRAPH status: the handler is about to read it.
              *

@@ -59,6 +59,9 @@ void nv2a_gl_report(void);
 void nv2a_gl_performance_enable(int on);
 void nv2a_gl_performance_stats(unsigned *fps_milli, unsigned *frame_us,
                                unsigned *cpu_us, int *gpu_us, int *gpu_supported);
+/* A non-GL backend publishes completed GPU frame durations in microseconds;
+ * negative disables the reading until a complete frame is available. */
+void nv2a_gl_performance_backend_gpu(int us);
 #endif
 
 #ifdef __cplusplus

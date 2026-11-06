@@ -22,6 +22,7 @@
 
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,13 +68,19 @@ static VkQueue          w_queue;
 static VkSwapchainKHR   w_sc;
 static VkCommandPool    w_pool;
 static VkCommandBuffer  w_cmd;
-static VkSemaphore      w_acq, w_done;
+static VkSemaphore      w_acq, w_done[8];
 static VkFence          w_fence;
 static VkImage          w_img[8];
 static VkImageLayout    w_layout[8];
 static uint32_t         w_nimg;
 static VkExtent2D       w_extent;
-static int              w_active;
+static VkExtent2D       w_window_extent;
+static VkSurfaceTransformFlagBitsKHR w_transform;
+static VkFormat         w_format;
+static atomic_int       w_active;
+static atomic_int       w_failed;
+static uint32_t         w_family;
+static int              w_depth_clamp;
 
 static PFN_vkGetInstanceProcAddr p_gipa;
 static PFN_vkDestroyInstance              p_destroy_instance;
@@ -91,6 +98,9 @@ static PFN_vkDestroyFence                 p_fence_free;
 static PFN_vkWaitForFences                p_wait;
 static PFN_vkResetFences                  p_reset;
 static PFN_vkDestroyCommandPool           p_pool_free;
+static PFN_vkResetCommandPool             p_pool_reset;
+static PFN_vkCreateCommandPool            p_pool_new;
+static PFN_vkAllocateCommandBuffers       p_cmds;
 static PFN_vkBeginCommandBuffer           p_begin;
 static PFN_vkEndCommandBuffer             p_end;
 static PFN_vkCmdPipelineBarrier           p_barrier;
@@ -128,6 +138,10 @@ static PFN_vkCmdCopyImageToBuffer p_copy_to_buf;
 static int vke_pipeline(void);
 static int SDLCALL vke_present_main(void *arg);
 static void vke_frame_body(void);
+static int vke_readback_test(void);
+static void vg_stop(void);
+static void vg_present_dispatch(void);
+void nv2a_vk_engine_target_free(void);
 
 /* What the first pipeline needs: a view per swapchain image, the two shader
  * modules glslang compiled, and the pipeline itself. Dynamic rendering takes
@@ -187,8 +201,6 @@ int nv2a_vk_engine_start(int want_w, int want_h)
     PFN_vkGetPhysicalDeviceSurfacePresentModesKHR p_modes;
     PFN_vkCreateDevice p_create_device;
     PFN_vkCreateSwapchainKHR p_sc_new;
-    PFN_vkCreateCommandPool p_pool_new;
-    PFN_vkAllocateCommandBuffers p_cmds;
     uint32_t family = UINT32_MAX, i, n;
     VkSurfaceFormatKHR fmt;
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
@@ -287,6 +299,7 @@ int nv2a_vk_engine_start(int want_w, int want_h)
             if (sup) { family = k; break; }
         } }
     if (family == UINT32_MAX) { vke("no graphics+present queue"); goto fail; }
+    w_family = family;
     p_create_device = (PFN_vkCreateDevice)p_gipa(w_inst, "vkCreateDevice");
     p_destroy_device = (PFN_vkDestroyDevice)p_gipa(w_inst, "vkDestroyDevice");
     p_get_queue = (PFN_vkGetDeviceQueue)p_gipa(w_inst, "vkGetDeviceQueue");
@@ -305,6 +318,13 @@ int nv2a_vk_engine_start(int want_w, int want_h)
         dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
+        VkPhysicalDeviceFeatures supported, enabled = {0};
+        PFN_vkGetPhysicalDeviceFeatures get_features =
+            (PFN_vkGetPhysicalDeviceFeatures)p_gipa(w_inst, "vkGetPhysicalDeviceFeatures");
+        get_features(w_phys, &supported);
+        enabled.depthClamp = supported.depthClamp;
+        w_depth_clamp = enabled.depthClamp;
+        dci.pEnabledFeatures = &enabled;
         {   /* Dynamic rendering and synchronized submission are core in 1.3;
              * without the feature enabled vkCmdBeginRendering is not legal. */
             static VkPhysicalDeviceVulkan13Features f13;
@@ -336,6 +356,7 @@ int nv2a_vk_engine_start(int want_w, int want_h)
     p_reset = (PFN_vkResetFences)p_gipa(w_inst, "vkResetFences");
     p_pool_new = (PFN_vkCreateCommandPool)p_gipa(w_inst, "vkCreateCommandPool");
     p_pool_free = (PFN_vkDestroyCommandPool)p_gipa(w_inst, "vkDestroyCommandPool");
+    p_pool_reset = (PFN_vkResetCommandPool)p_gipa(w_inst, "vkResetCommandPool");
     p_cmds = (PFN_vkAllocateCommandBuffers)p_gipa(w_inst, "vkAllocateCommandBuffers");
     p_begin = (PFN_vkBeginCommandBuffer)p_gipa(w_inst, "vkBeginCommandBuffer");
     p_end = (PFN_vkEndCommandBuffer)p_gipa(w_inst, "vkEndCommandBuffer");
@@ -386,12 +407,19 @@ int nv2a_vk_engine_start(int want_w, int want_h)
         for (i = 0; i < nf; i++)
             if (fmts[i].format == VK_FORMAT_R8G8B8A8_UNORM
              || fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM) { fmt = fmts[i]; break; }
+        w_format = fmt.format;
         for (i = 0; i < nm; i++) if (modes[i] == VK_PRESENT_MODE_FIFO_KHR) mode = modes[i];
         w_extent = caps.currentExtent;
         if (w_extent.width == 0xFFFFFFFFu) {
             w_extent.width = 480; w_extent.height = 320;
             if (w_extent.width > caps.maxImageExtent.width) w_extent.width = caps.maxImageExtent.width;
             if (w_extent.height > caps.maxImageExtent.height) w_extent.height = caps.maxImageExtent.height;
+        }
+        w_window_extent=w_extent;
+        w_transform=caps.currentTransform;
+        if(w_transform==VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
+           w_transform==VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) {
+            uint32_t tmp=w_extent.width;w_extent.width=w_extent.height;w_extent.height=tmp;
         }
         {   VkSwapchainCreateInfoKHR sci;
             memset(&sci, 0, sizeof sci);
@@ -406,7 +434,9 @@ int nv2a_vk_engine_start(int want_w, int want_h)
             sci.imageArrayLayers = 1;
             sci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
             sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-            sci.preTransform = caps.currentTransform;
+            sci.preTransform = w_transform;
+            vke("surface transform current %u, supported %u, chosen %u",
+                (unsigned)caps.currentTransform,(unsigned)caps.supportedTransforms,(unsigned)sci.preTransform);
             sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
             sci.presentMode = mode;
             sci.clipped = VK_TRUE;
@@ -417,10 +447,10 @@ int nv2a_vk_engine_start(int want_w, int want_h)
     if (p_sc_images(w_dev, w_sc, &w_nimg, NULL) != VK_SUCCESS || !w_nimg) {
         vke("no swapchain images"); goto fail;
     }
-    if (w_nimg > 8) w_nimg = 8;
-    p_sc_images(w_dev, w_sc, &w_nimg, w_img);
+    if (w_nimg > 8) { vke("too many swapchain images: %u", w_nimg); goto fail; }
+    if (p_sc_images(w_dev, w_sc, &w_nimg, w_img) != VK_SUCCESS) goto fail;
     for (i = 0; i < w_nimg; i++) w_layout[i] = VK_IMAGE_LAYOUT_UNDEFINED;
-    vke_pipeline();
+    if(vke_switch_on("RECOMP_VK_TRIANGLE_TEST")) vke_pipeline();
     {   VkCommandPoolCreateInfo pci;
         VkCommandBufferAllocateInfo cbi;
         VkFenceCreateInfo fci;
@@ -438,11 +468,14 @@ int nv2a_vk_engine_start(int want_w, int want_h)
         memset(&fci, 0, sizeof fci);
         fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-        p_fence_new(w_dev, &fci, NULL, &w_fence);
+        if (p_fence_new(w_dev, &fci, NULL, &w_fence) != VK_SUCCESS) goto fail;
         memset(&sci, 0, sizeof sci);
         sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-        p_sem_new(w_dev, &sci, NULL, &w_acq);
-        p_sem_new(w_dev, &sci, NULL, &w_done);
+        if (p_sem_new(w_dev, &sci, NULL, &w_acq) != VK_SUCCESS) goto fail;
+        /* A submit fence does not retire a present wait. Reuse the semaphore
+         * only after acquiring that same swapchain image again. */
+        for (i = 0; i < w_nimg; i++)
+            if (p_sem_new(w_dev, &sci, NULL, &w_done[i]) != VK_SUCCESS) goto fail;
     }
     w_active = 1;
     vke("swapchain %ux%u, format %d, %u images", w_extent.width, w_extent.height,
@@ -454,7 +487,10 @@ int nv2a_vk_engine_start(int want_w, int want_h)
     vke("fn acquire %p, begin %p, barrier %p, clear %p, submit %p, wait %p, present %p",
         (void *)p_acquire, (void *)p_begin, (void *)p_barrier, (void *)p_clear,
         (void *)p_submit, (void *)p_wait, (void *)p_present);
-        w_q_mu = SDL_CreateMutex();
+    w_failed = w_req = w_quit = 0;
+    w_q_mu = SDL_CreateMutex();
+    if (!w_q_mu) goto fail;
+    if (vke_switch_on("RECOMP_VK_READBACK_TEST") && !vke_readback_test()) goto fail;
     if (!w_thread) {
         w_mu = SDL_CreateMutex();
         w_cv = SDL_CreateCond();
@@ -462,6 +498,7 @@ int nv2a_vk_engine_start(int want_w, int want_h)
             w_thread = SDL_CreateThread(vke_present_main, "nv2a-vulkan-present", NULL);
         if (w_thread) vke("presenter thread started");
     }
+    if (!w_thread) { vke("presenter thread: %s", SDL_GetError()); goto fail; }
     /* The surface may not be attached to the window yet. Give Android a
      * moment before the first acquire: a swapchain whose surface the driver
      * has not been told about would explain a fault inside the driver. */
@@ -515,12 +552,13 @@ static int vke_pipeline(void)
     VkPipelineColorBlendStateCreateInfo cb;
     VkPipelineRenderingCreateInfoKHR ri;
     VkGraphicsPipelineCreateInfo gp;
+    const VkDynamicState states[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo ds;
     uint32_t i;
 
     /* RECOMP_VK_NO_DRAW=1: keep the clear path. It separates a crash in the
      * dynamic-rendering path from one the engine has regardless. */
-    { extern int not_here(void); }
-    if (vke_switch_on("RECOMP_VK_NO_DRAW")) return 0;
+    if (vke_switch_on("RECOMP_VK_NO_DRAW") || vke_switch_on("RECOMP_VK_NO_F13")) return 0;
     if (!p_view_new || !p_shader_new || !p_pipe_new || !p_begin_rendering) return 0;
     for (i = 0; i < w_nimg; i++) {
         VkImageViewCreateInfo vci;
@@ -528,7 +566,7 @@ static int vke_pipeline(void)
         vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         vci.image = w_img[i];
         vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+        vci.format = w_format;
         vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         vci.subresourceRange.levelCount = 1;
         vci.subresourceRange.layerCount = 1;
@@ -542,9 +580,13 @@ static int vke_pipeline(void)
     memset(&smi, 0, sizeof smi);
     smi.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     smi.codeSize = nv * 4; smi.pCode = wv;
-    if (p_shader_new(w_dev, &smi, NULL, &w_vs) != VK_SUCCESS) { vke("vertex module"); return 0; }
+    if (p_shader_new(w_dev, &smi, NULL, &w_vs) != VK_SUCCESS) {
+        free(wv); free(wf); vke("vertex module"); return 0;
+    }
     smi.codeSize = nf * 4; smi.pCode = wf;
-    if (p_shader_new(w_dev, &smi, NULL, &w_fs) != VK_SUCCESS) { vke("fragment module"); return 0; }
+    if (p_shader_new(w_dev, &smi, NULL, &w_fs) != VK_SUCCESS) {
+        free(wv); free(wf); vke("fragment module"); return 0;
+    }
     free(wv); free(wf);
 
     memset(&pli, 0, sizeof pli);
@@ -588,7 +630,11 @@ static int vke_pipeline(void)
     memset(&ri, 0, sizeof ri);
     ri.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
     ri.colorAttachmentCount = 1;
-    ri.pColorAttachmentFormats = &(VkFormat){ VK_FORMAT_R8G8B8A8_UNORM };
+    ri.pColorAttachmentFormats = &w_format;
+    memset(&ds, 0, sizeof ds);
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    ds.dynamicStateCount = 2;
+    ds.pDynamicStates = states;
     memset(&gp, 0, sizeof gp);
     gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     gp.pNext = &ri;
@@ -600,6 +646,7 @@ static int vke_pipeline(void)
     gp.pRasterizationState = &rs;
     gp.pMultisampleState = &ms;
     gp.pColorBlendState = &cb;
+    gp.pDynamicState = &ds;
     gp.layout = w_pl;
     if (p_pipe_new(w_dev, VK_NULL_HANDLE, 1, &gp, NULL, &w_pipe) != VK_SUCCESS) {
         vke("graphics pipeline"); return 0;
@@ -623,8 +670,7 @@ static int SDLCALL vke_present_main(void *arg)
         if (w_quit) { SDL_UnlockMutex(w_mu); break; }
         w_req = 0;
         SDL_UnlockMutex(w_mu);
-        { static unsigned it; if (++it % 20 == 0) vke("presenter loop %u", it); }
-        vke_frame_body();
+        vg_present_dispatch();
     }
     return 0;
 }
@@ -641,8 +687,7 @@ void nv2a_vk_engine_frame(void)
 
 static void vke_frame_body(void)
 {
-    { static unsigned b; if (++b % 20 == 0) vke("body %u", b); }
-    uint32_t idx = 0, i;
+    uint32_t idx = 0;
     VkCommandBufferBeginInfo bi;
     VkClearColorValue clr;
     VkImageSubresourceRange rg;
@@ -650,18 +695,29 @@ static void vke_frame_body(void)
     VkSubmitInfo si;
     VkPresentInfoKHR pi;
     VkResult r;
+    VkPipelineStageFlags wait_stage = w_draw_ready
+        ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT;
 
-    if (!w_active) return;
+    if (!w_active || w_failed) return;
+    /* A timed-out frame must never be recorded over while it is pending. */
+    r = p_wait(w_dev, 1, &w_fence, VK_TRUE, 1000000000ull);
+    if (r == VK_TIMEOUT) return;
+    if (r != VK_SUCCESS) goto failed;
     { static int st; if (!st) { st = 1; vke("f1: acquire"); } }
     r = p_acquire(w_dev, w_sc, 1000000000ull, w_acq, VK_NULL_HANDLE, &idx);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) return;
-    if (r != VK_SUCCESS || idx >= w_nimg) { vke("acquire -> %d", (int)r); return; }
+    if (r == VK_TIMEOUT || r == VK_NOT_READY) return;
+    /* SUBOPTIMAL still acquires an image and signals w_acq. Consume it. */
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { vke("acquire -> %d", (int)r); goto failed; }
+    if (idx >= w_nimg) { r = VK_ERROR_UNKNOWN; goto failed; }
+    r = p_pool_reset(w_dev, w_pool, 0);
+    if (r != VK_SUCCESS) goto failed;
 
     memset(&bi, 0, sizeof bi);
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     { static int st; if (!st) { st = 1; vke("f1: record begin"); } }
-    p_begin(w_cmd, &bi);
+    r = p_begin(w_cmd, &bi);
+    if (r != VK_SUCCESS) goto failed;
     { static int st; if (!st) { st = 1; vke("f1: barrier"); } }
     memset(&b, 0, sizeof b);
     b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -741,49 +797,76 @@ static void vke_frame_body(void)
     b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     p_barrier(w_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
               VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    r = p_end(w_cmd);
+    if (r != VK_SUCCESS) goto failed;
 
-    if (w_q_mu) SDL_LockMutex(w_q_mu);
     memset(&si, 0, sizeof si);
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.waitSemaphoreCount = 1;
     si.pWaitSemaphores = &w_acq;
-    {   VkPipelineStageFlags st = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        si.pWaitDstStageMask = &st; }
+    si.pWaitDstStageMask = &wait_stage;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &w_cmd;
     si.signalSemaphoreCount = 1;
-    si.pSignalSemaphores = &w_done;
-    p_reset(w_dev, 1, &w_fence);
+    si.pSignalSemaphores = &w_done[idx];
+    r = p_reset(w_dev, 1, &w_fence);
+    if (r != VK_SUCCESS) goto failed;
     { static int st5; if (!st5) { st5 = 1; vke("f1: submit"); } }
-    if (p_submit(w_queue, 1, &si, w_fence) != VK_SUCCESS) return;
-    { static int st6; if (!st6) { st6 = 1; vke("f1: wait"); } }
-    { VkResult wr = p_wait(w_dev, 1, &w_fence, VK_TRUE, 1000000000ull);
-      if (w_q_mu) SDL_UnlockMutex(w_q_mu);
-      if (wr != VK_SUCCESS) return; }
+    SDL_LockMutex(w_q_mu);
+    r = p_submit(w_queue, 1, &si, w_fence);
+    if (r != VK_SUCCESS) { SDL_UnlockMutex(w_q_mu); goto failed; }
+    w_layout[idx] = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
     memset(&pi, 0, sizeof pi);
     pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     pi.waitSemaphoreCount = 1;
-    pi.pWaitSemaphores = &w_done;
+    pi.pWaitSemaphores = &w_done[idx];
     pi.swapchainCount = 1;
     pi.pSwapchains = &w_sc;
     pi.pImageIndices = &idx;
-    if (p_present(w_queue, &pi) == VK_SUCCESS) {
+    r = p_present(w_queue, &pi);
+    SDL_UnlockMutex(w_q_mu);
+    if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
         static int shown;
-        if (!shown) { shown = 1; vke("first frame presented (triangle drawn with dynamic rendering)"); }
+        static unsigned frames;
+        if (!shown) { shown = 1; vke("first frame presented (%s)", w_draw_ready ? "triangle" : "clear"); }
+        if (++frames % 300 == 0) vke("%u frames presented successfully", frames);
+        return;
     }
-    for (i = 0; i < w_nimg; i++)
-        if (w_layout[i] != VK_IMAGE_LAYOUT_UNDEFINED) break;
+    vke("present -> %d", (int)r);
+failed:
+    /* Keep backend ownership: falling through to GL with no GL context is
+     * unsafe. Stop reusing failed/acquired resources until app restart. */
+    w_failed = 1;
+    vke("frame stopped -> %d; restart the app to rebuild the swapchain", (int)r);
 }
 
 void nv2a_vk_engine_stop(void)
 {
+    uint32_t i;
+    if (w_thread) {
+        SDL_LockMutex(w_mu);
+        w_quit = 1;
+        SDL_CondSignal(w_cv);
+        SDL_UnlockMutex(w_mu);
+        SDL_WaitThread(w_thread, NULL);
+        w_thread = NULL;
+    }
     w_active = 0;
     if (w_dev) {
+        vg_stop();
         if (p_device_idle) p_device_idle(w_dev);
+        nv2a_vk_engine_target_free();
+        if (w_pipe) p_pipe_free(w_dev, w_pipe, NULL);
+        if (w_pl) p_layout_free(w_dev, w_pl, NULL);
+        if (w_vs) p_shader_free(w_dev, w_vs, NULL);
+        if (w_fs) p_shader_free(w_dev, w_fs, NULL);
+        for (i = 0; i < w_nimg; i++) {
+            if (w_view[i]) p_view_free(w_dev, w_view[i], NULL);
+            if (w_done[i]) p_sem_free(w_dev, w_done[i], NULL);
+        }
         if (w_fence && p_fence_free) p_fence_free(w_dev, w_fence, NULL);
         if (w_acq && p_sem_free) p_sem_free(w_dev, w_acq, NULL);
-        if (w_done && p_sem_free) p_sem_free(w_dev, w_done, NULL);
         if (w_pool && p_pool_free) p_pool_free(w_dev, w_pool, NULL);
         if (w_sc && p_destroy_swapchain) p_destroy_swapchain(w_dev, w_sc, NULL);
         if (p_destroy_device) p_destroy_device(w_dev, NULL);
@@ -791,6 +874,16 @@ void nv2a_vk_engine_stop(void)
     if (w_surf && p_destroy_surface) p_destroy_surface(w_inst, w_surf, NULL);
     if (w_inst && p_destroy_instance) p_destroy_instance(w_inst, NULL);
     if (w_win) SDL_DestroyWindow(w_win);
+    if (w_cv) SDL_DestroyCond(w_cv);
+    if (w_mu) SDL_DestroyMutex(w_mu);
+    if (w_q_mu) SDL_DestroyMutex(w_q_mu);
+    w_cv = NULL; w_mu = w_q_mu = NULL;
+    w_req = w_quit = w_failed = w_draw_ready = 0;
+    w_vs = w_fs = VK_NULL_HANDLE; w_pl = VK_NULL_HANDLE; w_pipe = VK_NULL_HANDLE;
+    w_fence = VK_NULL_HANDLE; w_acq = VK_NULL_HANDLE;
+    memset(w_view, 0, sizeof w_view);
+    memset(w_done, 0, sizeof w_done);
+    w_nimg = 0;
     w_dev = VK_NULL_HANDLE; w_inst = VK_NULL_HANDLE; w_sc = VK_NULL_HANDLE;
     w_surf = VK_NULL_HANDLE; w_pool = VK_NULL_HANDLE; w_win = NULL;
 }
@@ -817,6 +910,7 @@ static VkImage          w_rt;
 static VkDeviceMemory   w_rt_mem;
 static VkImageView      w_rt_view;
 static uint32_t         w_rt_pw, w_rt_ph;
+static VkImageLayout    w_rt_layout;
 static VkBuffer         w_rb;
 static VkDeviceMemory   w_rb_mem;
 static VkDeviceSize     w_rb_size;
@@ -829,16 +923,15 @@ static VkFence          w_rb_fence;
 static uint32_t vke_mem_type(uint32_t need, VkMemoryPropertyFlags want)
 {
     VkPhysicalDeviceMemoryProperties mp;
-    uint32_t i, fallback = UINT32_MAX;
+    uint32_t i;
 
     if (!p_mem_props) return UINT32_MAX;
     p_mem_props(w_phys, &mp);
     for (i = 0; i < mp.memoryTypeCount; i++) {
-        if ((mp.memoryTypes[i].propertyFlags & need) != need) continue;
+        if (!(need & (1u << i))) continue;
         if ((mp.memoryTypes[i].propertyFlags & want) == want) return i;
-        if (fallback == UINT32_MAX) fallback = i;
     }
-    return fallback;
+    return UINT32_MAX;
 }
 
 void nv2a_vk_engine_target_free(void);
@@ -853,7 +946,7 @@ uint32_t nv2a_vk_target_new(uint32_t pw, uint32_t ph)
     uint32_t type;
 
     if (!pw || !ph) return 0;
-    if (w_rt && w_rt_pw == pw && w_rt_ph == ph && w_rb) return 1;
+    if (w_rt && w_rt_pw == pw && w_rt_ph == ph && w_rb_map && w_rb_pool && w_rb_fence) return 1;
     nv2a_vk_engine_target_free();
     memset(&ici, 0, sizeof ici);
     ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -866,7 +959,8 @@ uint32_t nv2a_vk_target_new(uint32_t pw, uint32_t ph)
     ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+              | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (p_image_new(w_dev, &ici, NULL, &w_rt) != VK_SUCCESS) return 0;
     p_img_req(w_dev, w_rt, &req);
@@ -902,6 +996,20 @@ uint32_t nv2a_vk_target_new(uint32_t pw, uint32_t ph)
     if (type == UINT32_MAX || p_mem_new(w_dev, &mai, NULL, &w_rb_mem) != VK_SUCCESS) return 0;
     if (p_buf_bind(w_dev, w_rb, w_rb_mem, 0) != VK_SUCCESS) return 0;
     if (p_map(w_dev, w_rb_mem, 0, VK_WHOLE_SIZE, 0, &w_rb_map) != VK_SUCCESS) return 0;
+    {
+        VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                        .queueFamilyIndex = w_family };
+        VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                           .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                           .commandBufferCount = 1 };
+        VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+                                  .flags = VK_FENCE_CREATE_SIGNALED_BIT };
+        if (p_pool_new(w_dev, &pci, NULL, &w_rb_pool) != VK_SUCCESS) return 0;
+        cai.commandPool = w_rb_pool;
+        if (p_cmds(w_dev, &cai, &w_rb_cmd) != VK_SUCCESS) return 0;
+        if (p_fence_new(w_dev, &fci, NULL, &w_rb_fence) != VK_SUCCESS) return 0;
+    }
+    w_rt_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     w_rb_size = bci.size;
     w_rt_pw = pw; w_rt_ph = ph;
     vke("render target %ux%u", pw, ph);
@@ -911,6 +1019,16 @@ uint32_t nv2a_vk_target_new(uint32_t pw, uint32_t ph)
 void nv2a_vk_engine_target_free(void);
 void nv2a_vk_engine_target_free(void)
 {
+    /* The read-back can still be pending after a timeout. */
+    if (w_rb_pool) {
+        if (w_q_mu) SDL_LockMutex(w_q_mu);
+        p_device_idle(w_dev);
+        if (w_q_mu) SDL_UnlockMutex(w_q_mu);
+        p_pool_free(w_dev, w_rb_pool, NULL);
+        w_rb_pool = VK_NULL_HANDLE;
+        w_rb_cmd = VK_NULL_HANDLE;
+    }
+    if (w_rb_fence) { p_fence_free(w_dev, w_rb_fence, NULL); w_rb_fence = VK_NULL_HANDLE; }
     if (w_rb_map) { p_unmap(w_dev, w_rb_mem); w_rb_map = NULL; }
     if (w_rb) { p_buf_free(w_dev, w_rb, NULL); w_rb = VK_NULL_HANDLE; }
     if (w_rb_mem) { p_mem_free(w_dev, w_rb_mem, NULL); w_rb_mem = VK_NULL_HANDLE; }
@@ -918,6 +1036,7 @@ void nv2a_vk_engine_target_free(void)
     if (w_rt) { p_image_free(w_dev, w_rt, NULL); w_rt = VK_NULL_HANDLE; }
     if (w_rt_mem) { p_mem_free(w_dev, w_rt_mem, NULL); w_rt_mem = VK_NULL_HANDLE; }
     w_rt_pw = w_rt_ph = 0;
+    w_rt_layout = VK_IMAGE_LAYOUT_UNDEFINED;
 }
 
 uint32_t nv2a_vk_target_texture(uint32_t rt) { (void)rt; return 1; }
@@ -941,17 +1060,19 @@ int nv2a_vk_target_read(uint32_t rt, uint32_t x, uint32_t y, uint32_t w,
     uint32_t row;
 
     (void)rt;
-    if (!w_rt || !w_rb_map || !w_rb_pool) return 0;
-    if (x + w > w_rt_pw || y + h > w_rt_ph) return 0;
+    if (!w_rt || !w_rb_map || !w_rb_pool || !out || w_failed) return 0;
+    if (!w || !h || x > w_rt_pw || y > w_rt_ph || w > w_rt_pw - x || h > w_rt_ph - y) return 0;
+    if (p_wait(w_dev, 1, &w_rb_fence, VK_TRUE, 1000000000ull) != VK_SUCCESS) return 0;
+    if (p_pool_reset(w_dev, w_rb_pool, 0) != VK_SUCCESS) return 0;
     memset(&bi, 0, sizeof bi);
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (p_begin(w_rb_cmd, &bi) != VK_SUCCESS) return 0;
     memset(&b, 0, sizeof b);
     b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    b.srcAccessMask = w_rt_layout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    b.oldLayout = w_rt_layout;
     b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -959,8 +1080,23 @@ int nv2a_vk_target_read(uint32_t rt, uint32_t x, uint32_t y, uint32_t w,
     b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     b.subresourceRange.levelCount = 1;
     b.subresourceRange.layerCount = 1;
-    p_barrier(w_rb_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    if (w_rt_layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+        VkClearColorValue clear = { .float32 = { 0.06f, 0.10f, 0.22f, 1.0f } };
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        p_barrier(w_rb_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+        p_clear(w_rb_cmd, w_rt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &b.subresourceRange);
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        p_barrier(w_rb_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    } else {
+        p_barrier(w_rb_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    }
     memset(&cp, 0, sizeof cp);
     cp.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     cp.imageSubresource.layerCount = 1;
@@ -982,11 +1118,13 @@ int nv2a_vk_target_read(uint32_t rt, uint32_t x, uint32_t y, uint32_t w,
     si.commandBufferCount = 1;
     si.pCommandBuffers = &w_rb_cmd;
     if (w_q_mu) SDL_LockMutex(w_q_mu);
-    p_reset(w_dev, 1, &w_rb_fence);
-    if (p_submit(w_queue, 1, &si, w_rb_fence) != VK_SUCCESS) {
+    if (p_reset(w_dev, 1, &w_rb_fence) != VK_SUCCESS ||
+        p_submit(w_queue, 1, &si, w_rb_fence) != VK_SUCCESS) {
+        w_failed = 1;
         if (w_q_mu) SDL_UnlockMutex(w_q_mu);
         return 0;
     }
+    w_rt_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     { VkResult wr = p_wait(w_dev, 1, &w_rb_fence, VK_TRUE, 1000000000ull);
       if (w_q_mu) SDL_UnlockMutex(w_q_mu);
       if (wr != VK_SUCCESS) return 0; }
@@ -1009,6 +1147,40 @@ int nv2a_vk_target_read(uint32_t rt, uint32_t x, uint32_t y, uint32_t w,
     }
     return 1;
 }
+
+/* Opt-in device check: exercise allocation, initial layout, a nonzero read
+ * offset, both channel orders, and command-buffer reuse before game boot. */
+static int vke_readback_test(void)
+{
+    uint8_t pixels[3 * 2 * 4];
+    int bgra, pass;
+    if (!nv2a_vk_target_new(16, 16)) {
+        vke("read-back test: target allocation failed");
+        return 0;
+    }
+    for (bgra = 0; bgra <= 1; bgra++) {
+        for (pass = 0; pass < 2; pass++) {
+            unsigned i;
+            memset(pixels, 0, sizeof pixels);
+            if (!nv2a_vk_target_read(1, 4, 8, 3, 2, bgra, pixels)) {
+                vke("read-back test: copy failed (bgra %d pass %d)", bgra, pass);
+                return 0;
+            }
+            for (i = 0; i < sizeof pixels; i += 4) {
+                if (pixels[i + (bgra ? 2 : 0)] != 15 || pixels[i + 1] != 26 ||
+                    pixels[i + (bgra ? 0 : 2)] != 56 || pixels[i + 3] != 255) {
+                    vke("read-back test: unexpected pixel %u %u %u %u", pixels[i],
+                        pixels[i + 1], pixels[i + 2], pixels[i + 3]);
+                    return 0;
+                }
+            }
+        }
+    }
+    nv2a_vk_engine_target_free();
+    vke("read-back test passed: RGBA/BGRA subrect, four submissions");
+    return 1;
+}
+#include "vk_game.inc"
 #else
 
 int nv2a_vk_engine_start(int w, int h) { (void)w; (void)h; return 0; }

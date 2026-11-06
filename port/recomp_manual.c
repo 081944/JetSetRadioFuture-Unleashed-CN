@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <math.h>
+#include "../src/nv2a_gl/jsrf_debug_env.h"
 static double jsrf_now(void);   /* defined further down */
 
 #if defined(_WIN32)
@@ -1426,7 +1427,7 @@ static double pad_now(void)
 }
 static void pad_script_load(void)
 {
-    const char *s = getenv("JSRF_PAD_SCRIPT");
+    const char *s = jsrf_getenv("JSRF_PAD_SCRIPT");
     s_pad_script_n = 0;
     if (!s) return;
     while (*s && s_pad_script_n < 64) {
@@ -2071,7 +2072,7 @@ static uint32_t map_request(void)
     static double at[32]; static uint32_t id[32];
     int r = nv_window_take_map_request();
     if (n < 0) {
-        const char *e = getenv("JSRF_MAP_TOUR");
+        const char *e = jsrf_getenv("JSRF_MAP_TOUR");
         n = 0;
         while (e && *e && n < 32) {
             char *end; double t = strtod(e, &end);
@@ -2414,17 +2415,67 @@ void sub_0013AA80(void)
  * DMA_PUT. The GPU here is the ack thread in xbox_memory_layout.c, which
  * polled every 200 us, so each kickoff waited out a poll: in the DJ K scene
  * the game thread spent 84% of its time in this spin and the scene ran at
- * 42-56 fps. While KickOff runs the ack thread now polls without sleeping,
- * and it is woken once more for the new DMA_PUT. RECOMP_NV2A_KICK=0 = old. */
+ * 42-56 fps. Root profiling on Android still found 22% of all process CPU
+ * samples in this loop: the ack thread also executes the pushbuffer, so it
+ * cannot acknowledge another CPU write-combine flush while drawing.
+ *
+ * Wait on the same acknowledgement using a condition variable instead of
+ * spinning. Immediate producer-side acknowledgement was rejected on-device:
+ * the legacy walker relies on this handshake for command-ring backpressure.
+ * Keep PUT bookkeeping, the optional idle wait, DMA_GET and software methods.
+ * RECOMP_NV2A_FLUSH_WAIT=0 retains the original generated handshake for A/B.
+ * The software-device path and unexpected register mappings also use it. */
 extern void xbox_nv2a_kick(void);
 extern void xbox_nv2a_hurry(int on);
+extern void xbox_nv2a_flush_wait(uint32_t register_base);
 extern void sub_001912A0_gen(void);
+extern void sub_0018E120(void);
 void sub_001912A0(void)
 {
-    xbox_nv2a_hurry(1);
-    sub_001912A0_gen();
-    xbox_nv2a_hurry(0);
+    static int flush_wait = -1;
+    if (flush_wait < 0) {
+        const char *v = jsrf_getenv("RECOMP_NV2A_FLUSH_WAIT");
+        flush_wait = v ? atoi(v) != 0 : 1;
+        fprintf(stderr, "  [NV2A] KickOff flush wait: %s\n",
+                flush_wait ? "blocking" : "spin (comparison)");
+    }
+    uint32_t device = g_ecx;
+    uint32_t flags = MEM32(device + 8);
+    uint32_t regs = 0;
+    if (flush_wait && !(flags & 0x2000u))
+        regs = MEM32(MEM32(0x19DCE0) + 0x2268);
+    if (!flush_wait || (flags & 0x2000u) || regs != 0xFD000000u) {
+        xbox_nv2a_hurry(1);
+        sub_001912A0_gen();
+        xbox_nv2a_hurry(0);
+        xbox_nv2a_kick();
+        return;
+    }
+
+    /* Same guest register/stack effects as 0x001912A0..0x00191326, apart
+     * from replacing the polling back edge with a native blocking wait. */
+    PUSH32(g_esp, g_ecx);
+    g_ecx = MEM32(device + ((flags & 4u) ? 0x35C : 0));
+    xbox_nv2a_flush_wait(regs);
+    g_eax = MEM32(device + 0x2264);
+    g_edx = g_ecx & 0x3FFFFFFu;
+    MEMW32(g_eax + 0x40, g_edx);
+    g_edx = device;
+    MEMW32(device + 0x2C, g_ecx);
+    g_eax = MEM32(0x19DED0);
+    /* Notify after publishing PUT, before the optional real idle wait. */
     xbox_nv2a_kick();
+    if (g_eax) {
+        do {
+            PUSH32(g_esp, 0x00191316u);
+            RECOMP_ABI_CALL(0x0018E120u, sub_0018E120);
+            if (g_eax) RECOMP_BACK_EDGE(0x00191318u);
+        } while (g_eax);
+        g_eax = MEM32(g_esp);
+        MEMW32(g_eax + 8, MEM32(g_eax + 8) | 0x2000u);
+    }
+    POP32(g_esp, g_ecx);
+    g_esp += 4;
 }
 
 /* ---- sub_00194210: D3D's PGRAPH interrupt handler --------------------------
