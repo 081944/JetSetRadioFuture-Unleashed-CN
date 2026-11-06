@@ -10478,10 +10478,12 @@ static void pace_sleep(const struct timespec *ts)
  * the frame's moment. A sleep that runs more than three quarters of the way
  * into the spin widens it at once, to what that sleep overran by and 0.2 ms
  * more (1.2 ms at most); frames on time narrow it back by 2 us each.
- * RECOMP_PACE_SPIN_US fixes it instead (1200: as before). Windows, macOS, iOS
- * and Android keep 1.2 ms. (From spriteice's measurements on a ROG Xbox Ally
- * X.) */
-#if defined(__linux__) && !defined(__ANDROID__)
+ * Android uses the same monotonic absolute deadlines and adaptive margin:
+ * now that its renderer sustains 60 fps, spinning for a fixed 1.2 ms is a
+ * measurable CPU cost. RECOMP_PACE_SPIN_US fixes the margin instead (1200
+ * restores the previous spin budget). Windows, macOS and iOS keep 1.2 ms.
+ * (From spriteice's measurements on a ROG Xbox Ally X.) */
+#if defined(__linux__)
 #include <errno.h>
 #define PACE_ABSOLUTE 1
 static double g_pace_margin = -1.0, g_pace_margin_min;
@@ -10490,7 +10492,7 @@ static int    g_pace_margin_fixed;
 static double pace_margin(void)
 {
     if (g_pace_margin < 0.0) {
-        const char *v = getenv("RECOMP_PACE_SPIN_US");
+        const char *v = jsrf_getenv("RECOMP_PACE_SPIN_US");
         g_pace_margin_fixed = v != NULL;
         g_pace_margin_min = v ? atof(v) * 1e-6 : 0.0003;
         if (g_pace_margin_min < 0.0) g_pace_margin_min = 0.0;

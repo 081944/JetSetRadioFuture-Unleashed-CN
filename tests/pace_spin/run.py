@@ -20,7 +20,7 @@ if not sys.platform.startswith("linux"):
 
 stats = gl[gl.index("static struct {\n    uint64_t frames, late, restarts"):]
 stats = stats[:stats.index("} g_pace_st;") + len("} g_pace_st;")]
-spin = gl[gl.index("#if defined(__linux__) && !defined(__ANDROID__)\n#include <errno.h>\n#define PACE_ABSOLUTE 1"):
+spin = gl[gl.index("#if defined(__linux__)\n#include <errno.h>\n#define PACE_ABSOLUTE 1"):
           gl.index("static void frame_pace(void)")]
 source = ("""
 #define _GNU_SOURCE
@@ -28,6 +28,7 @@ source = ("""
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+static const char *jsrf_getenv(const char *name) { return getenv(name); }
 static double mono_now(void)
 {
     struct timespec t;
