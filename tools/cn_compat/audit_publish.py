@@ -43,11 +43,41 @@ def audit(staged, base):
         for path in filter(None, paths):
             blobs.append((path, git('show', ':'+path)))
     else:
-        # rev-list excludes every object already present in the reviewed base.
-        for line in git('rev-list', '--objects', 'HEAD', '--not', base).decode('utf-8').splitlines():
-            oid, _, name = line.partition(' ')
-            if git('cat-file', '-t', oid).strip() == b'blob':
-                blobs.append((name, git('cat-file', 'blob', oid)))
+        # Exclude actual inherited upstream objects as promised, including
+        # upstream merges after the initial CN audit baseline. Only exclude
+        # the shared ancestor, never unmerged upstream or local CN changes.
+        excludes = [base]
+        try:
+            inherited = git('merge-base', 'HEAD', 'refs/remotes/upstream/main').decode().strip()
+            if inherited:
+                excludes.append(inherited)
+        except subprocess.CalledProcessError:
+            pass  # A checkout without the upstream remote still audits fully.
+        objects = [line.partition(' ') for line in
+                   git('rev-list', '--objects', 'HEAD', '--not', *excludes).decode('utf-8').splitlines()]
+        # A single batch avoids spawning Git twice per object on Windows.
+        request = ''.join(oid+'\n' for oid, _, name in objects).encode()
+        info = subprocess.check_output(['git', 'cat-file', '--batch-check'], input=request).splitlines()
+        wanted = []
+        for (oid, _, name), header in zip(objects, info):
+            _, kind, size = header.split()
+            if kind == b'blob':
+                if int(size) > 2_000_000:
+                    raise ValueError(f'Oversized new blob: {name}')
+                wanted.append((oid, name))
+        if wanted:
+            payload = subprocess.check_output(['git', 'cat-file', '--batch'],
+                input=''.join(oid+'\n' for oid, name in wanted).encode())
+            cursor = 0
+            for oid, name in wanted:
+                end = payload.index(b'\n', cursor)
+                actual, kind, size = payload[cursor:end].split()
+                if actual.decode() != oid or kind != b'blob':
+                    raise ValueError(f'Unexpected batch object: {name}')
+                cursor = end+1
+                size = int(size)
+                blobs.append((name, payload[cursor:cursor+size]))
+                cursor += size+1
     for name, data in blobs:
         inspect(name, data)
         print(f'OK {len(data):7d} {name}')
