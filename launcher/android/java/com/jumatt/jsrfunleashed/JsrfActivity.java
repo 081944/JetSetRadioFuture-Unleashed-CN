@@ -95,7 +95,10 @@ static native int nativeRstickCamera();            /* 0 off, 1 the camera, 2 tra
         mSwapTriggers = getSharedPreferences("controller", MODE_PRIVATE).getBoolean("swap_triggers", false);
         mNintendo = getSharedPreferences("controller", MODE_PRIVATE).getBoolean("nintendo", false);
         mReleaseBuild=getResources().getBoolean(R.bool.cn_release_build);
-        mPerformanceOverlay = !mReleaseBuild && Settings.get(this, "performance_overlay", 0) != 0;
+        // Release has its own opt-in preference, so installing over a profiling
+        // build starts clean while the user's later choice survives restarts.
+        mPerformanceOverlay = Settings.get(this, mReleaseBuild ? "performance_overlay_release"
+                : "performance_overlay", 0) != 0;
         nativeSetPerformanceOverlay(mPerformanceOverlay);
         nativeSetControllerMapping(mSwapTriggers, mNintendo);
         mPad = new TouchPadView(this, this);
@@ -306,9 +309,7 @@ final int rcam = nativeRstickCamera();
             "切换角色",
             "Controls",
         };
-        // Retain action IDs while excluding development tools from release UI.
-        final int[] actions=mReleaseBuild ? new int[] {0,1,2,3,4,5,7,8,9,10,11}
-                : new int[] {0,1,2,3,4,5,6,7,8,9,10,11};
+        final int[] actions=new int[] {0,1,2,3,4,5,6,7,8,9,10,11};
         String[] visibleItems=new String[actions.length];
         for (int i=0;i<actions.length;i++) visibleItems[i]=items[actions[i]];
         mPad.reset();
@@ -336,7 +337,8 @@ final int rcam = nativeRstickCamera();
                     break;
                 case 6:
                     mPerformanceOverlay = !perf;
-                    Settings.set(this, "performance_overlay", mPerformanceOverlay ? 1 : 0);
+                    Settings.set(this, mReleaseBuild ? "performance_overlay_release"
+                            : "performance_overlay", mPerformanceOverlay ? 1 : 0);
                     nativeSetPerformanceOverlay(mPerformanceOverlay);
                     mPad.setPerformanceOverlay(mPerformanceOverlay);
                     break;

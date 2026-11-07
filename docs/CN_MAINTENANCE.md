@@ -100,3 +100,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Resolve merge conflicts and review each resolu
 当前发布版本升级为 0.6.6-cn.1 / versionCode 41。`build_native.ps1 -Release -Jobs 2` 使用 CMake Release（-O2 -DNDEBUG，保留实机调试阶段验证的优化级别），关闭 JSRF_DEVELOPMENT_TOOLS；`build_apk.ps1 -Release` 要求匹配的正式原生回执，使用 D8 release、去除原生调试符号，并将 cn_release_build 资源写入临时构建副本。正式 UI 忽略此前保存的性能叠层开启状态且隐藏该入口；正常游戏设置仍保留。
 
 正式包原生默认设置 RECOMP_BACKEND=vulkan，不依赖设备 debug.jsrf.recomp_backend；编译掉 Android 系统调试属性读取与 JSRF-GLPROF 输出，保留普通启动/错误日志。发布说明见 docs/release-notes/0.6.6-cn.1.md。上传仅限 APK 与同名 SHA256 文件；私钥、游戏资源、构建日志及生成代码均不上传。代码提交并审计后，按干净提交构建，标签指向该源码提交；GitHub Release 上传同一份实机验证产物。
+
+## 0.6.6-cn.2 性能显示选项
+
+41 版发布完成后，用户要求正式包也能手动显示 FPS、CPU 和 GPU 耗时。42 版恢复设置中的“性能叠层”，使用独立的 performance_overlay_release 偏好，默认关闭、手动选择后保存；避免从开发包沿用开启状态。此选项不会重新启用 Android 调试属性、profiler 日志或 debuggable，发布标签与 41 版分开保留。
