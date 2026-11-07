@@ -28,6 +28,7 @@
 #include <string.h>
 #include <dlfcn.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #define VK_USE_PLATFORM_ANDROID_KHR 1
 #define VK_NO_PROTOTYPES 1
@@ -167,6 +168,8 @@ static int              w_req, w_quit;
  * on screen). */
 static SDL_mutex       *w_q_mu;
 
+#include "vk_window_lifecycle.inc"
+
 static int vke_switch_on(const char *name)
 {
     const char *v = jsrf_getenv(name);
@@ -238,6 +241,7 @@ int nv2a_vk_engine_start(int want_w, int want_h)
         w_native = wmi.info.android.window;
     }
     if (!w_native) { vke("SDL has no native window"); goto fail; }
+    ANativeWindow_acquire(w_native);
 
     {   const char *exts[] = { VK_KHR_SURFACE_EXTENSION_NAME,
                                VK_KHR_ANDROID_SURFACE_EXTENSION_NAME };
@@ -478,6 +482,9 @@ int nv2a_vk_engine_start(int want_w, int want_h)
         for (i = 0; i < w_nimg; i++)
             if (p_sem_new(w_dev, &sci, NULL, &w_done[i]) != VK_SUCCESS) goto fail;
     }
+    pthread_mutex_lock(&w_surface_mu);
+    if (w_requested_native==w_native) w_seen_surface_generation=w_surface_generation;
+    pthread_mutex_unlock(&w_surface_mu);
     w_active = 1;
     vke("swapchain %ux%u, format %d, %u images", w_extent.width, w_extent.height,
         (int)fmt.format, w_nimg);
@@ -700,7 +707,7 @@ static void vke_frame_body(void)
     VkPipelineStageFlags wait_stage = w_draw_ready
         ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT;
 
-    if (!w_active || w_failed) return;
+    if (!w_active || w_failed || !vke_window_refresh()) return;
     /* A timed-out frame must never be recorded over while it is pending. */
     r = p_wait(w_dev, 1, &w_fence, VK_TRUE, 1000000000ull);
     if (r == VK_TIMEOUT) return;
@@ -709,7 +716,7 @@ static void vke_frame_body(void)
     r = p_acquire(w_dev, w_sc, 1000000000ull, w_acq, VK_NULL_HANDLE, &idx);
     if (r == VK_TIMEOUT || r == VK_NOT_READY) return;
     /* SUBOPTIMAL still acquires an image and signals w_acq. Consume it. */
-    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { vke("acquire -> %d", (int)r); goto failed; }
+    if (!vke_window_result(r,"acquire")) return;
     if (idx >= w_nimg) { r = VK_ERROR_UNKNOWN; goto failed; }
     r = p_pool_reset(w_dev, w_pool, 0);
     if (r != VK_SUCCESS) goto failed;
@@ -828,14 +835,14 @@ static void vke_frame_body(void)
     pi.pImageIndices = &idx;
     r = p_present(w_queue, &pi);
     SDL_UnlockMutex(w_q_mu);
-    if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
+    if (vke_window_result(r,"present")) {
         static int shown;
         static unsigned frames;
         if (!shown) { shown = 1; vke("first frame presented (%s)", w_draw_ready ? "triangle" : "clear"); }
         if (++frames % 300 == 0) vke("%u frames presented successfully", frames);
         return;
     }
-    vke("present -> %d", (int)r);
+    return;
 failed:
     /* Keep backend ownership: falling through to GL with no GL context is
      * unsafe. Stop reusing failed/acquired resources until app restart. */
@@ -874,6 +881,13 @@ void nv2a_vk_engine_stop(void)
         if (p_destroy_device) p_destroy_device(w_dev, NULL);
     }
     if (w_surf && p_destroy_surface) p_destroy_surface(w_inst, w_surf, NULL);
+    if (w_native) ANativeWindow_release(w_native);
+    w_native=NULL;
+    pthread_mutex_lock(&w_surface_mu);
+    if (w_requested_native) ANativeWindow_release(w_requested_native);
+    w_requested_native=NULL; w_surface_generation=w_seen_surface_generation=0;
+    pthread_mutex_unlock(&w_surface_mu);
+    w_rebuild_window=0;
     if (w_inst && p_destroy_instance) p_destroy_instance(w_inst, NULL);
     if (w_win) SDL_DestroyWindow(w_win);
     if (w_cv) SDL_DestroyCond(w_cv);

@@ -26,7 +26,12 @@
 #include <stddef.h>
 #include <math.h>
 #include "../src/nv2a_gl/jsrf_debug_env.h"
+#include "android/map_snapshot.h"
+#include "android/character_switch.h"
 static double jsrf_now(void);   /* defined further down */
+#ifdef __ANDROID__
+static int character_world_available(void);
+#endif
 
 #if defined(_WIN32)
 /* No pwrite on Windows: a seek and a write do the same for the one writer here. */
@@ -73,6 +78,51 @@ typedef void (*recomp_func_t)(void);
 
 #include "recomp/gen/recomp_types.h"
 extern ptrdiff_t g_xbox_mem_offset;
+
+#ifdef __ANDROID__
+extern void sub_000256A0(void);
+extern void sub_00013FC0(void);
+extern void sub_00011B90(void);
+extern void sub_000A6AF0(void);
+extern void sub_000A8370(void);
+extern void sub_0006F890(void);
+/* A new call at a frame boundary must not leak guest register/FP state into
+ * the original caller. Explicitly describe cdecl and thiscall cleanup. */
+static int character_guest_call(uint32_t va,unsigned count,const uint32_t *args,uint32_t *result)
+{
+    void (*fn)(void)=NULL;
+    unsigned first=0,callee_words=0;
+    switch (va) {
+    case 0x256A0: if (count==2) fn=sub_000256A0; break;
+    case 0x13FC0: if (count==1) fn=sub_00013FC0; break;
+    case 0x11B90: if (count==2) fn=sub_00011B90; first=1; callee_words=1; break;
+    case 0xA6AF0: if (count==2) fn=sub_000A6AF0; first=1; callee_words=1; break;
+    case 0xA8370: if (count==1) fn=sub_000A8370; first=1; break;
+    case 0x6F890: if (count==4) fn=sub_0006F890; first=1; callee_words=3; break;
+    }
+    if (!fn || g_esp<0x14000u || g_esp>=0x4000000u) return 0;
+    uint32_t regs[]={g_eax,g_ecx,g_edx,g_ebx,g_esp,g_ebp,g_esi,g_edi,g_seh_ebp,g_eflags,g_mxcsr};
+    double fp[8]; memcpy(fp,g_fp_stack,sizeof fp);
+    RecompXmm vectors[]={g_xmm0,g_xmm1,g_xmm2,g_xmm3,g_xmm4,g_xmm5,g_xmm6,g_xmm7};
+    int top=g_fp_top,df=g_df,cmp=g_fp_cmp;
+    uint16_t cw=g_fp_control_word,cc=g_fp_cc;
+    if (first) g_ecx=args[0];
+    for (unsigned n=count;n>first;n--) PUSH32(g_esp,args[n-1]);
+    PUSH32(g_esp,0); /* out-of-band call: no guest continuation */
+    fn();
+    *result=g_eax;
+    uint32_t expected=regs[4]-(count-first-callee_words)*4;
+    int ok=g_esp==expected;
+    if (!ok) fprintf(stderr,"[CHARACTER] guest %08X stack %08X expected %08X\n",va,g_esp,expected);
+    g_eax=regs[0]; g_ecx=regs[1]; g_edx=regs[2]; g_ebx=regs[3]; g_esp=regs[4];
+    g_ebp=regs[5]; g_esi=regs[6]; g_edi=regs[7]; g_seh_ebp=regs[8]; g_eflags=regs[9]; g_mxcsr=regs[10];
+    memcpy(g_fp_stack,fp,sizeof fp); g_fp_top=top; g_df=df; g_fp_cmp=cmp;
+    g_fp_control_word=cw; g_fp_cc=cc;
+    g_xmm0=vectors[0]; g_xmm1=vectors[1]; g_xmm2=vectors[2]; g_xmm3=vectors[3];
+    g_xmm4=vectors[4]; g_xmm5=vectors[5]; g_xmm6=vectors[6]; g_xmm7=vectors[7];
+    return ok;
+}
+#endif
 
 /* ── Manual function overrides ─────────────────────────────── */
 
@@ -2094,8 +2144,20 @@ static uint32_t map_request(void)
     return (uint32_t)r;
 }
 extern void sub_00051FC0_gen(void);
+/* Observe the game's own live objective update, including its explicit
+ * English pointer. No mission flags or caption storage are changed. */
+extern void sub_0004CA20_gen(void);
+void sub_0004CA20(void)
+{
+    uint32_t flow=g_ecx,record=GARG(1);
+    sub_0004CA20_gen();
+    jsrf_map_set_objective((const uint8_t *)g_xbox_mem_offset,flow,record);
+}
 void sub_00051FC0(void)
 {
+    /* Hold only the flow controller during the short delete/recreate gap.
+     * The spawner, loader and object destructor walks must keep running. */
+    if (jsrf_character_hold_flow(g_ecx)) { g_esp+=4; return; }
     static int init = -1, log_on; static double t; static uint32_t id, last_state = 0xFFFFFFFFu;
     uint8_t *m = (uint8_t *)g_xbox_mem_offset;
     uint32_t flow = g_ecx;
@@ -2301,9 +2363,11 @@ void sub_000A6980(void)
 extern void sub_000A6110_gen(void);
 void sub_000A6110(void)
 {
+    uint32_t manager=g_ecx;
     if (player_log_on())
         fprintf(stderr, "[PLAYER] t=%.2f destroy manager %08X from %08X\n", pad_now(), g_ecx, GARG(0));
     sub_000A6110_gen();
+    jsrf_character_destroyed(manager);
 }
 
 /* ---- sub_00116E30: the sound manager's per-frame update; counts frames.
@@ -2561,6 +2625,10 @@ void sub_00013A80(void)
     uint32_t w94 = (o > 0x10000u && o < (64u << 20)) ? *(uint32_t *)(m + o + 0x94) : 0;
     if (on < 0) on = getenv("JSRF_FRAME_LOG") ? 1 : 0;
     sub_00013A80_gen();
+#ifdef __ANDROID__
+    jsrf_character_tick(m,jsrf_now(),character_world_available(),character_guest_call);
+#endif
+    jsrf_map_publish(m);
     if (!on || o < 0x10000u || o >= (64u << 20)) return;
     n++;
     if (*(uint32_t *)(m + o + 0x74)) nopres++;
@@ -4449,6 +4517,10 @@ static struct {
     float    pos[3], yaw, pitch;
     int      help, hud_hidden;
 } s_photo;
+#ifdef __ANDROID__
+static int character_world_available(void)
+{ return !s_photo.on && !s_world_frozen && !s_picker.open && !s_picker.want_open; }
+#endif
 static float photo_axis(int16_t v)
 {
     float x = (float)v / 32767.0f;
@@ -4562,6 +4634,10 @@ static int photo_frame(uint8_t *m, uint32_t cam, uint32_t mode, float dt)
 
 static void rcam_note_pad(XBOX_INPUT_STATE *s)
 {
+    if (jsrf_character_blocks_input()) {
+        memset(&s->Gamepad,0,sizeof s->Gamepad);
+        s_rcam.rx=s_rcam.ry=0.0f; s_rcam.lt=0; return;
+    }
     if (picker_note_pad(s) || photo_note_pad(s)) { s_rcam.rx = s_rcam.ry = 0.0f; s_rcam.lt = 0; return; }
     float x = (float)s->Gamepad.sThumbRX / 32767.0f, y = (float)s->Gamepad.sThumbRY / 32767.0f;
     float mag = sqrtf(x * x + y * y);

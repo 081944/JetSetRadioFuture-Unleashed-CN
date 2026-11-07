@@ -28,6 +28,10 @@ project(jsrf_recomp C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+option(JSRF_DEVELOPMENT_TOOLS "Enable Android diagnostic properties and profiler UI" ON)
+if(NOT JSRF_DEVELOPMENT_TOOLS)
+    add_compile_definitions(JSRF_RELEASE_BUILD=1)
+endif()
 
 add_compile_definitions(
     RECOMP_ICALL_FEEDBACK
@@ -195,6 +199,8 @@ if(ANDROID)
         xbe_check.c
         cn_compat.c
         android/jsrf_android.c
+        android/map_snapshot.c
+        android/character_switch.c
         vk_probe.c
         vk_driver_probe.c
         vk_demo.c

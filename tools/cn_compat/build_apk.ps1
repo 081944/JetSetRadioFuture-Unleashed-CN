@@ -6,6 +6,7 @@ param(
     [string]$SigningDir = '',
     [string]$OutputDir = '',
     [string]$NativeDir = '',
+    [Alias('Release')][switch]$ReleaseBuild,
     [switch]$AllowVersionOverride,
     [switch]$AllowNewIdentity,
     # Keep the scratch directory (build/work/work-<guid>) after a successful run
@@ -64,6 +65,12 @@ if ($LASTEXITCODE -eq 0 -and $tagCommit) {
 
 $profile = Get-Content -LiteralPath "$repoRoot/game_files/cn_compat/manifest.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 $receipt = Get-Content -LiteralPath "$native/engine/cn-build.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+if ($ReleaseBuild -and ($receipt.build_type -ne 'Release' -or $receipt.development_tools -ne $false)) {
+    throw 'Release APK requires build_native.ps1 -Release with diagnostics disabled.'
+}
+if (!$ReleaseBuild -and $receipt.build_type -eq 'Release') {
+    throw 'Release native library requires build_apk.ps1 -Release.'
+}
 if ($receipt.version -ne $release.version) {
     throw "APK and native engine versions differ ($($release.version) vs $($receipt.version)). Build the native library with the same version first."
 }
@@ -104,6 +111,12 @@ function Invoke-Tool {
 }
 New-Item -ItemType Directory -Path $work -Force | Out-Null
 Copy-Item -LiteralPath "$repoRoot/launcher/android/res" -Destination "$work/res" -Recurse
+if ($ReleaseBuild) {
+    $boolFile="$work/res/values/bools.xml"
+    $boolXml=[xml](Get-Content -LiteralPath $boolFile -Raw -Encoding UTF8)
+    $boolXml.SelectSingleNode('/resources/bool[@name="cn_release_build"]').InnerText='true'
+    $boolXml.OuterXml | Set-Content -LiteralPath $boolFile -Encoding UTF8
+}
 $stringsFile = "$work/res/values/strings.xml"
 $stringsXml = [xml](Get-Content -LiteralPath $stringsFile -Raw -Encoding UTF8)
 $stringsXml.SelectSingleNode('/resources/string[@name="supported_disc"]').InnerText = 'the supported Chinese-patched Japanese disc (JSRF-CN.iso)'
@@ -224,6 +237,8 @@ $report = [ordered]@{
     bytes                         = $apkBytes
     version                       = $release.version
     versionCode                   = $release.versionCode
+    build_type                    = $receipt.build_type
+    development_tools             = [bool](-not $ReleaseBuild)
     version_source                = $release.source
     version_overridden            = [bool]$release.overridden
     source_commit                 = $source.commit

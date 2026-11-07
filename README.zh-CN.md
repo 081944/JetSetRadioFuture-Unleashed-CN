@@ -1,10 +1,10 @@
 # JSRF Unleashed CN
 
-基于 [JuMatt/JetSetRadioFuture-Unleashed](https://github.com/JuMatt/JetSetRadioFuture-Unleashed) 的中文 Android 分支，由 081944 维护。本项目保留上游代码、许可证及第三方署名；新增工作是运行时适配与手柄设置，不包含自行制作的游戏汉化资源。
+基于 [JuMatt/JetSetRadioFuture-Unleashed](https://github.com/JuMatt/JetSetRadioFuture-Unleashed) 的中文 Android 分支，由 081944 维护。本项目保留上游代码、许可证及第三方署名，提供中文资源适配、Vulkan 渲染、双屏地图及手柄设置。
 
 ## 下载与使用
 
-从 [本分支 Releases](https://github.com/081944/JetSetRadioFuture-Unleashed-CN/releases) 下载 `JSRF-Unleashed-android-arm64-CN.apk`。需要 Android 10 或以上、ARM64 和 OpenGL ES 3.0。
+从 [本分支 Releases](https://github.com/081944/JetSetRadioFuture-Unleashed-CN/releases) 下载 `JSRF-Unleashed-android-arm64-CN.apk`。当前正式版需要 Android 10 或以上、ARM64，以及能够运行随包 Turnip 驱动的 Adreno GPU；副屏地图还使用 OpenGL ES。实机验证设备为 AYN Thor，不保证所有 GPU 兼容。
 
 1. 安装 APK，把自己持有的受支持中文版 ISO 复制到设备。
 2. 启动应用，选择中文版 ISO，等待资源提取完成。
@@ -19,15 +19,19 @@
 - 齿轮设置中的“肩键/扳机互换”：同时交换 LB↔LT、RB↔RT。
 - “ABXY 布局”：微软默认布局，或任天堂布局（A↔B、X↔Y）。
 - 两项手柄设置仅影响实体手柄，切换立即生效，退出并重新打开后恢复。
-- 齿轮菜单中的性能浮层：显示平滑帧率、帧间隔和游戏线程的 CPU 占用；设备提供 `GL_EXT_disjoint_timer_query` 时显示 GPU 时间，否则显示 `GPU n/a`。默认关闭。
+- 正式包默认 Vulkan 渲染，无需 ADB 属性；修复远处建筑转动视角时的深度闪烁。
+- 支持外接/内置副屏常驻地图，显示玩家位置、地图标记、地名和当前目标；触摸旋转限制在 35°，支持缩放和双击复位。
+- 副屏右侧显示已解锁角色头像，直接读取游戏资源；两列、每列最多显示五个，超出可上下滑动。
+- 任务横条有动态雪花与平滑走马灯，区域标题左对齐、左亮右淡；地图整体左移，为角色栏留出空间。
+- 修复后台返回黑屏及偶发上方黑边。正式包关闭性能叠层和 Android 调试属性入口；开发包仍可使用诊断功能。
 
 ## 支持范围与验证
 
-当前版本 `v0.5.10-cn.2` 基于上游 `1c7e21f31b8899c810f77a89bec4f90e47a3a00f`（0.5.10）。相对 `v0.5.10-cn.1`，本版优化了几何命令包的处理路径（标量几何方法走快路径，完整的非递增负载成批提交，诊断回退与容量上限保持不变），并把移植的内嵌文字补齐到 534 处。`v0.5.10-cn.1` 与 `v0.5.9-cn.1` 保留作为旧版基线。
+当前版本为 `v0.6.6-cn.1`（Android versionCode 41），以本分支已验证的 0.6.6 代码为基础，包含 Vulkan、CPU 热点和帧节奏优化，以及双屏地图、实时换人和生命周期修复。完整变化见 [发布说明](docs/release-notes/0.6.6-cn.1.md)。历史版本保留在 Releases。
 
-上游的硬件建议是骁龙 8 Gen 1 及以上；本版以骁龙 8 Gen 2 为目标设备。骁龙 865 的实测结果为 40–60 帧浮动，属于该平台性能不足，不代表优化未生效。
+本版主要在 AYN Thor 上验证，优化过程中没有调整用户锁定的 CPU 频率。用户反馈多数场景可达 60 帧，具体表现取决于场景、驱动及设备。
 
-用户此前也已确认中文显示并进行手柄设置测试。这些反馈不等同于完整流程通关或所有设备的兼容验证。
+用户已确认中文、手柄、宽屏、双屏地图及远景闪烁修复。实时换人仍可能极少出现异常腾空，暂保留现状；地图未知任务文本可能回退为游戏英文。以上验证不等同于完整通关或所有设备兼容。
 
 目前仅支持下列已测量的 `default.xbe`。SHA256 是版本识别信息，仓库不包含对应文件：
 

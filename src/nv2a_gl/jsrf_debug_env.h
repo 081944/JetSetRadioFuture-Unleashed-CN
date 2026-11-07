@@ -35,6 +35,7 @@ static inline const char *jsrf_getenv(const char *name)
 {
     const char *value = getenv(name);
     if (value) return value;
+#ifndef JSRF_RELEASE_BUILD
     {
         static __thread char ring[JSRF_PROP_RING][PROP_VALUE_MAX];
         static __thread int slot;
@@ -53,6 +54,7 @@ static inline const char *jsrf_getenv(const char *name)
         key[n] = '\0';
         if (__system_property_get(key, out) > 0) return out;
     }
+#endif
     return NULL;
 }
 
@@ -70,6 +72,9 @@ static inline const char *jsrf_getenv(const char *name)
  * still print into the void. */
 static inline void jsrf_dbg_log(const char *fmt, ...)
 {
+#ifdef JSRF_RELEASE_BUILD
+    (void)fmt;
+#else
     va_list ap;
     va_start(ap, fmt);
 #ifdef __ANDROID__
@@ -78,6 +83,7 @@ static inline void jsrf_dbg_log(const char *fmt, ...)
     vfprintf(stderr, fmt, ap);
 #endif
     va_end(ap);
+#endif
 }
 
 #endif /* JSRF_DEBUG_ENV_H */

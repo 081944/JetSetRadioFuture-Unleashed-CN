@@ -94,3 +94,9 @@ if ($LASTEXITCODE -ne 0) { throw 'Resolve merge conflicts and review each resolu
 延续当前签名身份并递增 Android `versionCode`。已有私钥和密码文件需由维护者自行离线备份，不提交到 Git，不作为 Release 附件。当前设备上的测试包与本次发布包使用同一身份。
 
 游戏派生的兼容配置和静态重编译代码会编入本地构建的 APK；“Git 只提交源码”不表示 APK 内不存在这些派生数据。保留原项目和第三方组件的许可说明。
+
+## 0.6.6-cn.1 正式发布构建
+
+当前发布版本升级为 0.6.6-cn.1 / versionCode 41。`build_native.ps1 -Release -Jobs 2` 使用 CMake Release（-O2 -DNDEBUG，保留实机调试阶段验证的优化级别），关闭 JSRF_DEVELOPMENT_TOOLS；`build_apk.ps1 -Release` 要求匹配的正式原生回执，使用 D8 release、去除原生调试符号，并将 cn_release_build 资源写入临时构建副本。正式 UI 忽略此前保存的性能叠层开启状态且隐藏该入口；正常游戏设置仍保留。
+
+正式包原生默认设置 RECOMP_BACKEND=vulkan，不依赖设备 debug.jsrf.recomp_backend；编译掉 Android 系统调试属性读取与 JSRF-GLPROF 输出，保留普通启动/错误日志。发布说明见 docs/release-notes/0.6.6-cn.1.md。上传仅限 APK 与同名 SHA256 文件；私钥、游戏资源、构建日志及生成代码均不上传。代码提交并审计后，按干净提交构建，标签指向该源码提交；GitHub Release 上传同一份实机验证产物。

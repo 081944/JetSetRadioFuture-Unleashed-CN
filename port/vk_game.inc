@@ -113,6 +113,15 @@ static VkDescriptorSetLayout vg_set_layout;
 static VkPipelineLayout vg_pipeline_layout;
 static VkPipelineCache vg_pipeline_cache;
 static VkFormat vg_depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+static int vg_reversed_depth;
+
+static int vg_zrev(int want)
+{
+    /* Vulkan already has [0,w] clip depth and D32 float attachments. Let the
+     * shared frontend emit its cancellation-free reversed projection row. */
+    vg_reversed_depth=!!want;
+    return vg_reversed_depth;
+}
 static uint32_t vg_uniform_offset[NV2A_U_COUNT], vg_uniform_stride[NV2A_U_COUNT];
 static uint32_t vg_uniform_bytes, vg_attr_offset, vg_alignment;
 static int vg_uniform_dedup;
@@ -455,7 +464,7 @@ static int vg_pass(void)
         .imageView = t->depth.view, .imageLayout = t->depth.layout,
         .loadOp = fresh_z ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-        .clearValue.depthStencil = { 1.0f, 0 } };
+        .clearValue.depthStencil = { vg_reversed_depth ? 0.0f : 1.0f, 0 } };
     VkRenderingInfo ri = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
         .renderArea = { { 0, 0 }, { t->w, t->h } }, .layerCount = 1,
         .colorAttachmentCount = 1, .pColorAttachments = &ca,
@@ -693,7 +702,12 @@ static char *vg_source(const char *src, int frag, VgProgram *program)
     }
     vg_text(&s, "\nvoid main() {\n");
     vg_text(&s, "_vg_main();\n");
-    if (!frag) vg_text(&s, "gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;\n");
+    if (!frag) vg_text(&s,
+        "#if !defined(NV2A_CLIP_Z01) || !NV2A_CLIP_Z01\n"
+        "gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;\n"
+        "#endif\n");
+    else if (vg_reversed_depth && strstr(src,"gl_FragDepth"))
+        vg_text(&s,"gl_FragDepth = 1.0 - gl_FragDepth;\n");
     vg_text(&s, "}\n");
     if (s.failed) { vke("shader conversion failed"); free(s.data); return NULL; }
     return s.data;
@@ -1310,11 +1324,14 @@ static int vg_window_init(void)
         .descriptorPool=vg_window_descriptors,.descriptorSetCount=3,.pSetLayouts=layouts};
     if(!vg_ok(vgAllocateDescriptorSets(w_dev,&ai,sets),"window descriptor sets"))return 0;
     for(int i=0;i<3;i++)vg_display[i].set=sets[i];
+    SDL_LockMutex(w_q_mu);
     for(uint32_t i=0;i<w_nimg;i++) {
+        if(w_view[i])continue;
         VkImageViewCreateInfo vi={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=w_img[i],
             .viewType=VK_IMAGE_VIEW_TYPE_2D,.format=w_format,.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
-        if(!vg_ok(p_view_new(w_dev,&vi,NULL,&w_view[i]),"window image view"))return 0;
+        if(!vg_ok(p_view_new(w_dev,&vi,NULL,&w_view[i]),"window image view")){SDL_UnlockMutex(w_q_mu);return 0;}
     }
+    SDL_UnlockMutex(w_q_mu);
     vke("asynchronous pre-rotated presenter: window %ux%u, images %ux%u, transform %u",
         w_window_extent.width,w_window_extent.height,w_extent.width,w_extent.height,(unsigned)w_transform);
     return 1;
@@ -1341,10 +1358,10 @@ static int vg_display_target(int index,uint32_t w,uint32_t h)
 static void vg_window_frame(int index)
 {
     VgDisplay *d=&vg_display[index];uint32_t image=0;
-    if(w_failed || !vg_ok(p_wait(w_dev,1,&w_fence,VK_TRUE,UINT64_MAX),"window buffer wait"))return;
+    if(w_failed || !vke_window_refresh() || !vg_ok(p_wait(w_dev,1,&w_fence,VK_TRUE,UINT64_MAX),"window buffer wait"))return;
     VkResult r=p_acquire(w_dev,w_sc,1000000000ull,w_acq,VK_NULL_HANDLE,&image);
     if(r==VK_TIMEOUT || r==VK_NOT_READY)return;
-    if(r!=VK_SUCCESS && r!=VK_SUBOPTIMAL_KHR){vg_ok(r,"window acquire");return;}
+    if(!vke_window_result(r,"window acquire"))return;
     if(image>=w_nimg || !vg_ok(p_pool_reset(w_dev,w_pool,0),"window command reset"))return;
     float aspect=(float)w_window_extent.width/w_window_extent.height;
     float picture=d->aspect;
@@ -1385,7 +1402,7 @@ static void vg_window_frame(int index)
     SDL_LockMutex(w_q_mu);r=p_submit(w_queue,1,&si,w_fence);
     if(r==VK_SUCCESS){w_layout[image]=VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;r=p_present(w_queue,&pi);}
     SDL_UnlockMutex(w_q_mu);
-    if(r!=VK_SUCCESS && r!=VK_SUBOPTIMAL_KHR){vg_ok(r,"asynchronous present");return;}
+    if(!vke_window_result(r,"asynchronous present"))return;
     unsigned count=atomic_fetch_add(&vg_window_frames,1)+1;
     if(count==1 || count%300==0)vke("window present %u: game flip %u",count,d->flip);
 }
@@ -1561,6 +1578,34 @@ static int vg_self_test(void)
         }
         vg_vbuf_free(vb);
     }
+    /* Two almost coplanar distant surfaces. A GL [-w,w] round-trip loses
+     * their ordering even with a D32 attachment; native [0,w] must keep it. */
+    vg_reversed_depth=1;
+    const char *depth_vs="#version 450\n#define NV2A_CLIP_Z01 1\n"
+        "layout(location=0) in vec4 v0;layout(location=3) in vec4 v3;out vec4 oD0;\n"
+        "void main(){gl_Position=vec4(v0.xy*v0.z,0.0002,v0.z);oD0=v3;}\n";
+    const char *depth_fs="#version 450\nin vec4 oD0;out vec4 frag;void main(){frag=oD0;}\n";
+    const char *w_fs="#version 450\nin vec4 oD0;out vec4 frag;"
+        "void main(){frag=oD0;gl_FragDepth=(1.0/gl_FragCoord.w)/100.0;}\n";
+    for (int wb=0;wb<2;++wb) {
+        uint32_t dp=vg_prog_new(depth_vs,wb?w_fs:depth_fs,"Vulkan depth precision test");
+        if (!dp) {ok=0;break;}
+        vg_prog_use(dp);
+        Nv2aRenderState dr={.color_mask=0x01010101u,.depth_test=1,.depth_write=1,.depth_func=0x0206 /* GEQUAL */};
+        vg_set_state(&dr);vg_clear(7,clear,0,0,NULL);
+        float near_w=wb?10.0f:3000.0f,far_w=wb?20.0f:3000.25f;
+        for (int layer=0;layer<2;++layer) {
+            float w=layer?far_w:near_w;
+            float triangle[]={-1,-1,w,1,3,-1,w,1,-1,3,w,1};
+            values[3][0]=layer?0:1;values[3][1]=layer?1:0;values[3][2]=0;values[3][3]=1;
+            vg_vertices(triangle,3,4,at,1u<<3,values);vg_draw(NV2A_PRIM_TRIANGLES,3);
+        }
+        int read=vg_target_read(target,8,8,1,1,0,pixel);
+        int pass=read && pixel[0]==255 && pixel[1]==0 && pixel[2]==0;
+        vke("depth precision test %s: %s (pixel %u %u %u)",wb?"W-buffer":"distant Z",pass?"PASS":"FAIL",pixel[0],pixel[1],pixel[2]);
+        ok=ok && pass;vg_prog_free(dp);
+    }
+    vg_reversed_depth=0;
     vg_prog_free(prog);vg_target_free(target);memset(&vg_state,0,sizeof vg_state);
     vg_gpu_frame.frame=UINT32_MAX;vg_gpu_frame.us=0;vg_gpu_total_ms=vg_wait_total_ms=0;
     nv2a_gl_performance_backend_gpu(-1);
@@ -1607,7 +1652,7 @@ static void vg_stop(void)
     memset(vg_prog,0,sizeof vg_prog);memset(vg_pipes,0,sizeof vg_pipes);
     memset(vg_pipe_head,0,sizeof vg_pipe_head);memset(vg_pipe_next,0,sizeof vg_pipe_next);
     memset(vg_vbufs,0,sizeof vg_vbufs);vg_nfree_ranges=vg_cached_vb=0;
-    vg_ready=vg_recording=vg_rendering=0;vg_slot_index=vg_current_rt=vg_current_prog=vg_npipe=0;
+    vg_ready=vg_recording=vg_rendering=vg_reversed_depth=0;vg_slot_index=vg_current_rt=vg_current_prog=vg_npipe=0;
 }
 
 static const Nv2aGfx vg_gfx={
@@ -1620,7 +1665,7 @@ static const Nv2aGfx vg_gfx={
     .state_invalidate=vg_invalidate,.vertices=vg_vertices,.draw=vg_draw,.clear=vg_clear,
     .present=vg_present,.report=vg_report
     ,.vbuf_new=vg_vbuf_new,.vbuf_free=vg_vbuf_free,.vbuf_fill=vg_vbuf_fill,.vbuf_bind=vg_vbuf_bind,
-    .draw_indexed=vg_draw_indexed,.gpu_ms=vg_gpu_ms,.uniform_f_part=vg_uniform_f_part
+    .draw_indexed=vg_draw_indexed,.gpu_ms=vg_gpu_ms,.uniform_f_part=vg_uniform_f_part,.zrev=vg_zrev
 };
 
 const Nv2aGfx *nv2a_vk_game_gfx(void) { return &vg_gfx; }

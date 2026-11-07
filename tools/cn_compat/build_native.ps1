@@ -7,10 +7,13 @@ param(
     [int]$VersionCode = 0,
     [int]$Jobs = 4,
     [string]$BuildDir = '',
+    [Alias('Release')][switch]$ReleaseBuild,
     [switch]$AllowVersionOverride,
     [switch]$SdlOnly
 )
 $ErrorActionPreference = 'Stop'
+$buildType = if ($ReleaseBuild) { 'Release' } else { 'RelWithDebInfo' }
+$developmentTools = if ($ReleaseBuild) { 'OFF' } else { 'ON' }
 . (Join-Path $PSScriptRoot 'version.ps1')
 $repoRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $release = Resolve-CnReleaseInfo -Info (Get-CnReleaseInfo) -Version $Version -VersionCode $VersionCode -AllowOverride:$AllowVersionOverride
@@ -43,7 +46,7 @@ function Invoke-CMake {
 Invoke-CMake -CMakeArgs @('-S', $SdlSource, '-B', "$workDir/sdl", '-G', 'Ninja',
     "-DCMAKE_MAKE_PROGRAM=$ninjaPath", "-DCMAKE_TOOLCHAIN_FILE=$toolchain",
     '-DANDROID_ABI=arm64-v8a', '-DANDROID_PLATFORM=android-29',
-    '-DCMAKE_BUILD_TYPE=RelWithDebInfo', '-DSDL_STATIC=OFF', '-DSDL_TEST=OFF',
+    "-DCMAKE_BUILD_TYPE=$buildType", '-DSDL_STATIC=OFF', '-DSDL_TEST=OFF',
     '-DSDL_TESTS=OFF', "-DCMAKE_INSTALL_PREFIX=$sdlInstall")
 Invoke-CMake -CMakeArgs @('--build', "$workDir/sdl", '-j', "$Jobs")
 Invoke-CMake -CMakeArgs @('--install', "$workDir/sdl")
@@ -62,7 +65,8 @@ if ($genStamp -ne $profileManifest.target_sha256) {
 Invoke-CMake -CMakeArgs @('-S', "$repoRoot/port", '-B', "$workDir/engine", '-G', 'Ninja',
     "-DCMAKE_MAKE_PROGRAM=$ninjaPath", "-DCMAKE_TOOLCHAIN_FILE=$toolchain",
     '-DANDROID_ABI=arm64-v8a', '-DANDROID_PLATFORM=android-29',
-    '-DCMAKE_BUILD_TYPE=RelWithDebInfo', "-DJSRF_VERSION=$($release.version)",
+    "-DCMAKE_BUILD_TYPE=$buildType", "-DJSRF_DEVELOPMENT_TOOLS=$developmentTools",
+    '-DCMAKE_C_FLAGS_RELEASE=-O2 -DNDEBUG', "-DJSRF_VERSION=$($release.version)",
     "-DJSRF_GEN_DIR=$GeneratedDir", "-DJSRF_CN_PROFILE_DIR=$CnProfileDir",
     "-DSDL2_DIR=$sdlInstall/lib/cmake/SDL2")
 Invoke-CMake -CMakeArgs @('--build', "$workDir/engine", '-j', "$Jobs", '--target', 'jsrf_recomp')
@@ -70,6 +74,8 @@ $source = Get-CnGitState -RepoRoot $repoRoot
 $nativeReceipt = [ordered]@{
     version         = $release.version
     versionCode     = $release.versionCode
+    build_type      = $buildType
+    development_tools = [bool](-not $ReleaseBuild)
     target_sha256   = $profileManifest.target_sha256
     gen_stamp       = $genStamp
     library_sha256  = (Get-FileHash -LiteralPath "$workDir/engine/libmain.so" -Algorithm SHA256).Hash.ToLowerInvariant()

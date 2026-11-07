@@ -136,3 +136,13 @@ JSRF_CN_PROFILE_DIR = game_files/cn_compat
 仍需更多设备和长时间游戏测试，关注生成器诊断、切场景、存档读档、手柄设置重启恢复等路径。用户反馈已验证的内容与尚未完整覆盖的路径应分开记录。
 
 此目录仅提交脚本、测试和地址元数据。运行 `prepare.py` 生成的配置包含镜像派生数据，必须保留在忽略目录中，不可提交 Git。发布与同步规则见 [维护说明](../../docs/CN_MAINTENANCE.md)。
+
+正式发行构建（明确授权发布后）：
+
+```powershell
+$ErrorActionPreference = 'Stop'
+./tools/cn_compat/build_native.ps1 -Release -Jobs 2
+./tools/cn_compat/build_apk.ps1 -Release
+```
+
+`-Release` 切换至优化的 CMake Release，并关闭诊断属性及 profiler 日志。APK 脚本核验原生回执、隐藏性能叠层且不读取旧的开启偏好；仍保留宽屏、实体手柄、地图与角色等正常设置。发布包必须与实机安装验证使用同一文件，不上传构建报告（含本机构建信息）或整个构建目录。

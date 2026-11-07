@@ -27,10 +27,54 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <android/log.h>
+#include <android/native_window_jni.h>
 #include "xiso.h"
 #include "../xbe_check.h"
 #include "../../src/input/controller_mapping.h"
 #include "../../src/nv2a_gl/nv2a_gl.h"
+#include "map_snapshot.h"
+#include "character_switch.h"
+
+JNIEXPORT jboolean JNICALL Java_com_jumatt_jsrfunleashed_CharacterSwitchBar_nativeRequest(
+        JNIEnv *env,jclass cls,jint id)
+{ (void)env; (void)cls; return jsrf_character_request(id) ? JNI_TRUE : JNI_FALSE; }
+
+JNIEXPORT void JNICALL Java_com_jumatt_jsrfunleashed_CharacterSwitchBar_nativeStatus(
+        JNIEnv *env,jclass cls,jintArray array)
+{
+    (void)cls;
+    if (!array || (*env)->GetArrayLength(env,array)<JSRF_CHARACTER_WORDS) return;
+    int state[JSRF_CHARACTER_WORDS];
+    jsrf_character_snapshot(state);
+    (*env)->SetIntArrayRegion(env,array,0,JSRF_CHARACTER_WORDS,(const jint *)state);
+}
+
+extern void nv2a_vk_engine_surface(ANativeWindow *window);
+JNIEXPORT jstring JNICALL Java_com_jumatt_jsrfunleashed_SecondaryMapView_nativeObjective(JNIEnv *env,jclass cls)
+{
+    char caption[JSRF_MAP_CAPTION_BYTES]={0}; (void)cls;
+    jsrf_map_objective_copy(caption,sizeof caption);
+    return (*env)->NewStringUTF(env,caption);
+}
+JNIEXPORT void JNICALL Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeVulkanSurface(
+        JNIEnv *env, jclass cls, jobject surface)
+{
+    (void)cls;
+    nv2a_vk_engine_surface(surface ? ANativeWindow_fromSurface(env,surface) : NULL);
+}
+
+JNIEXPORT void JNICALL Java_com_jumatt_jsrfunleashed_SecondaryMapView_nativeEnable(
+        JNIEnv *env, jclass cls, jboolean on)
+{ (void)env; (void)cls; jsrf_map_enable(on); }
+
+JNIEXPORT jint JNICALL Java_com_jumatt_jsrfunleashed_SecondaryMapView_nativeSnapshot(
+        JNIEnv *env, jclass cls, jobject buffer)
+{
+    (void)cls;
+    jlong bytes = (*env)->GetDirectBufferCapacity(env, buffer);
+    if (bytes < (jlong)(JSRF_MAP_FLOATS * sizeof(float))) return 0;
+    return jsrf_map_copy((*env)->GetDirectBufferAddress(env, buffer), (unsigned)(bytes / sizeof(float)));
+}
 
 #ifndef JSRF_VERSION
 #define JSRF_VERSION "dev"
@@ -108,6 +152,10 @@ static int cfg_get_int(const char *file, const char *key, int def)
  * player 2's, which the game does not read. SDL_TV_REMOTE_AS_JOYSTICK=0 is
  * SDL's own rule for this (fewer than two axes and no hat: not a joystick). */
 static const char *const k_env[][2] = {
+#ifdef JSRF_RELEASE_BUILD
+    /* Shipping CN builds must not depend on an adb debug property. */
+    { "RECOMP_BACKEND", "vulkan" },
+#endif
     { "RECOMP_USB", "1" }, { "RECOMP_GL", "1" }, { "RECOMP_PB_EXEC", "1" },
     { "RECOMP_VBLANK", "1" }, { "RECOMP_AC97_READY_NOTRAP", "1" },
     { "RECOMP_TRACE_BUDGET", "0" }, { "RECOMP_GL_READBACK", "0" }, { "RECOMP_FPS", "60" },

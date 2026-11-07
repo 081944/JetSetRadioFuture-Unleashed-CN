@@ -3,9 +3,20 @@ package com.jumatt.jsrfunleashed;
 import android.app.AlertDialog;
 import android.content.pm.ActivityInfo;
 import android.hardware.input.InputManager;
+import android.hardware.display.DisplayManager;
 import android.os.Bundle;
+import android.os.Build;
+import android.graphics.Color;
 import android.util.Log;
 import android.view.InputDevice;
+import android.view.Display;
+import android.view.WindowManager;
+import android.view.Surface;
+import android.view.SurfaceHolder;
+import android.view.View;
+import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.view.MotionEvent;
 import android.view.ViewGroup;
 import android.widget.RelativeLayout;
@@ -23,10 +34,11 @@ import org.libsdl.app.SDLActivity;
  * the settings button.
  */
 public class JsrfActivity extends SDLActivity
-        implements TouchPadView.Listener, InputManager.InputDeviceListener {
+        implements TouchPadView.Listener, InputManager.InputDeviceListener, DisplayManager.DisplayListener {
 
     /* port/android/jsrf_android.c */
     static native void nativeTouch(int buttons, int analog, int x, int y, boolean stick, boolean shown);
+    static native void nativeVulkanSurface(Surface surface);
     static native boolean nativeWidescreen();
     static native void nativeSetWidescreen(boolean on);
 static native int nativeRstickCamera();            /* 0 off, 1 the camera, 2 tracking */
@@ -45,6 +57,19 @@ static native int nativeRstickCamera();            /* 0 off, 1 the camera, 2 tra
     private String mPadsSaid = "";
     private boolean mSwapTriggers, mNintendo;
     private boolean mPerformanceOverlay;
+    private boolean mReleaseBuild;
+    private DisplayManager mDisplays;
+    private SecondaryMapPresentation mMapDisplay;
+    private boolean mResumed;
+    private final SurfaceHolder.Callback mVulkanSurfaceCallback = new SurfaceHolder.Callback() {
+        @Override public void surfaceCreated(SurfaceHolder holder) { publishVulkanSurface(holder); }
+        @Override public void surfaceChanged(SurfaceHolder holder,int format,int width,int height) { publishVulkanSurface(holder); }
+        @Override public void surfaceDestroyed(SurfaceHolder holder) { nativeVulkanSurface(null); }
+    };
+    private void publishVulkanSurface(SurfaceHolder holder) {
+        Surface surface=holder.getSurface();
+        nativeVulkanSurface(mResumed && surface!=null && surface.isValid() ? surface : null);
+    }
 
     @Override
     protected String[] getLibraries() {
@@ -65,9 +90,12 @@ static native int nativeRstickCamera();            /* 0 off, 1 the camera, 2 tra
     protected void onCreate(Bundle state) {
         super.onCreate(state);
         if (mLayout == null) return;        /* SDL could not load the engine: it says so */
+        restoreFullscreen();
+        if (mSurface != null) mSurface.getHolder().addCallback(mVulkanSurfaceCallback);
         mSwapTriggers = getSharedPreferences("controller", MODE_PRIVATE).getBoolean("swap_triggers", false);
         mNintendo = getSharedPreferences("controller", MODE_PRIVATE).getBoolean("nintendo", false);
-        mPerformanceOverlay = Settings.get(this, "performance_overlay", 0) != 0;
+        mReleaseBuild=getResources().getBoolean(R.bool.cn_release_build);
+        mPerformanceOverlay = !mReleaseBuild && Settings.get(this, "performance_overlay", 0) != 0;
         nativeSetPerformanceOverlay(mPerformanceOverlay);
         nativeSetControllerMapping(mSwapTriggers, mNintendo);
         mPad = new TouchPadView(this, this);
@@ -77,19 +105,98 @@ static native int nativeRstickCamera();            /* 0 off, 1 the camera, 2 tra
         mInput = (InputManager) getSystemService(INPUT_SERVICE);
         if (mInput != null) mInput.registerInputDeviceListener(this, null);
         updateControls();
+        mDisplays = (DisplayManager)getSystemService(DISPLAY_SERVICE);
+        if (mDisplays != null) mDisplays.registerDisplayListener(this, null);
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        mResumed = true;
+        if (mLayout != null) restoreFullscreen();
+        if (mSurface != null) publishVulkanSurface(mSurface.getHolder());
+        updateMapDisplay();
     }
 
     @Override
     protected void onPause() {
+        mResumed = false;
+        if (mLayout != null) nativeVulkanSurface(null);
+        closeMapDisplay();
         if (mPad != null) mPad.reset();
         super.onPause();
     }
 
+    /* Returning from Home can leave a status-bar color view covering the top
+     * 55 pixels even after SDL's surface has grown back to full size. Restore
+     * both the layout policy and bar visibility when this window owns focus. */
+    private void restoreFullscreen() {
+        Window window=getWindow();
+        window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        window.clearFlags(WindowManager.LayoutParams.FLAG_FORCE_NOT_FULLSCREEN);
+        window.setStatusBarColor(Color.TRANSPARENT);
+        window.setNavigationBarColor(Color.TRANSPARENT);
+        window.setStatusBarContrastEnforced(false);
+        window.setNavigationBarContrastEnforced(false);
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.setDecorFitsSystemWindows(false);
+            WindowInsetsController bars=window.getInsetsController();
+            if (bars!=null) {
+                bars.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                bars.hide(WindowInsets.Type.systemBars());
+            }
+        } else {
+            window.getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN
+                    |View.SYSTEM_UI_FLAG_HIDE_NAVIGATION|View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                    |View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN|View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                    |View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+        }
+    }
+
+    @Override public void onWindowFocusChanged(boolean focused) {
+        super.onWindowFocusChanged(focused);
+        if (focused && mLayout!=null) restoreFullscreen();
+    }
+
     @Override
     protected void onDestroy() {
+        if (mSurface != null) mSurface.getHolder().removeCallback(mVulkanSurfaceCallback);
+        closeMapDisplay();
+        if (mDisplays != null) mDisplays.unregisterDisplayListener(this);
         if (mInput != null) mInput.unregisterInputDeviceListener(this);
         super.onDestroy();
     }
+
+    private void closeMapDisplay() {
+        if (mMapDisplay != null) {
+            mMapDisplay.dismiss();
+            mMapDisplay = null;
+        }
+    }
+
+    private void updateMapDisplay() {
+        if (!mResumed || mLayout == null || mDisplays == null || Settings.get(this,"secondary_map",1)==0) {
+            closeMapDisplay(); return;
+        }
+        int primary = getWindowManager().getDefaultDisplay().getDisplayId();
+        Display target = null;
+        for (Display display : mDisplays.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION)) {
+            if (display.getDisplayId()!=primary && display.getState()!=Display.STATE_OFF) { target=display; break; }
+        }
+        if (target==null) { closeMapDisplay(); return; }
+        if (mMapDisplay!=null && mMapDisplay.getDisplay().getDisplayId()==target.getDisplayId() && mMapDisplay.isShowing()) return;
+        closeMapDisplay();
+        SecondaryMapPresentation next = new SecondaryMapPresentation(this,target,new File(getExternalFilesDir(null),"game"));
+        try {
+            next.show(); mMapDisplay=next;
+            Log.i("JSRF-Map","Companion map on display "+target.getDisplayId());
+        } catch (WindowManager.InvalidDisplayException | SecurityException ex) {
+            Log.w("JSRF-Map","Secondary display unavailable",ex);
+            next.dismiss();
+        }
+    }
+    @Override public void onDisplayAdded(int id) { updateMapDisplay(); }
+    @Override public void onDisplayRemoved(int id) { updateMapDisplay(); }
+    @Override public void onDisplayChanged(int id) { updateMapDisplay(); }
 
     /** Landscape, either way up. SDL would let a resizable window turn with
      *  the phone, into portrait too. */
@@ -195,12 +302,19 @@ final int rcam = nativeRstickCamera();
             "性能叠层：" + (perf ? "开" : "关"),
             "Photo mode",
             "Go to a map",
+            "副屏地图：" + (Settings.get(this,"secondary_map",1)!=0 ? "开" : "关"),
+            "切换角色",
             "Controls",
         };
+        // Retain action IDs while excluding development tools from release UI.
+        final int[] actions=mReleaseBuild ? new int[] {0,1,2,3,4,5,7,8,9,10,11}
+                : new int[] {0,1,2,3,4,5,6,7,8,9,10,11};
+        String[] visibleItems=new String[actions.length];
+        for (int i=0;i<actions.length;i++) visibleItems[i]=items[actions[i]];
         mPad.reset();
         dialog().setTitle("JSRF Unleashed " + nativeVersion())
-            .setItems(items, (d, which) -> {
-                switch (which) {
+            .setItems(visibleItems, (d, which) -> {
+                switch (actions[which]) {
                 case 0:
                     nativeSetWidescreen(!wide);
                     break;
@@ -231,6 +345,16 @@ final int rcam = nativeRstickCamera();
                     break;
                 case 8:
                     pickMap();
+                    break;
+                case 9:
+                    Settings.set(this,"secondary_map",Settings.get(this,"secondary_map",1)!=0 ? 0 : 1);
+                    updateMapDisplay();
+                    break;
+                case 10:
+                    AlertDialog characters=dialog().setTitle("切换角色")
+                        .setNegativeButton("关闭",null).create();
+                    characters.setView(new CharacterSwitchBar(this,characters::dismiss));
+                    characters.show();
                     break;
                 default:
                     showControls();

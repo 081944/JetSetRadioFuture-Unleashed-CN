@@ -10,7 +10,7 @@ import re
 import subprocess
 
 BASE = '414b1037a4503a167c5440a258ae2ff904d408f5'
-TEXT_SUFFIXES = {'.c', '.h', '.java', '.py', '.ps1', '.md', '.json', '.xml', '.txt',
+TEXT_SUFFIXES = {'.c', '.h', '.inc', '.java', '.py', '.ps1', '.md', '.json', '.xml', '.txt',
                  '.yml', '.yaml', '.sh', '.cmake'}
 
 
