@@ -37,10 +37,16 @@ The game goes in the app's folder, `Android/data/com.jumatt.jsrfunleashed/files/
 screen); its saves are kept there, under `UDATA`, and `Logs/last-run.log`
 beside it. The settings are in `files/settings`.
 
-The ⚙ menu can show a performance overlay with smoothed FPS, frame interval,
-CPU time used by the game/render thread between frames, and GPU time when the
-device exposes `GL_EXT_disjoint_timer_query`. GPU queries are read
-asynchronously; devices without that extension show `GPU n/a`.
+The ⚙ options menu and its dialogs use Chinese text, including map names from
+the existing CN place labels. “显示帧数（FPS）” shows smoothed FPS and frame
+interval; “显示 CPU/GPU 耗时” independently shows the game/render thread's CPU
+time and GPU render time per frame, in milliseconds. Both switches take effect
+immediately and persist across restarts, inheriting the old performance-overlay
+preference on first use. Release and profiling builds retain separate preferences.
+GPU queries are asynchronous (Vulkan timestamps, or
+`GL_EXT_disjoint_timer_query` with OpenGL ES). Missing or unsupported readings
+show `--`; a pending GPU reading shows `…`. Turning both switches off disables
+performance sampling.
 
 Android-specific choices, all in `port/` and `launcher/android/`:
 

@@ -73,7 +73,7 @@ final class TouchPadView extends View {
     private int mInL, mInT, mInR, mInB;
 
     private boolean mControls;          /* the pad and Start / Back showing */
-    private boolean mPerformanceOverlay;
+    private boolean mShowFps, mShowFrameTimes;
     private int mPills;                 /* Start / Back held */
     private final long[] mPillDown = new long[2];
     private final int[] mPillSeq = new int[2];
@@ -97,9 +97,10 @@ final class TouchPadView extends View {
         reset();
     }
 
-    void setPerformanceOverlay(boolean on) {
-        if (on == mPerformanceOverlay) return;
-        mPerformanceOverlay = on;
+    void setPerformanceOverlay(boolean showFps, boolean showFrameTimes) {
+        if (showFps == mShowFps && showFrameTimes == mShowFrameTimes) return;
+        mShowFps = showFps;
+        mShowFrameTimes = showFrameTimes;
         invalidate();
     }
 
@@ -205,7 +206,7 @@ final class TouchPadView extends View {
 
     @Override
     protected void onDraw(Canvas c) {
-        if (mPerformanceOverlay) drawPerformance(c);
+        if (mShowFps || mShowFrameTimes) drawPerformance(c);
         if (mControls) {
             for (int i = 0; i < COUNT; i++) {
                 circle(c, cx[i], cy[i], rad[i], mHeld[i] ? 0.42f : 0.16f, 0.55f);
@@ -250,11 +251,12 @@ final class TouchPadView extends View {
         float pad = 9 * dp, lineH = 16 * dp, textSize = 11 * dp;
         /* Width and placement are constants: the box is anchored to the top
          * right corner and never resized. */
-        float boxW = 192 * dp;
+        float boxW = 212 * dp;
         float left = getWidth() - mInR - 8 * dp - boxW;
         float top = mInT + 8 * dp;
         float right = left + boxW;
-        float bottom = top + 2 * lineH + pad * 2;
+        int rows = (mShowFps ? 1 : 0) + (mShowFrameTimes ? 1 : 0);
+        float bottom = top + rows * lineH + pad * 2;
         mFill.setColor(Color.argb(190, 18, 20, 24));
         c.drawRoundRect(left, top, right, bottom, 7 * dp, 7 * dp, mFill);
         mLine.setColor(Color.argb(120, 255, 255, 255));
@@ -266,19 +268,22 @@ final class TouchPadView extends View {
         mText.setColor(Color.WHITE);
         float x = left + pad;
         float y1 = top + pad + lineH - 4 * dp;
-        float y2 = y1 + lineH;
-
-        label(c, "FPS",       x,           y1);
-        value(c, f, 0, 1,     x +  53 * dp, y1);
-        label(c, "Frame",     x +  60 * dp, y1);
-        value(c, f, 1, 2,     x + 131 * dp, y1);
-        label(c, "ms",        x + 135 * dp, y1);
-
-        label(c, "CPU frame", x,           y2);
-        value(c, f, 2, 2,     x +  92 * dp, y2);
-        label(c, "ms",        x +  96 * dp, y2);
-        label(c, "GPU",       x + 118 * dp, y2);
-        value(c, f, 3, 2,     x + 173 * dp, y2);
+        if (mShowFps) {
+            label(c, "帧数",       x,           y1);
+            value(c, f, 0, 1,     x +  58 * dp, y1);
+            label(c, "帧间隔",     x +  68 * dp, y1);
+            value(c, f, 1, 2,     x + 162 * dp, y1);
+            label(c, "毫秒",       x + 167 * dp, y1);
+        }
+        if (mShowFrameTimes) {
+            float y2 = mShowFps ? y1 + lineH : y1;
+            label(c, "CPU",       x,           y2);
+            value(c, f, 2, 2,     x +  69 * dp, y2);
+            label(c, "毫秒",       x +  73 * dp, y2);
+            label(c, "GPU",       x + 102 * dp, y2);
+            value(c, f, 3, 2,     x + 167 * dp, y2);
+            label(c, "毫秒",       x + 171 * dp, y2);
+        }
 
         /* The controls are drawn after this and centre their labels on their
          * own centres, so the paint has to go back to centred text. */

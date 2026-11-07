@@ -33,6 +33,7 @@ if ($release.overridden) {
 if (!$OutputDir) { $OutputDir = Join-Path $repoRoot "build/dist/$($release.version)" }
 if (!$SigningDir) { $SigningDir = Join-Path $repoRoot 'build/signing' }
 $OutputDir = [IO.Path]::GetFullPath($OutputDir)
+New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 $workRoot = Join-Path $repoRoot 'build/work'
 $work = Join-Path $workRoot ('work-' + [guid]::NewGuid().ToString('N'))
 

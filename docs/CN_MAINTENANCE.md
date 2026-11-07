@@ -103,4 +103,6 @@ if ($LASTEXITCODE -ne 0) { throw 'Resolve merge conflicts and review each resolu
 
 ## 0.6.6-cn.2 性能显示选项
 
-41 版发布完成后，用户要求正式包也能手动显示 FPS、CPU 和 GPU 耗时。42 版恢复设置中的“性能叠层”，使用独立的 performance_overlay_release 偏好，默认关闭、手动选择后保存；避免从开发包沿用开启状态。此选项不会重新启用 Android 调试属性、profiler 日志或 debuggable，发布标签与 41 版分开保留。
+41 版发布完成后，用户要求正式包也能手动显示 FPS、CPU 和 GPU 耗时。42 版最终提供“显示帧数（FPS）”与“显示 CPU/GPU 耗时”两个独立开关，并将选项菜单、子菜单、地图名及操作说明中文化。正式版使用 performance_overlay_release_fps / performance_overlay_release_times 偏好，兼容原 performance_overlay_release 设置；默认关闭、手动选择后保存，避免从开发包沿用开启状态。此选项不会重新启用 Android 调试属性、profiler 日志或 debuggable，发布标签与 41 版分开保留。
+
+42 版 APK 已覆盖安装到 AYN Thor，用户确认正常。发布复用该 APK，不重打包；SHA256 为 `590fcc7e3693b5bf7e1418e5e340272f45d9f1ff8a3d611fece5957307ba789f`。构建时尚未提交的菜单与打包目录修复在发布前一并提交，标签对应包含这些修改的源码。原生库实际检查结果：libmain.so、libSDL2.so、libvulkan_freedreno.so 已剥离调试符号；四个 AdrenoTools 辅助库仍含调试节，不能将整个 APK 描述为完全无调试符号。

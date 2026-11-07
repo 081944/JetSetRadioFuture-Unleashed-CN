@@ -56,7 +56,7 @@ static native int nativeRstickCamera();            /* 0 off, 1 the camera, 2 tra
     private InputManager mInput;
     private String mPadsSaid = "";
     private boolean mSwapTriggers, mNintendo;
-    private boolean mPerformanceOverlay;
+    private boolean mShowFps, mShowFrameTimes;
     private boolean mReleaseBuild;
     private DisplayManager mDisplays;
     private SecondaryMapPresentation mMapDisplay;
@@ -97,12 +97,13 @@ static native int nativeRstickCamera();            /* 0 off, 1 the camera, 2 tra
         mReleaseBuild=getResources().getBoolean(R.bool.cn_release_build);
         // Release has its own opt-in preference, so installing over a profiling
         // build starts clean while the user's later choice survives restarts.
-        mPerformanceOverlay = Settings.get(this, mReleaseBuild ? "performance_overlay_release"
-                : "performance_overlay", 0) != 0;
-        nativeSetPerformanceOverlay(mPerformanceOverlay);
+        String perfKey = performancePreferenceKey();
+        int legacyPerf = Settings.get(this, perfKey, 0);
+        mShowFps = Settings.get(this, perfKey + "_fps", legacyPerf) != 0;
+        mShowFrameTimes = Settings.get(this, perfKey + "_times", legacyPerf) != 0;
         nativeSetControllerMapping(mSwapTriggers, mNintendo);
         mPad = new TouchPadView(this, this);
-        mPad.setPerformanceOverlay(mPerformanceOverlay);
+        updatePerformanceOverlay();
         mLayout.addView(mPad, new RelativeLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         mInput = (InputManager) getSystemService(INPUT_SERVICE);
@@ -284,6 +285,15 @@ static native int nativeRstickCamera();            /* 0 off, 1 the camera, 2 tra
 
     /* ---- settings ---- */
 
+    private String performancePreferenceKey() {
+        return mReleaseBuild ? "performance_overlay_release" : "performance_overlay";
+    }
+
+    private void updatePerformanceOverlay() {
+        nativeSetPerformanceOverlay(mShowFps || mShowFrameTimes);
+        mPad.setPerformanceOverlay(mShowFps, mShowFrameTimes);
+    }
+
     private AlertDialog.Builder dialog() {
         return new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert);
     }
@@ -292,28 +302,28 @@ static native int nativeRstickCamera();            /* 0 off, 1 the camera, 2 tra
     public void onSettings() {
         final boolean wide = nativeWidescreen();
         final boolean touch = touchPref();
-final int rcam = nativeRstickCamera();
-        final boolean perf = mPerformanceOverlay;
+        final int rcam = nativeRstickCamera();
         final int scale = Settings.get(this, "scale", 2);
         String[] items = {
-            "Widescreen: " + (wide ? "on" : "off"),
-            "On-screen controls: " + (touch ? "shown" : "hidden"),
-            "Resolution: " + scale + "x",
-            "Camera on the right stick: " + (rcam == 2 ? "tracking" : rcam != 0 ? "on" : "off"),
+            "宽屏显示：" + (wide ? "开" : "关"),
+            "屏幕虚拟按键：" + (touch ? "显示" : "隐藏"),
+            "渲染分辨率：" + scale + " 倍",
+            "右摇杆镜头：" + (rcam == 2 ? "自由观察" : rcam != 0 ? "开" : "关"),
             "肩键/扳机互换 (LB↔LT、RB↔RT)：" + (mSwapTriggers ? "开" : "关"),
             "ABXY 布局：" + (mNintendo ? "任天堂" : "微软"),
-            "性能叠层：" + (perf ? "开" : "关"),
-            "Photo mode",
-            "Go to a map",
+            "显示帧数（FPS）：" + (mShowFps ? "开" : "关"),
+            "拍照模式",
+            "前往地图",
             "副屏地图：" + (Settings.get(this,"secondary_map",1)!=0 ? "开" : "关"),
             "切换角色",
-            "Controls",
+            "操作说明",
+            "显示 CPU/GPU 耗时：" + (mShowFrameTimes ? "开" : "关"),
         };
-        final int[] actions=new int[] {0,1,2,3,4,5,6,7,8,9,10,11};
+        final int[] actions=new int[] {0,1,2,3,4,5,6,12,7,8,9,10,11};
         String[] visibleItems=new String[actions.length];
         for (int i=0;i<actions.length;i++) visibleItems[i]=items[actions[i]];
         mPad.reset();
-        dialog().setTitle("JSRF Unleashed " + nativeVersion())
+        dialog().setTitle("选项 · JSRF Unleashed " + nativeVersion())
             .setItems(visibleItems, (d, which) -> {
                 switch (actions[which]) {
                 case 0:
@@ -336,11 +346,14 @@ final int rcam = nativeRstickCamera();
                     pickControllerLayout();
                     break;
                 case 6:
-                    mPerformanceOverlay = !perf;
-                    Settings.set(this, mReleaseBuild ? "performance_overlay_release"
-                            : "performance_overlay", mPerformanceOverlay ? 1 : 0);
-                    nativeSetPerformanceOverlay(mPerformanceOverlay);
-                    mPad.setPerformanceOverlay(mPerformanceOverlay);
+                    mShowFps = !mShowFps;
+                    Settings.set(this, performancePreferenceKey() + "_fps", mShowFps ? 1 : 0);
+                    updatePerformanceOverlay();
+                    break;
+                case 12:
+                    mShowFrameTimes = !mShowFrameTimes;
+                    Settings.set(this, performancePreferenceKey() + "_times", mShowFrameTimes ? 1 : 0);
+                    updatePerformanceOverlay();
                     break;
                 case 7:
                     nativePhotoMode();
@@ -363,7 +376,7 @@ final int rcam = nativeRstickCamera();
                     break;
                 }
             })
-            .setNegativeButton("Close", null)
+            .setNegativeButton("关闭", null)
             .show();
     }
 
@@ -371,9 +384,14 @@ final int rcam = nativeRstickCamera();
     private void pickMap() {
         String[] items = nativeMapNames();
         if (items == null) return;
-        dialog().setTitle("Go to a map")
+        // The native selector uses Stg10..Stg34 order, as do the CN place labels.
+        for (int i = 0; i < items.length; i++) {
+            String name = MapPlaceNames.forKind(i + 12);
+            if (name != null) items[i] = name;
+        }
+        dialog().setTitle("前往地图")
             .setItems(items, (d, which) -> nativeGoToMap(which))
-            .setNegativeButton("Cancel", null)
+            .setNegativeButton("取消", null)
             .show();
     }
 
@@ -381,28 +399,28 @@ final int rcam = nativeRstickCamera();
      * tracking (it only looks around: the skater keeps his heading), or off
      * (the game's own camera). */
     private void pickRstickCamera(int now) {
-        String[] names = { "Off (the game's camera)", "On", "Tracking (look around, keep going)" };
+        String[] names = { "关闭（使用游戏原有镜头）", "开启（移动方向随镜头转动）", "自由观察（保持原有移动方向）" };
         String[] items = new String[3];
         int[] modes = { 1, 2, 0 };
         for (int i = 0; i < 3; i++)
             items[i] = names[modes[i]] + (modes[i] == now ? "  ✓" : "");
-        dialog().setTitle("Camera on the right stick")
+        dialog().setTitle("右摇杆镜头")
             .setItems(items, (d, which) -> nativeSetRstickCamera(modes[which]))
-            .setNegativeButton("Cancel", null)
+            .setNegativeButton("取消", null)
             .show();
     }
 
     private void pickScale(int now) {
         String[] items = new String[4];
         for (int s = 1; s <= 4; s++)
-            items[s - 1] = s + "x (" + 640 * s + " x " + 480 * s + ")" + (s == now ? "  ✓" : "");
-        dialog().setTitle("Resolution")
+            items[s - 1] = s + " 倍（" + 640 * s + " × " + 480 * s + "）" + (s == now ? "  ✓" : "");
+        dialog().setTitle("渲染分辨率")
             .setItems(items, (d, which) -> {
                 Settings.set(this, "scale", which + 1);
                 if (which + 1 != now)
-                    Toast.makeText(this, "Used the next time the game starts.", Toast.LENGTH_LONG).show();
+                    Toast.makeText(this, "新的分辨率将在下次启动游戏时生效。", Toast.LENGTH_LONG).show();
             })
-            .setNegativeButton("Cancel", null)
+            .setNegativeButton("取消", null)
             .show();
     }
 
@@ -432,24 +450,22 @@ final int rcam = nativeRstickCamera();
     }
 
     private void showControls() {
-        dialog().setTitle("Controls")
-            .setMessage("A controller works as on the console (Xbox, PlayStation, Switch Pro and "
-                + "others, over Bluetooth or USB): A jump, R trigger talk and spray, Start, "
-                + "Back/Select Back.\n\n"
-                + "On screen: put your left thumb anywhere on the left half to steer; A B X Y are "
-                + "the pad's, R and L its triggers, the hollow and filled circles White and Black; "
-                + "Start and Back are at the top.\n\n"
-                + "With the camera on the right stick (the settings), a controller's right stick "
-                + "turns the camera around you and it eases back behind you when let go; "
-                + "L trigger puts it straight behind at once. Set to tracking, it only looks "
-                + "around: you keep going the way you were.\n\n"
-                + "Photo mode (the settings, or hold Back on a controller): move the camera freely with "
-                + "the sticks, the triggers lower and raise it, Y hides the HUD, A the help, B goes back "
-                + "to the game.\n\n"
-                + "A keyboard: WASD (by position) moves, arrows the camera, Space jump, E spray, "
-                + "Enter Start, Esc Back.\n\n"
-                + "A new resolution is used the next time the game starts.")
-            .setPositiveButton("OK", null)
+        dialog().setTitle("操作说明")
+            .setMessage("实体手柄：支持通过蓝牙或 USB 连接 Xbox、PlayStation、Switch Pro 等手柄。"
+                + "默认按键为 A 跳跃、右扳机对话或喷涂、Start 开始或暂停、Back/Select 返回。"
+                + "肩键/扳机互换和 ABXY 布局可在选项中调整。\n\n"
+                + "屏幕虚拟按键：在屏幕左半边任意位置按住并拖动即可控制方向；A、B、X、Y 对应手柄按键，"
+                + "R、L 对应右、左扳机，空心圆、实心圆对应白键、黑键。开始和返回键位于屏幕顶部。\n\n"
+                + "右摇杆镜头：在选项中开启后，用右摇杆环绕观察，松开后镜头逐渐回到角色身后；"
+                + "左扳机可立即将镜头移到身后。选择“自由观察”时，转动镜头不会改变角色的移动方向。\n\n"
+                + "拍照模式：从选项进入，或长按手柄 Back 键。用摇杆自由移动镜头，扳机降低或升高镜头，"
+                + "Y 隐藏界面，A 显示或隐藏帮助，B 返回游戏。\n\n"
+                + "键盘：WASD（按键盘位置）移动，方向键控制镜头，空格跳跃，E 喷涂，Enter 开始，Esc 返回。\n\n"
+                + "性能显示：帧数与 CPU/GPU 耗时可分别开关，立即生效并自动保存。帧间隔和耗时以毫秒为单位；"
+                + "CPU 为游戏/渲染线程每帧占用的处理器时间，GPU 为每帧渲染耗时，均不是使用率。"
+                + "“--”表示暂无数据或设备不支持，“…”表示等待 GPU 计时结果。\n\n"
+                + "新的渲染分辨率将在下次启动游戏时生效。")
+            .setPositiveButton("确定", null)
             .show();
     }
 }
